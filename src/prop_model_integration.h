@@ -216,6 +216,23 @@ static bool preparePart(void* object, void* part, uint32_t attributes, const re3
     // the original part matrix supplies all motion (lid hinge, statue arm, gears), with no second animation clock.
     const auto native = re3model::FromNativeMatrix(*world);
     const auto bone = rule->transformed ? re3model::Multiply(native, rule->transform) : native;
+    // Opaque props take the GPU path: the static mesh and one bone. The chest (its proxy maps triangles to buckets one by
+    // one) and semi-transparent parts (STP passes) stay on the cached CPU geometry below.
+    if (!semiTransparent && rule->depth != Depth::Chest) {
+        ActorPlan gpuPlan; gpuPlainLight = true;
+        const int gpu = appendGpuJobs(asset, {bone}, projection, gpuPlan, nullptr, nullptr, nullptr); gpuPlainLight = false;
+        if (gpu == 0) return fallback("prepare");
+        if (gpu > 0) {
+            if (!gpuPlan.jobs.empty() && !EnqueueBatch(orderingTable, kOrderingTableSlots, gpuPlan.jobs)) return fallback("enqueue");
+            try {
+                noteUse(rule->asset);
+                if (noteOnce(std::string("ok:") + where + rule->asset))
+                    log("MODEL_PROP %s asset=%s identity=%s depth=triangle xf=%u attributes=%x semi=0 abr=0 jobs=%zu triangles=%zu OT=%p gpu", where, rule->asset.c_str(), identityText(identity).c_str(),
+                        rule->transformed ? 1u : 0u, attributes, gpuPlan.jobs.size(), asset->mesh.indices.size() / 3, orderingTable);
+            } catch (...) {}
+            return true;
+        }
+    }
     std::vector<uint8_t> key; key.reserve(320);
     keyBytes(key, asset.get()); keyBytes(key, rule); keyBytes(key, bone); keyBytes(key, projection.camera);
     keyBytes(key, projection.h); keyBytes(key, projection.offsetX); keyBytes(key, projection.offsetY); keyBytes(key, projection.zsf3);

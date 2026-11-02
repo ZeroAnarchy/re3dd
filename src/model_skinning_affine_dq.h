@@ -79,9 +79,10 @@ inline void RotateDouble(Quaternion q,const double in[3],double out[3]){
     const double tx=2*(q.y*in[2]-q.z*in[1]),ty=2*(q.z*in[0]-q.x*in[2]),tz=2*(q.x*in[1]-q.y*in[0]);
     out[0]=in[0]+q.w*tx+q.y*tz-q.z*ty;out[1]=in[1]+q.w*ty+q.z*tx-q.x*tz;out[2]=in[2]+q.w*tz+q.x*ty-q.y*tx;
 }
+// only: skin just these vertices (GPU path: the body vertices an overlay rides on); the others keep what the array holds.
 template<bool Corrected> inline bool SkinAffineDualQuaternionImpl(const Mesh& mesh,const std::vector<Matrix3x4>& worldBones,
     std::vector<SkinnedVertex>& output,std::string* error,Diagnostics* diagnostics,
-    const re3shoulder::ShoulderCorrective* corrective,re3shoulder::Factors* usedFactors){
+    const re3shoulder::ShoulderCorrective* corrective,re3shoulder::Factors* usedFactors,const std::vector<std::uint32_t>* only=nullptr){
     auto fail=[&](const char* text){if(error)*error=text;return false;};
     try {
         re3shoulder::Factors factors;(void)factors;(void)corrective;(void)usedFactors;
@@ -106,7 +107,7 @@ template<bool Corrected> inline bool SkinAffineDualQuaternionImpl(const Mesh& me
         // vertices run in chunks on the worker pool, duplicates are copied afterwards in index order and the
         // lowest failing index reports, so the output and errors equal the sequential loop's.
         const std::size_t count=mesh.vertices.size();
-        std::vector<SkinnedVertex> result;result.swap(output);result.resize(count);std::vector<std::uint8_t> duplicate(count,0);   // caller's array reused
+        std::vector<SkinnedVertex> result;result.swap(output);result.resize(count);std::vector<std::uint8_t> duplicate(only?0:count,0);   // caller's array reused
         auto vertex=[&](std::size_t i)->const char*{const auto& baseVertex=mesh.vertices[i];const Vertex* selected=&baseVertex;Vertex adjusted;
             if constexpr(Corrected){const auto* entry=corrective->ForVertex(i);
                 // Exact zero leaves base PN bytes untouched. Loader validation
@@ -118,7 +119,7 @@ template<bool Corrected> inline bool SkinAffineDualQuaternionImpl(const Mesh& me
             }
             const auto& v=*selected;
             if(!re3model::Finite(v.position)||!re3model::Finite(v.normal)||re3model::Dot(v.normal,v.normal)<1.e-20f||!std::isfinite(v.uv.x)||!std::isfinite(v.uv.y))return "Affine DQ invalid vertex";
-            const auto representative=CanonicalSkinVertex(mesh,i);if(representative<i){duplicate[i]=1;return nullptr;}
+            if(!only){const auto representative=CanonicalSkinVertex(mesh,i);if(representative<i){duplicate[i]=1;return nullptr;}}
             unsigned sum=0,reference=0;for(unsigned k=0;k<4;++k){if(v.bone[k]>=joints.size())return "Affine DQ bone outside skeleton";sum+=v.weight[k];if(v.weight[k]>v.weight[reference])reference=k;}
             if(sum!=65535)return "Affine DQ invalid weights";
             if(v.weight[reference]==65535){
@@ -153,6 +154,8 @@ template<bool Corrected> inline bool SkinAffineDualQuaternionImpl(const Mesh& me
             if(!re3model::Finite(p)||!re3model::Finite(n))return "Affine DQ nonfinite output";
             result[i]={p,n,v.uv};return nullptr;
         };
+        if(only){for(const auto i:*only)if(const char* problem=vertex(i))return fail(problem);
+            output=std::move(result);if constexpr(Corrected){if(usedFactors)*usedFactors=factors;}if(error)error->clear();return true;}
         const std::size_t grain=2048;std::vector<std::pair<std::size_t,const char*>> failures((count+grain-1)/grain,{count,nullptr});
         if(!re3model::parallel::For(count,grain,[&](std::size_t chunk,std::size_t begin,std::size_t end){
             for(std::size_t i=begin;i<end;++i)if(const char* problem=vertex(i)){failures[chunk]={i,problem};return;}
@@ -168,7 +171,7 @@ inline bool SkinAffineDualQuaternion(const Mesh& mesh,const std::vector<Matrix3x
 }
 inline bool SkinAffineDualQuaternionCorrected(const Mesh& mesh,const std::vector<Matrix3x4>& worldBones,
     const re3shoulder::ShoulderCorrective& corrective,std::vector<SkinnedVertex>& output,std::string* error=nullptr,
-    Diagnostics* diagnostics=nullptr,re3shoulder::Factors* usedFactors=nullptr){
-    return SkinAffineDualQuaternionImpl<true>(mesh,worldBones,output,error,diagnostics,&corrective,usedFactors);
+    Diagnostics* diagnostics=nullptr,re3shoulder::Factors* usedFactors=nullptr,const std::vector<std::uint32_t>* only=nullptr){
+    return SkinAffineDualQuaternionImpl<true>(mesh,worldBones,output,error,diagnostics,&corrective,usedFactors,only);
 }
 } // namespace re3affine

@@ -123,6 +123,12 @@ inline bool woundFromShot(const re3model::Mesh& mesh,const std::vector<re3model:
     }
     return makeWound(mesh,body,hidden,where,normal,radius,angle,texture,wound);
 }
+// GPU path: the multiplier of each bone; the vertex shader blends it by the skin weights (= damageTint up to rounding).
+inline void damageBoneTint(const std::uint32_t partColour[32],std::uint32_t damaged,float out[32][3]){
+    for(unsigned i=0;i<32;++i){const std::uint32_t c=partColour[i];const bool red=(damaged>>i)&1u;
+        const float base[3]={(128.f+float(c&255))/256.f,(128.f+float((c>>8)&255))/256.f,(128.f+float((c>>16)&255))/256.f};
+        out[i][0]=red?(std::min)(1.f,base[0]*1.28f):1.f;out[i][1]=red?base[1]*0.72f:1.f;out[i][2]=red?base[2]*0.68f:1.f;}
+}
 // Per-vertex multiplier of the red parts: native colour C (part+0x78) gives the native average (128+C)/256, pushed
 // toward red for the HD textures; blended by the vertex's skin weights on those parts.
 inline void damageTint(const re3model::Mesh& mesh,const std::uint32_t partColour[32],std::uint32_t damaged,std::vector<std::uint32_t>& out){

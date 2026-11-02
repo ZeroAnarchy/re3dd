@@ -68,6 +68,25 @@ inline std::shared_ptr<InterpData> Record(std::uint64_t key,std::uint32_t serial
     store.Expire(serial);
     return data;
 }
+// GPU path: the in-between frame blends palettes; the last palette of every draw, with the checks of Record. Overlays
+// (World draws) keep their placed positions the same way.
+struct GpuRecorded {std::shared_ptr<std::vector<float>> palette;std::vector<Vec3> origins;std::shared_ptr<std::vector<Vec3>> positions;re3model::Matrix3x4 camera;float h=0,offsetX=0,offsetY=0,pose[2]{},rect[4]{};std::uint32_t serial=0;};
+struct GpuStore {
+    std::unordered_map<std::uint64_t,GpuRecorded> last;
+    void Expire(std::uint32_t serial){if(last.size()<256)return;for(auto it=last.begin();it!=last.end();)if(serial-it->second.serial>30)it=last.erase(it);else ++it;}
+};
+inline GpuStore& GetGpuStore(){static GpuStore store;return store;}
+inline bool GpuSameView(const GpuRecorded& r,const re3model::Projection& p){return !std::memcmp(r.camera.m,p.camera.m,sizeof(p.camera.m))&&r.h==p.h&&r.offsetX==p.offsetX&&r.offsetY==p.offsetY;}
+// The record of this draw if the build before drew it under the same camera without a jump; the slot now holds this build.
+inline bool RecordGpu(std::uint64_t key,std::uint32_t serial,const std::shared_ptr<std::vector<float>>& palette,std::vector<Vec3>&& origins,const std::shared_ptr<std::vector<Vec3>>& positions,const re3model::Projection& p,const float* pose,const float* rect,GpuRecorded& before){
+    auto& store=GetGpuStore();auto& slot=store.last[key];bool usable=slot.serial&&slot.serial+1==serial&&GpuSameView(slot,p);
+    if(usable&&palette)usable=slot.palette&&slot.palette->size()==palette->size()&&slot.origins.size()==origins.size();
+    if(usable&&positions)usable=slot.positions&&slot.positions->size()==positions->size();
+    if(usable)for(std::size_t i=0;i<origins.size();++i){const Vec3 d=origins[i]-slot.origins[i];if(re3model::Dot(d,d)>600.f*600.f){usable=false;break;}}
+    if(usable)before=slot;
+    slot.palette=palette;slot.origins=std::move(origins);slot.positions=positions;slot.camera=p.camera;slot.h=p.h;slot.offsetX=p.offsetX;slot.offsetY=p.offsetY;slot.pose[0]=pose?pose[0]:0;slot.pose[1]=pose?pose[1]:0;std::memcpy(slot.rect,rect,sizeof(slot.rect));slot.serial=serial;
+    store.Expire(serial);return usable;
+}
 // The vertices of `base` (prepared from data.current) moved to `weight` of the way from data.previous to data.current.
 inline bool Reproject(const InterpData& data,const std::vector<re3model::DrawVertex>& base,float weight,std::vector<re3model::DrawVertex>& out){
     if(!data.previous||!data.current||data.sources.size()!=base.size())return false;

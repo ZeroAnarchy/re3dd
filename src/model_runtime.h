@@ -57,7 +57,10 @@ class Pool {
         }
     }
     Pool(){
-        const unsigned hardware=std::thread::hardware_concurrency();
+        // the processors this process may use: hardware_concurrency ignores an affinity mask, and spinning workers on fewer
+        // cores than threads cost more than they do
+        unsigned hardware=std::thread::hardware_concurrency();
+        {DWORD_PTR process=0,system=0;if(GetProcessAffinityMask(GetCurrentProcess(),&process,&system)&&process){unsigned allowed=0;for(DWORD_PTR m=process;m;m&=m-1)++allowed;hardware=(std::min)(hardware,allowed);}}
         const unsigned count=hardware>1?(std::min)(hardware-1,7u):0u;
         for(unsigned i=0;i<count;++i){try{std::thread(&Pool::Work,this).detach();++workers_;}catch(...){break;}}
     }
@@ -379,6 +382,11 @@ struct Projection {
     ShadeVertexFunction shadeVertex=nullptr;
     // fps60: also emit FrameGeometry::sources (same vertices and order otherwise).
     bool recordSources=false;
+    // GPU path (model_gpu.h): the same choices in the form a static mesh can use. hiddenTriangles = triangles whose
+    // dominant bone is outside keepBones (~0 with hiddenTriangles set: not expressible, CPU path); vertexTint = boneTint
+    // blended by the skin weights.
+    std::uint32_t keepBones=0xffffffffu;
+    const float (*boneTint)[3]=nullptr;
 };
 inline std::uint32_t VertexTint(const Projection& p,std::uint32_t vertex){return p.vertexTint&&vertex<p.vertexTint->size()?(*p.vertexTint)[vertex]:0xffffffffu;}
 inline bool MaterialHidden(const Projection& p,std::size_t material){return p.hiddenMaterials&&material<p.hiddenMaterials->size()&&(*p.hiddenMaterials)[material];}

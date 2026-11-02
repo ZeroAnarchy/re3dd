@@ -423,11 +423,14 @@ inline bool ValidatePlan(const ActorContext& context, const ActorPlan& plan) {
         suppressesVisible |= context.bones[i].visible;
     }
     if (!suppressesVisible) return false;
+    // One memory query for the whole table range: a query per job was ~700 system calls per frame with the GPU path's
+    // job per bucket.
+    uint16_t low = 0xffff, high = 0;
     for (const auto& job : plan.jobs) {
-        if (job.bucket > kMaxBucket || !job.token ||
-            !Accessible(context.orderingTable + job.bucket, sizeof(uint32_t), true)) return false;
+        if (job.bucket > kMaxBucket || !job.token) return false;
+        low = (std::min)(low, job.bucket); high = (std::max)(high, job.bucket);
     }
-    return true;
+    return Accessible(context.orderingTable + low, (size_t(high) - low + 1) * sizeof(uint32_t), true);
 }
 inline void InsertPackets(uint32_t* orderingTable, Batch& batch) {
     // Native prepending: link stores previous head | 3 (ONE command), OT head
@@ -743,8 +746,12 @@ using AbsoluteJob = std::pair<uint32_t*, BucketJob>;
 inline bool EnqueueAbsoluteBatch(const std::vector<AbsoluteJob>& jobs) {
     auto& s = detail::Get();
     if (!s.enabled || !s.building || !s.pendingMode || jobs.empty() || jobs.size() > kMaxJobsPerActor) return false;
-    for (const auto& entry : jobs) if (!entry.second.token ||
-        !detail::Accessible(entry.first, sizeof(uint32_t), true)) return false;
+    uintptr_t checkedPage = 0;   // one memory query per page of slots, not per slot
+    for (const auto& entry : jobs) {
+        if (!entry.second.token) return false;
+        const uintptr_t page = reinterpret_cast<uintptr_t>(entry.first) & ~uintptr_t(0xfff);
+        if (page != checkedPage) { if (!detail::Accessible(entry.first, sizeof(uint32_t), true)) return false; checkedPage = page; }
+    }
     detail::Batch* accepted = nullptr;
     try {
         auto batch = std::make_unique<detail::Batch>();

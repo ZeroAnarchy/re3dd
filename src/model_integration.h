@@ -33,10 +33,12 @@ struct ModelAsset {
     // barycentric point, offset and normal in that triangle's frame (smooth normal, first edge, their cross product)
     struct WrapEntry{uint32_t v[3];float b1,b2,offset[3],normal[3];};
     std::vector<WrapEntry> wrap;uint32_t wrapBodyVertices=0;
+    std::vector<uint32_t> wrapAnchors;   // the body vertices of wrap, sorted (GPU path: all the overlay needs of the CPU skin)
     // follow.txt (Nemesis back worms EM36/3A parts 16-21): bone k of this extra mesh is station k of the native part's
     // own vertices (centroid of an index group), read every frame from the part's mesh object, where the engine writes
     // its morph (writhing) in place (4381F0: base copy + weighted deltas into mesh+0, 8-byte vertices)
     std::vector<std::vector<uint16_t>> followStations;uint32_t followVertices=0;bool followMoved=false;
+    std::shared_ptr<re3gpu::Mesh> gpu;bool gpuFailed=false;   // static buffers of the GPU path, on first use
     ~ModelAsset(){for(auto& t:textures){if(t.albedo)t.albedo->Release();if(t.stp)t.stp->Release();}for(auto& v:variantTextures)if(v.second)v.second->Release();}
 };
 struct PendingFrame;
@@ -44,6 +46,7 @@ struct ModelJob {
     std::shared_ptr<re3model::GpuFrame> geometry;
     size_t slice=0;
     std::shared_ptr<PendingFrame> pending;   // deferred prepare (fix 2026-10-25d): resolved to geometry/slice at the first draw
+    std::shared_ptr<re3gpu::Draw> gpu;       // GPU path: this bucket of that model (model_gpu.h)
     uint16_t bucket=0;
     re3model::DrawOptions options{};
     std::string name;
@@ -153,6 +156,7 @@ struct ActorRuntime{
     std::vector<re3wound::Wound> wounds;uint32_t damagedParts=0;std::vector<uint32_t> damageTint;
     re3handik::State handIk;   // fix 2026-10-25b: player left-hand pose rows (hand-ik.txt)
     uint32_t dropSerial=0;float drop=0;   // fix 2026-10-25c: Western Custom aim, arms lowered (0..1)
+    float damageBone[32][3]{};            // GPU path: damage red per bone (same parts as damageTint)
 };
 static std::unordered_map<void*,ActorRuntime> actorRuntime;
 static ActorRuntime& actorState(void* actor,uint8_t modelId,const std::string& asset,uint32_t serial){
@@ -300,8 +304,9 @@ static void logEnemyPartStates(const re3bridge::ActorContext& context){
         old.flags=b.flags;old.render=b.renderAttributes;old.mesh=b.runtimeMesh;std::memcpy(old.scale,b.scale,sizeof(old.scale));
     }
     static bool diagnostics=GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())!=0;static unsigned actorDumps=0;
+    if(!diagnostics||actorDumps>=96)return;
     char key[64];sprintf_s(key,"dump:%p:%u:%u",context.actor,*(uint16_t*)(gameBase+0x661fa6),*(uint16_t*)(gameBase+0x661fa8));
-    if(diagnostics&&actorDumps<96&&modelObserved.insert(key).second&&re3bridge::detail::Accessible(context.actor,0x200)){++actorDumps;
+    if(modelObserved.insert(key).second&&re3bridge::detail::Accessible(context.actor,0x200)){++actorDumps;
         auto hex=[](const void* data,size_t size){static const char* digits="0123456789abcdef";std::string text;text.reserve(size*2);for(size_t k=0;k<size;++k){const auto c=static_cast<const uint8_t*>(data)[k];text+=digits[c>>4];text+=digits[c&15];}return text;};
         log("MODEL_ACTOR_DUMP actor=%p model=%02x parts=%u room=%u%02x bytes=%s",context.actor,context.modelId,context.partCount,*(uint16_t*)(gameBase+0x661fa6),*(uint16_t*)(gameBase+0x661fa8),hex(context.actor,0x200).c_str());
         for(size_t i=0;i<context.bones.size();++i)log("MODEL_PART_DUMP actor=%p part=%zu bytes=%s mesh=%s",context.actor,i,hex(context.bones[i].nativePart,re3bridge::kPartStride).c_str(),
@@ -430,8 +435,22 @@ static bool resolveLook(const ActorRule& rule,const re3bridge::ActorContext& con
     if(withBody&&withBody!=parts){if(modelObserved.size()<4000&&modelObserved.insert("look-mixed-body:"+out.text).second)log("MODEL_LOOK_NATIVE model=%02x look=%s (parts of two bodies)",context.modelId,out.text.c_str());return false;}
     out.valid=true;return true;
 }
+// The rule and look of an actor change with its mesh objects only (the engine dresses and swaps parts by those pointers).
+// Matching them is strings and memory queries for every part: 0.55 ms per frame in the first alley, re-done for nothing.
+struct RuleMemo{uint64_t key=0;const ActorRule* rule=nullptr;ResolvedLook look;uint32_t serial=0;};
+static std::unordered_map<void*,RuleMemo> ruleMemos;
+static const ActorRule* matchActorRule(const re3bridge::ActorContext& context);
 static const ActorRule* findActorRule(const re3bridge::ActorContext& context){
     logEnemyPartStates(context);
+    uint64_t key=0xcbf29ce484222325ull;auto mix=[&](uint64_t v){key=(key^v)*0x100000001b3ull;};
+    mix(context.modelId);mix(context.isPlayer);mix(context.playerCostume);mix(context.bones.size());
+    for(const auto& b:context.bones)mix(reinterpret_cast<uintptr_t>(b.runtimeMesh));
+    if(ruleMemos.size()>96)ruleMemos.clear();
+    auto& memo=ruleMemos[context.actor];
+    if(memo.serial&&memo.key==key){memo.serial=context.serial;modelLastLook=memo.look;return memo.rule;}
+    memo.rule=matchActorRule(context);memo.key=key;memo.look=modelLastLook;memo.serial=context.serial;return memo.rule;
+}
+static const ActorRule* matchActorRule(const re3bridge::ActorContext& context){
     // every distinct enemy look is logged once: this is how in-game swap sets show up in runtime.log
     if(!context.isPlayer){const auto text=partSignatureText(context);char key[16];sprintf_s(key,"sig:%02x:",context.modelId);
         if(modelObserved.size()<4000&&modelObserved.insert(key+text).second)log("MODEL_PART_SIGNATURE model=%02x parts=%u %s",context.modelId,context.partCount,text.c_str());}
@@ -468,6 +487,8 @@ static std::shared_ptr<ModelAsset> getModel(const std::string& id){
             for(size_t i=0;ok&&i<asset->wrap.size();++i)for(unsigned k=0;k<3;++k)ok=ok&&asset->wrap[i].v[k]<head[2];
             if(!ok){asset->missing=true;log("MODEL_UNAVAILABLE %s invalid wrap.r3wrap",id.c_str());return nullptr;}
             asset->wrapBodyVertices=head[2];asset->bytes+=asset->wrap.size()*sizeof(ModelAsset::WrapEntry);
+            for(const auto& w:asset->wrap)asset->wrapAnchors.insert(asset->wrapAnchors.end(),w.v,w.v+3);
+            std::sort(asset->wrapAnchors.begin(),asset->wrapAnchors.end());asset->wrapAnchors.erase(std::unique(asset->wrapAnchors.begin(),asset->wrapAnchors.end()),asset->wrapAnchors.end());
         }}
     {std::ifstream follow(root+"/"+relative+"follow.txt");std::string line;
         while(follow&&std::getline(follow,line)){std::istringstream f(line);std::string key;if(!(f>>key)||key[0]=='#')continue;
@@ -700,10 +721,275 @@ static bool resolvePendingJob(ModelJob& job){
     const int slice=pf.sliceOf[job.bucket-pf.bucketLow];if(slice<0)return false;
     job.geometry=pf.gpu;job.slice=size_t(slice);return true;
 }
+// ---------------------------------------------------------------- GPU path (model_gpu.h)
+// pilot.ini gpu_models=0 or a device without hardware shader model 3: every model takes the CPU path below. Also per
+// draw: anything the static mesh cannot express returns -1 from appendGpuJobs and goes the CPU way.
+static bool modelGpuEnabled=true;
+static std::vector<re3gpu::Entry> gpuList;static std::uint32_t gpuListSerial=1;
+static bool gpuFlushing=false,gpuInJob=false,gpuBodySkinWanted=false;
+static bool gpuPlainLight=false;   // props: the plain native light, as their CPU path (lighting.txt is for actors and doors)
+// Doors (extra_model_integration.h): their own depth map (OTZ >> shift, 7 or 12 instead of 3, no native near cut) and light
+static unsigned gpuBucketShift=3;static bool gpuNearCut=true;static const re3model::SculptedLighting* gpuDoorLight=nullptr;
+static const std::vector<uint32_t>* gpuBodySkinOnly=nullptr;   // the overlay's anchors, when nothing else needs the body
+static std::vector<re3model::SkinnedVertex> gpuOverlayBody;     // kept between frames: full size, anchors rewritten
+static std::vector<std::weak_ptr<re3gpu::Draw>> gpuLiveDraws;
+static std::shared_ptr<re3gpu::Draw> gpuLastBody;
+static re3gpu::Stats gpuStats;
+static bool gpuPathOn(){
+    if(!modelGpuEnabled||modelParity)return false;
+    std::string why;const bool usable=modelRenderer.gpuUsable(&why);
+    if(!usable&&!why.empty())log("MODEL_GPU_UNAVAILABLE %s; HD models stay on the CPU path",why.c_str());
+    return usable;
+}
+static re3gpu::Mesh* gpuMeshOf(ModelAsset& asset){
+    if(asset.gpu)return asset.gpu.get();if(asset.gpuFailed)return nullptr;
+    std::vector<uint8_t> deformed(asset.mesh.vertices.size(),0);
+    if(modelFaceEnabled&&asset.face.Valid())for(const auto v:asset.face.Affected())deformed[v]=1;
+    if(asset.affineDualQuaternion)for(const auto& e:asset.shoulderCorrective.Entries())deformed[e.vertexIndex]=1;
+    const auto lit=re3model::AssetLightingStore().find(asset.id);
+    const std::vector<uint8_t>* occlusion=lit!=re3model::AssetLightingStore().end()&&lit->second.sculpted&&!lit->second.occlusion.empty()?&lit->second.occlusion:nullptr;
+    HRESULT hr=S_OK;asset.gpu=re3gpu::BuildMesh(modelRenderer.device(),asset.mesh,deformed,occlusion,asset.poseWeights.valid?&asset.poseWeights:nullptr,asset.affineDualQuaternion,&hr);
+    if(!asset.gpu){asset.gpuFailed=true;log("MODEL_GPU_MESH_FAILED %s hr=%08lx; CPU path",asset.id.c_str(),hr);return nullptr;}
+    log("MODEL_GPU_MESH %s vertices=%u dynamic=%zu morphed=%zu pose=%u kb=%zu",asset.id.c_str(),asset.gpu->vertexCount,asset.gpu->dynamicSource.size(),asset.gpu->morphed.size(),unsigned(asset.gpu->pose!=nullptr),asset.gpu->bytes>>10);
+    return asset.gpu.get();
+}
+static std::shared_ptr<re3gpu::IndexSet> gpuIndices(ModelAsset& asset,re3gpu::Mesh& mesh,uint32_t keep){
+    if(keep==0xffffffffu)return mesh.base;
+    const auto hit=mesh.variants.find(keep);if(hit!=mesh.variants.end())return hit->second;
+    HRESULT hr=S_OK;auto set=re3gpu::BuildIndices(modelRenderer.device(),asset.mesh,mesh,&asset.triangleBone,keep,&hr);
+    if(!set)log("MODEL_GPU_INDICES_FAILED %s keep=%x hr=%08lx",asset.id.c_str(),keep,hr);else mesh.variants[keep]=set;
+    return set;
+}
+// The CPU skin of a body, for what still needs its vertices: a wound's ray cast (only in the frame of a hit) and overlay anchors.
+static bool gpuCpuSkin(const ModelAsset& asset,const std::vector<re3model::Matrix3x4>& bones,std::vector<re3model::SkinnedVertex>& out,std::string& error){
+    bool okay=asset.affineDualQuaternion?re3affine::SkinAffineDualQuaternionCorrected(asset.mesh,bones,asset.shoulderCorrective,out,&error,nullptr,nullptr,gpuBodySkinOnly):re3model::Skin(asset.mesh,bones,out,&error);
+    if(okay&&asset.poseWeights.valid){float factors[2]{};okay=re3poseweights::Apply(asset.poseWeights,asset.mesh,bones,out,factors,&error);}
+    return okay;
+}
+static uint64_t fps60DrawKey(const void* asset){
+    unsigned occurrence=0;bool found=false;
+    for(auto& entry:fps60Occurrences)if(entry.first==asset){occurrence=++entry.second;found=true;break;}
+    if(!found)fps60Occurrences.push_back({asset,0});
+    return re3fps60::Key(fps60Actor,asset,occurrence);
+}
+static void gpuAddJobs(const std::shared_ptr<re3gpu::Draw>& draw,const std::string& name,re3bridge::ActorPlan& plan){
+    const unsigned count=unsigned(draw->bucketHigh)-draw->bucketLow+1;
+    auto jobs=std::make_shared<std::vector<ModelJob>>(count);std::shared_ptr<void> keep=jobs;
+    for(unsigned i=0;i<count;++i){auto& job=(*jobs)[i];job.gpu=draw;job.bucket=uint16_t(draw->bucketHigh-i);job.name=name;plan.jobs.push_back({job.bucket,reinterpret_cast<uintptr_t>(&job),keep});}
+    if(gpuLiveDraws.size()>1024)gpuLiveDraws.erase(std::remove_if(gpuLiveDraws.begin(),gpuLiveDraws.end(),[](const std::weak_ptr<re3gpu::Draw>& w){return w.expired();}),gpuLiveDraws.end());
+    gpuLiveDraws.push_back(draw);
+}
+// The bucket range of a draw from its camera depth range, as the CPU path's vertex depths give it; false = nothing to draw
+// (only for a body: behind the camera or wholly in the near cut, the actor stays native like the CPU path).
+static bool gpuBuckets(const ModelAsset& asset,re3gpu::Draw& draw,const re3model::Projection& p,float zmin,float zmax,bool& empty){
+    empty=false;
+    if(!(zmax>=p.nearPlane)){if(modelObserved.insert("failed:"+asset.id).second)log("MODEL_PREPARE_FAILED %s no triangles (behind the near plane)",asset.id.c_str());return false;}
+    auto depthOf=[](float z){return re3model::StoredDepth((std::max)(0.f,(std::min)(65535.f,z)));};
+    const auto dl=depthOf(zmin),dh=depthOf(zmax);
+    auto bucketOf=[&](uint16_t d){const int64_t product=int64_t(3u*unsigned(d))*p.zsf3;const int64_t otz=product<=0?0:(std::min)(int64_t(gpuBucketShift==3?65535:0x1fff),product/4096);return uint16_t(otz>>gpuBucketShift);};
+    uint16_t low=bucketOf(dl),high=bucketOf(dh);
+    high=uint16_t((std::min)(unsigned(high),(std::min)(p.bucketLimit-1u,re3bridge::kMaxBucket)));low=(std::min)(low,high);
+    // 423F6B/423FA7: without bit 31 the native near cut drops buckets 0-7 (re3bridge::detail::ApplyNativeActorCutoff)
+    if(gpuNearCut&&!(*(uint32_t*)(gameBase+0x65cbd4)&0x80000000u)){
+        if(high<8){
+            if(asset.characterBody||asset.id=="jill-standard"||asset.id=="dario"){if(modelObserved.insert("near-native-fallback:"+asset.id).second)log("MODEL_BODY_NATIVE_NEAR_FALLBACK %s all body slices lie below native OT cut8",asset.id.c_str());return false;}
+            empty=true;return true;}
+        if(low<8){low=8;draw.nearClosed=true;}
+    }
+    draw.bucketHigh=high;draw.bucketLow=low;draw.bucketDepth=float(4096u<<gpuBucketShift)/(3.f*float(p.zsf3));
+    return true;
+}
+// The in-between frame shows the model anywhere between its two builds.
+static void gpuUniteRect(float* rect,const float* other){rect[0]=(std::min)(rect[0],other[0]);rect[1]=(std::min)(rect[1],other[1]);rect[2]=(std::max)(rect[2],other[2]);rect[3]=(std::max)(rect[3],other[3]);}
+// 1 jobs added, 0 the actor stays native (as a failed CPU prepare), -1 not for this path.
+static int appendGpuJobs(const std::shared_ptr<ModelAsset>& asset,const std::vector<re3model::Matrix3x4>& worldBones,const re3model::Projection& worldProjection,re3bridge::ActorPlan& plan,
+    const std::vector<re3model::MaterialTextures>* actorTextures,std::vector<re3model::SkinnedVertex>* skinnedOut,const std::vector<re3model::SkinnedVertex>* preskinned){
+    // skinned draws work relative to the rounded camera eye (re3gpu::Draw::origin); overlays keep their world vertices
+    float origin[3]{};std::vector<re3model::Matrix3x4> localBones;re3model::Projection localProjection=worldProjection;re3model::Matrix3x4 view;
+    if(!preskinned&&re3model::InverseAffine(worldProjection.camera,view)){
+        for(unsigned k=0;k<3;++k)origin[k]=std::floor(view.m[k*4+3]+.5f);
+        localBones=worldBones;for(auto& b:localBones)for(unsigned k=0;k<3;++k)b.m[k*4+3]-=origin[k];
+        // in double: the terms are around 30000 and float rounding here would shift the whole model
+        for(unsigned r=0;r<3;++r){const float* c=worldProjection.camera.m+r*4;localProjection.camera.m[r*4+3]=float(double(c[3])+double(c[0])*origin[0]+double(c[1])*origin[1]+double(c[2])*origin[2]);}
+    }else localBones=worldBones;
+    const auto& bones=localBones;const auto& projection=localProjection;
+    if((projection.depth&&!gpuDoorLight)||projection.triangleDepth||asset->dualQuaternion||!gpuPathOn())return -1;
+    if((projection.hiddenTriangles&&projection.keepBones==0xffffffffu)||(projection.vertexTint&&!projection.boneTint))return -1;
+    if(asset->mesh.inverseBind.size()>re3gpu::kMaxBones||asset->mesh.materials.size()>64)return -1;
+    const double started=modelClockMs();
+    auto* mesh=gpuMeshOf(*asset);if(!mesh)return -1;
+    auto draw=std::make_shared<re3gpu::Draw>();draw->owner=asset;draw->mesh=mesh;draw->name=asset->id;
+    draw->indices=gpuIndices(*asset,*mesh,projection.keepBones);if(!draw->indices)return -1;
+    std::memcpy(draw->cameraRows,projection.camera.m,sizeof(draw->cameraRows));std::memcpy(draw->origin,origin,sizeof(origin));
+    draw->h=projection.h;draw->offsetX=projection.offsetX;draw->offsetY=projection.offsetY;draw->pixelOffsetX=projection.pixelOffsetX;draw->pixelOffsetY=projection.pixelOffsetY;draw->nearPlane=projection.nearPlane;
+    for(unsigned k=0;k<3;++k)draw->tint[k]=float((projection.tintARGB>>(16-8*k))&255u)/255.f;draw->tint[3]=float(projection.tintARGB>>24)/255.f;
+    draw->epoch=modelRenderer.epoch();draw->textures=actorTextures?*actorTextures:asset->textures;
+    if(projection.hiddenMaterials)for(size_t m=0;m<projection.hiddenMaterials->size()&&m<64;++m)if((*projection.hiddenMaterials)[m])draw->hiddenMaterials|=1ull<<m;
+    if(projection.shade==&re3model::ShadeNativeNccs&&projection.shadeContext){
+        static const re3model::AssetLighting plain;const auto lit=re3model::AssetLightingStore().find(asset->id);
+        const auto& source=lit!=re3model::AssetLightingStore().end()&&lit->second.sculpted&&!gpuPlainLight?lit->second:plain;
+        re3gpu::MakeLight(re3model::MakeSculptedLighting(*static_cast<const re3model::NativeLighting*>(projection.shadeContext),source,{0,-1,0}),draw->light);draw->lit=true;
+    }else if(gpuDoorLight){re3gpu::MakeLight(*gpuDoorLight,draw->light);draw->lit=true;
+    }else if(projection.shade||projection.shadeVertex)return -1;
+    float zmin=0,zmax=0;std::string error;double skinnedAt=started;
+    if(preskinned){
+        // an overlay placed on its body: world vertices of this build
+        if(preskinned->size()!=asset->mesh.vertices.size()){if(modelObserved.insert("failed:"+asset->id).second)log("MODEL_PREPARE_FAILED %s overlay vertex count",asset->id.c_str());return 0;}
+        draw->skin=re3gpu::Skin::World;const auto lit=re3model::AssetLightingStore().find(asset->id);
+        const std::vector<uint8_t>* occlusion=lit!=re3model::AssetLightingStore().end()&&lit->second.sculpted?&lit->second.occlusion:nullptr;
+        draw->world.resize(preskinned->size());
+        auto positions=std::make_shared<std::vector<re3model::Vec3>>(preskinned->size());
+        for(size_t i=0;i<preskinned->size();++i){const auto& v=(*preskinned)[i];auto& out=draw->world[i];
+            std::memcpy(out.position,&v.position,12);std::memcpy(out.previous,&v.position,12);std::memcpy(out.normal,&v.normal,12);out.uv[0]=v.uv.x;out.uv[1]=v.uv.y;
+            out.colour=re3gpu::OcclusionColour(occlusion&&i<occlusion->size()?(*occlusion)[i]:uint8_t(255));(*positions)[i]=v.position;}
+        re3gpu::ScreenRectWorld(draw->world.data(),draw->world.size(),projection,draw->rect);
+        if(fps60Enabled&&fps60Actor){re3fps60::GpuRecorded before;
+            if(re3fps60::RecordGpu(fps60DrawKey(asset.get()),re3bridge::BuildSerial(),nullptr,{},positions,projection,nullptr,draw->rect,before)){
+                for(size_t i=0;i<draw->world.size();++i)std::memcpy(draw->world[i].previous,&(*before.positions)[i],12);gpuUniteRect(draw->rect,before.rect);}}
+        re3gpu::DepthRangeWorld(draw->world.data(),draw->world.size(),projection.camera.m+8,zmin,zmax);
+    }else{
+        const size_t boneCount=asset->mesh.inverseBind.size();const float* transforms=nullptr;unsigned stride=0;
+        if(asset->affineDualQuaternion){
+            modelLastSkinMode="affine-dual-quaternion";draw->skin=re3gpu::Skin::Affine;draw->paletteRegs=unsigned(boneCount)*re3gpu::kAffineRegs;
+            draw->palette=std::make_shared<std::vector<float>>(size_t(draw->paletteRegs)*4);
+            re3shoulder::Factors factors;re3model::Matrix3x4 head;
+            bool okay=asset->shoulderCorrective.Evaluate(asset->mesh,bones,factors,&error);
+            const bool lifted=okay&&re3gpu::CorrectiveHead(asset->shoulderCorrective,factors,bones,head);
+            okay=okay&&re3gpu::AffinePalette(asset->mesh,bones,lifted?&head:nullptr,draw->palette->data(),&error);
+            if(!okay){if(modelObserved.insert("failed:"+asset->id).second)log("MODEL_PREPARE_FAILED %s %s vertices=0",asset->id.c_str(),error.c_str());return 0;}
+            modelLastShoulderFactors=factors;
+            re3gpu::FillDynamic(asset->mesh,*mesh,&asset->shoulderCorrective,&factors,draw->dynamic);
+            draw->affineRows.resize(boneCount*12);for(size_t i=0;i<boneCount;++i){const auto t=re3model::Multiply(lifted&&i==1?head:bones[i],asset->mesh.inverseBind[i]);std::memcpy(&draw->affineRows[i*12],t.m,48);}
+            transforms=draw->affineRows.data();stride=12;
+        }else{
+            modelLastSkinMode="linear";modelLastShoulderFactors={};draw->paletteRegs=unsigned(boneCount)*re3gpu::kLinearRegs;
+            draw->palette=std::make_shared<std::vector<float>>(size_t(draw->paletteRegs)*4);
+            bool okay=re3gpu::LinearPalette(asset->mesh,bones,projection.boneTint,draw->palette->data(),&error);
+            if(okay&&asset->poseWeights.valid&&mesh->pose){okay=re3poseweights::Factors(asset->poseWeights,bones,draw->poseFactor,&error);
+                if(okay&&(draw->poseFactor[0]>0||draw->poseFactor[1]>0)){draw->skin=re3gpu::Skin::LinearPose;
+                    if((draw->poseFactor[0]>0.5f||draw->poseFactor[1]>0.5f)&&modelObserved.insert("pose-weights-on:"+asset->id+":"+currentScene).second)
+                        log("MODEL_POSE_WEIGHTS_ACTIVE %s scene=%s right=%.2f left=%.2f",asset->id.c_str(),currentScene.c_str(),draw->poseFactor[0],draw->poseFactor[1]);}}
+            if(!okay){if(modelObserved.insert("failed:"+asset->id).second)log("MODEL_PREPARE_FAILED %s %s vertices=0",asset->id.c_str(),error.c_str());return 0;}
+            if(!mesh->dynamicSource.empty())re3gpu::FillDynamic(asset->mesh,*mesh,nullptr,nullptr,draw->dynamic);
+            transforms=draw->palette->data();stride=re3gpu::kLinearRegs*4;
+        }
+        re3gpu::DepthRange(*mesh,transforms,stride,projection.camera.m+8,zmin,zmax);
+        re3gpu::ScreenRect(*mesh,transforms,stride,projection,draw->rect);
+        if(fps60Enabled&&fps60Actor){std::vector<re3model::Vec3> origins;origins.reserve(boneCount);for(size_t i=0;i<boneCount;++i)origins.push_back({bones[i].m[3],bones[i].m[7],bones[i].m[11]});
+            re3fps60::GpuRecorded before;
+            if(re3fps60::RecordGpu(fps60DrawKey(asset.get()),re3bridge::BuildSerial(),draw->palette,std::move(origins),nullptr,worldProjection,draw->poseFactor,draw->rect,before)&&*before.palette!=*draw->palette){
+                draw->previous=before.palette;draw->previousPoseFactor[0]=before.pose[0];draw->previousPoseFactor[1]=before.pose[1];gpuUniteRect(draw->rect,before.rect);
+                // the second skin may have ended since the build before: the in-between frame still blends out of it
+                if(mesh->pose&&(before.pose[0]>0||before.pose[1]>0))draw->skin=re3gpu::Skin::LinearPose;}}
+        skinnedAt=modelClockMs();
+        if(skinnedOut&&gpuBodySkinWanted&&!gpuCpuSkin(*asset,worldBones,*skinnedOut,error)){if(modelObserved.insert("failed:"+asset->id).second)log("MODEL_PREPARE_FAILED %s %s vertices=0",asset->id.c_str(),error.c_str());return 0;}
+    }
+    bool empty=false;if(!gpuBuckets(*asset,*draw,projection,zmin,zmax,empty))return 0;
+    gpuLastBody=draw;if(empty)return 1;
+    gpuAddJobs(draw,asset->id,plan);
+    const double doneAt=modelClockMs();auto& perf=modelPerf[asset->id];perf.count++;perf.skin+=skinnedAt-started;perf.prepare+=doneAt-skinnedAt;perf.maximum=(std::max)(perf.maximum,doneAt-started);
+    if(perf.count==300){log("MODEL_PERF %s samples=%u skin_avg_ms=%.3f prepare_avg_ms=%.3f upload_avg_ms=%.3f total_max_ms=%.3f gpu",asset->id.c_str(),perf.count,perf.skin/perf.count,perf.prepare/perf.count,0.0,perf.maximum);perf=ModelPerf{};}
+    if(modelObserved.insert("prepared:"+asset->id).second)log("MODEL_PREPARED %s triangles=%zu buckets=%u-%u skin=%u H=%.1f offset=%.1f,%.1f scale=%.3f,%.3f zsf3=%d gpu",asset->id.c_str(),asset->mesh.indices.size()/3,unsigned(draw->bucketLow),unsigned(draw->bucketHigh),unsigned(draw->skin),projection.h,projection.offsetX,projection.offsetY,projection.scaleX,projection.scaleY,projection.zsf3);
+    return 1;
+}
+// Wounds of a body drawn by the GPU path: the corners keep the body's bind vertex and weights, the shader adds the offset and
+// the pull toward the eye of appendWounds. Rebuilt each frame (a few hundred vertices at most per wound).
+static void appendWoundsGpu(const std::vector<re3wound::Wound>& wounds,const ModelAsset& body,const std::shared_ptr<re3gpu::Draw>& bodyDraw,const std::vector<uint8_t>* hidden,
+    const re3model::Projection& bodyProjection,re3bridge::ActorPlan& plan,const std::vector<uint8_t>* vertexBone,uint32_t goneBones){
+    if(wounds.empty())return;
+    re3model::Matrix3x4 view;if(!re3model::InverseAffine(bodyProjection.camera,view))return;
+    auto decals=getModel("wound-decals");
+    if(!decals||decals->mesh.materials.size()!=re3wound::kTextures){if(modelObserved.insert("wound-decals-unavailable").second)log("MODEL_WOUND_DECALS_UNAVAILABLE materials=%zu",decals?decals->mesh.materials.size():0);return;}
+    auto* mesh=gpuMeshOf(*decals);if(!mesh)return;
+    const auto found=re3model::AssetLightingStore().find(body.id);
+    const std::vector<uint8_t>* occlusion=found!=re3model::AssetLightingStore().end()&&found->second.sculpted&&!found->second.occlusion.empty()?&found->second.occlusion:nullptr;
+    auto draw=std::make_shared<re3gpu::Draw>();draw->owner=decals;draw->mesh=mesh;draw->name="wound-decals";draw->skin=re3gpu::Skin::Decal;draw->textures=decals->textures;
+    std::memcpy(draw->cameraRows,bodyDraw->cameraRows,sizeof(draw->cameraRows));draw->h=bodyDraw->h;draw->offsetX=bodyDraw->offsetX;draw->offsetY=bodyDraw->offsetY;draw->pixelOffsetX=bodyDraw->pixelOffsetX;draw->pixelOffsetY=bodyDraw->pixelOffsetY;draw->nearPlane=bodyDraw->nearPlane;
+    std::memcpy(draw->tint,bodyDraw->tint,sizeof(draw->tint));draw->light=bodyDraw->light;draw->lit=bodyDraw->lit;draw->palette=bodyDraw->palette;draw->previous=bodyDraw->previous;draw->paletteRegs=bodyDraw->paletteRegs;
+    std::memcpy(draw->rect,bodyDraw->rect,sizeof(draw->rect));draw->epoch=bodyDraw->epoch;draw->bucketHigh=bodyDraw->bucketHigh;draw->bucketLow=bodyDraw->bucketLow;draw->bucketDepth=bodyDraw->bucketDepth;draw->nearClosed=bodyDraw->nearClosed;
+    for(unsigned k=0;k<3;++k)draw->eye[k]=view.m[k*4+3]-bodyDraw->origin[k];
+    for(unsigned texture=0;texture<re3wound::kTextures;++texture){
+        const uint32_t first=uint32_t(draw->decal.size());
+        for(const auto& wound:wounds){
+            if(wound.texture!=texture||std::any_of(wound.corners.begin(),wound.corners.end(),[&](uint32_t v){return v>=body.mesh.vertices.size();}))continue;
+            for(size_t t=0;t<wound.material.size();++t){
+                if(hidden&&wound.material[t]<hidden->size()&&(*hidden)[wound.material[t]])continue;
+                if(vertexBone&&goneBones){const uint32_t v=wound.corners[wound.triangles[t*3]];if(v<vertexBone->size()&&((goneBones>>(*vertexBone)[v])&1u))continue;}
+                for(unsigned k=0;k<3;++k){const uint32_t corner=wound.triangles[t*3+k],source=wound.corners[corner];const auto& v=body.mesh.vertices[source];re3gpu::GpuVertex out;
+                    std::memcpy(out.position,&v.position,12);std::memcpy(out.normal,&v.normal,12);out.uv[0]=wound.uv[corner*2];out.uv[1]=wound.uv[corner*2+1];
+                    for(unsigned b=0;b<4;++b){out.bone[b]=uint8_t(v.bone[b]);out.weight[b]=float(v.weight[b])/65535.f;}
+                    out.colour=re3gpu::OcclusionColour(occlusion&&source<occlusion->size()?(*occlusion)[source]:uint8_t(255));draw->decal.push_back(out);}
+            }
+        }
+        if(uint32_t(draw->decal.size())>first)draw->decalRuns.push_back({first,uint32_t(draw->decal.size())-first,texture});
+    }
+    if(draw->decal.empty())return;
+    gpuAddJobs(draw,"wound-decals",plan);
+}
+static void gpuDrawEntries(const re3gpu::Entry* entries,size_t count){
+    gpuFlushing=true;const double started=modelClockMs();
+    auto dd=gogWrapper;bool ownScene=dd&&!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))ownScene=false;
+    const HRESULT hr=modelRenderer.drawGpu(entries,count,fps60Pass?fps60PassWeight:1.f,gpuStats);
+    if(ownScene)gameDevice->EndScene();
+    gpuFlushing=false;
+    const double spent=modelClockMs()-started;gpuStats.milliseconds+=spent;
+    if(!gpuInJob){if(fps60Pass)fps60PassDrawMs+=spent;else modelFrameDrawMs+=spent;}
+    if(FAILED(hr)&&!re3model::IsTransientDrawStatus(hr)){
+        log("MODEL_GPU_DRAW_FAILED hr=%08lx: the rest of the session uses the CPU path (%s)",hr,modelRenderer.gpuShaderError().c_str());modelGpuEnabled=false;}
+}
+// Native work is about to go over everything gathered so far: draw it. Called before the native queues reach the device,
+// from every device draw that is not ours, the flip and EndScene; re-entered by our own draws.
+static void gpuFlushPending(){
+    if(gpuList.empty()||gpuFlushing||!gameDevice)return;
+    gpuTraceNote("flush-full");
+    ++gpuStats.flushesFull;gpuDrawEntries(gpuList.data(),gpuList.size());gpuList.clear();++gpuListSerial;
+}
+// A quad of known extent (mask, UI): only the models it touches have to be down first. The others stay gathered, their
+// next jobs extend them: one draw instead of a split at every mask of the room.
+static void gpuFlushRect(float left,float top,float right,float bottom){
+    if(gpuTraceNow()){char text[128];sprintf_s(text,"quad %.0f,%.0f,%.0f,%.0f",left,top,right,bottom);gpuTraceNote(text);}
+    if(gpuList.empty()||gpuFlushing||!gameDevice)return;
+    static std::vector<re3gpu::Entry> now;now.clear();size_t kept=0;
+    for(size_t i=0;i<gpuList.size();++i){auto& entry=gpuList[i];const float* q=entry.draw->rect;
+        if(q[0]<right&&left<q[2]&&q[1]<bottom&&top<q[3]){entry.draw->listSerial=0;now.push_back(std::move(entry));}
+        else{entry.draw->listIndex=uint32_t(kept);if(kept!=i)gpuList[kept]=std::move(entry);++kept;}}
+    if(gpuTraceNow()){char text[128];sprintf_s(text,"flush-rect %.0f,%.0f,%.0f,%.0f now=%zu kept=%zu",left,top,right,bottom,now.size(),kept);gpuTraceNote(text);}
+    gpuList.resize(kept);if(!now.empty())gpuDrawEntries(now.data(),now.size());now.clear();
+}
+// A job only extends its model's bucket range while nothing native lies in between. Anything queued natively since the
+// last job goes over the models gathered so far, and under this one: they are drawn, then the native queues.
+static bool drawGpuJob(ModelJob& job,void* renderer){
+    auto dd=gogWrapper;if(!dd||!gameDevice)return false;auto& draw=*job.gpu;if(!draw.ready())return true;
+    keepDeviceHooks();   // the native draws after this job have to find the flush
+    const uint32_t queuedGame=*(uint32_t*)(static_cast<uint8_t*>(renderer)+0x84+0x8088);
+    // the wrapper's deferred queue: vertex and primitive counts the end of its flush 45B30 clears (47110, 47116); another
+    // wrapper build reads as always queued, which only costs the merging
+    static const bool wrapperKnown=*(uint16_t*)(dd+0x47110)==0x3d89&&*(uint32_t*)(dd+0x47112)==uint32_t(uintptr_t(dd+0x18197c))&&*(uint16_t*)(dd+0x47116)==0x3d89&&*(uint32_t*)(dd+0x47118)==uint32_t(uintptr_t(dd+0x4b1944));
+    const bool queuedWrapper=!wrapperKnown||*(uint32_t*)(dd+0x18197c)||*(uint32_t*)(dd+0x4b1944);
+    if(gpuTraceNow()){char text[160];sprintf_s(text,"gather %s bucket=%u game=%u wrapper=%u rect=%.0f,%.0f,%.0f,%.0f",job.name.c_str(),unsigned(job.bucket),queuedGame,unsigned(queuedWrapper),draw.rect[0],draw.rect[1],draw.rect[2],draw.rect[3]);gpuTraceNote(text);}
+    if(gpuList.empty()||queuedGame||queuedWrapper){
+        gpuFlushPending();flushGame(renderer);
+        auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);
+    }
+    if(draw.listSerial==gpuListSerial){auto& entry=gpuList[draw.listIndex];entry.high=(std::max)(entry.high,job.bucket);entry.low=(std::min)(entry.low,job.bucket);}
+    else{draw.listSerial=gpuListSerial;draw.listIndex=uint32_t(gpuList.size());gpuList.push_back({job.gpu,job.bucket,job.bucket});}
+    modelDraws++;
+    if(job.name=="jill-standard")modelRenderedActorMask|=1;else if(job.name=="dario")modelRenderedActorMask|=2;
+    if(modelObserved.insert("drawn:"+job.name).second)log("MODEL_DRAWN %s epoch=%llu buckets=%u-%u gpu",job.name.c_str(),draw.epoch,unsigned(draw.bucketLow),unsigned(draw.bucketHigh));
+    return true;
+}
+static size_t gpuPendingCount(){return gpuList.size();}
+static bool gpuFlushingNow(){return gpuFlushing;}
+static void gpuDropDraws(){
+    gpuList.clear();++gpuListSerial;gpuLastBody.reset();
+    for(auto& weak:gpuLiveDraws)if(auto draw=weak.lock()){draw->owner.reset();draw->mesh=nullptr;draw->indices.reset();draw->textures.clear();}
+    gpuLiveDraws.clear();
+}
 // skinnedOut: the skinned vertices of this asset for an overlay worn over it; preskinned: vertices already placed
 // (overlays), skinning is skipped.
 static bool appendModelJobs(const std::shared_ptr<ModelAsset>& asset,const std::vector<re3model::Matrix3x4>& bones,const re3model::Projection& projection,re3bridge::ActorPlan& plan,const std::vector<re3model::MaterialTextures>* actorTextures=nullptr,
     std::vector<re3model::SkinnedVertex>* skinnedOut=nullptr,const std::vector<re3model::SkinnedVertex>* preskinned=nullptr){
+    {const int gpu=appendGpuJobs(asset,bones,projection,plan,actorTextures,skinnedOut,preskinned);if(gpu>=0)return gpu>0;}
     std::string error;std::vector<re3model::SkinnedVertex> skinned;re3model::FrameGeometry geometry;
     // Fix 2026-10-25d: skinned arrays of earlier calls are reused (no fresh 0.5-2 MB per actor per frame).
     skinned=takeSkinSpare();struct GiveBack {std::vector<re3model::SkinnedVertex>& array;~GiveBack(){giveSkinSpare(std::move(array));}} giveBack{skinned};
@@ -1185,7 +1471,7 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     auto projection=actorProjection(context);
     if(zones||partMaterials){projection.hiddenMaterials=&hiddenMaterials;projection.sortWithinBucketByMaterial=true;}
     std::vector<uint8_t> bodyHidden;
-    if(partGone|split){bodyHidden.resize(body->triangleBone.size());for(size_t t=0;t<bodyHidden.size();++t)bodyHidden[t]=uint8_t(((partGone|split)>>body->triangleBone[t])&1u);projection.hiddenTriangles=&bodyHidden;}
+    if(partGone|split){bodyHidden.resize(body->triangleBone.size());for(size_t t=0;t<bodyHidden.size();++t)bodyHidden[t]=uint8_t(((partGone|split)>>body->triangleBone[t])&1u);projection.hiddenTriangles=&bodyHidden;projection.keepBones=~(partGone|split);}
     if(partGone|partShatter|partFalling|partScaled){char note[160];sprintf_s(note,"parts:%s:%x:%x:%x:%x:%u",name.c_str(),partGone,partShatter,partFalling,partScaled,unsigned(headGone));
         if(modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_SPLIT %s model=%02x gone=%x shatter=%x falling=%x scaled=%x headless=%u pieces=%u",name.c_str(),context.modelId,partGone,partShatter,partFalling,partScaled,unsigned(headGone),pieces);}
     re3model::NativeLighting lighting;
@@ -1240,18 +1526,30 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
         // The wounds stay for the whole room (cleared in beginModelBuild) and with the actor's model (actorState): a
         // part losing its native red only recolours it, and dead or downed enemies keep their wounds.
         if(damaged!=actor.damagedParts||(damaged&&actor.damageTint.size()!=body->mesh.vertices.size())){
-            actor.damagedParts=damaged;re3wound::damageTint(body->mesh,colour,damaged,actor.damageTint);
+            actor.damagedParts=damaged;re3wound::damageTint(body->mesh,colour,damaged,actor.damageTint);re3wound::damageBoneTint(colour,damaged,actor.damageBone);
             char note[96];sprintf_s(note,"damage-red:%s:%x",name.c_str(),damaged);
             if(damaged&&modelObserved.size()<4000&&modelObserved.insert(note).second){unsigned first=0;while(!((damaged>>first)&1u))++first;
                 log("MODEL_DAMAGE_RED %s model=%02x parts=%x colour=%06x",name.c_str(),context.modelId,damaged,colour[first]);}
         }
-        if(!actor.damageTint.empty())projection.vertexTint=&actor.damageTint;
+        if(!actor.damageTint.empty()){projection.vertexTint=&actor.damageTint;projection.boneTint=actor.damageBone;}
         woundsWanted=!actor.wounds.empty()||std::any_of(re3wound::pendingHits.begin(),re3wound::pendingHits.end(),[&](const re3wound::PendingHit& h){return h.actor==context.actor;});
     }
+    // GPU path: the CPU skin of the body only for an overlay's anchors and in the frame of a hit (the wound's ray cast)
+    const bool hitPending=woundsWanted&&std::any_of(re3wound::pendingHits.begin(),re3wound::pendingHits.end(),[&](const re3wound::PendingHit& h){return h.actor==context.actor;});
+    // a wounded body that the GPU decals cannot follow (second skin of NPC Carlos, affine EM5F): decals placed on the CPU
+    const bool cpuWounds=!actor.wounds.empty()&&(body->poseWeights.valid||body->affineDualQuaternion);
+    gpuBodySkinWanted=wearsOverlay||hitPending||cpuWounds;gpuLastBody.reset();
+    // Jill's harness rides 1013 of her 57811 vertices: the frame of no hit skins just those on the CPU
+    std::shared_ptr<ModelAsset> worn=wearsOverlay&&!hitPending&&!cpuWounds?getModel(rule->overlay):nullptr;
+    gpuBodySkinOnly=worn&&body->affineDualQuaternion&&gpuPathOn()&&!worn->wrapAnchors.empty()?&worn->wrapAnchors:nullptr;
+    if(gpuBodySkinOnly)bodySkinned.swap(gpuOverlayBody);
     const bool bodyReady=appendModelJobs(body,bones,projection,plan,actorTextures.empty()?nullptr:&actorTextures,(wearsOverlay||woundsWanted)?&bodySkinned:nullptr);
+    const auto bodyDraw=gpuLastBody;gpuBodySkinWanted=false;
+    const bool keptOverlayBody=gpuBodySkinOnly!=nullptr;gpuBodySkinOnly=nullptr;
+    struct OverlayBodyBack{std::vector<re3model::SkinnedVertex>& a;bool on;~OverlayBodyBack(){if(on)a.swap(gpuOverlayBody);}} overlayBodyBack{bodySkinned,keptOverlayBody};
     // falling pieces (R402 head from parts_down, limbs blown off): the piece's own native matrices, the rest of the mesh rigid
     // with its root, only the piece's triangles (a head of a pack with regions: the Head material); a failing piece skips itself
-    auto capProjection=projection;capProjection.hiddenMaterials=nullptr;capProjection.hiddenTriangles=nullptr;capProjection.vertexTint=nullptr;capProjection.sortWithinBucketByMaterial=false;
+    auto capProjection=projection;capProjection.hiddenMaterials=nullptr;capProjection.hiddenTriangles=nullptr;capProjection.keepBones=~0u;capProjection.vertexTint=nullptr;capProjection.boneTint=nullptr;capProjection.sortWithinBucketByMaterial=false;
     if(bodyReady&&rule&&reattach)if(auto caps=limbCaps(*body,reattach))appendModelJobs(caps,bones,capProjection,plan);
     for(unsigned k=0;k<pieces&&bodyReady;++k){
         const unsigned r=pieceRoot[k];const bool region=headGone&&int(r)==head;
@@ -1260,21 +1558,24 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
         for(unsigned b=0;b<boneCount;++b){re3model::Matrix3x4 bind;
             if((pieceBones[k]>>b)&1u)pose[b]=re3model::FromNativeMatrix(context.bones[b].world);else if(re3model::InverseAffine(body->mesh.inverseBind[b],bind))pose[b]=re3model::Multiply(rigid,bind);}
         auto pieceProjection=projection;std::vector<uint8_t> pieceMaterials,pieceTriangles;
-        if(region){pieceMaterials.resize(body->materialRegion.size());for(size_t m=0;m<pieceMaterials.size();++m)pieceMaterials[m]=body->materialRegion[m]!=ModelAsset::Head;pieceProjection.hiddenMaterials=&pieceMaterials;pieceProjection.hiddenTriangles=nullptr;}
-        else{pieceTriangles.resize(body->triangleBone.size());for(size_t t=0;t<pieceTriangles.size();++t){const unsigned b=body->triangleBone[t];pieceTriangles[t]=uint8_t(!((pieceBones[k]>>b)&1u)||((partGone>>b)&1u));}pieceProjection.hiddenTriangles=&pieceTriangles;}
+        if(region){pieceMaterials.resize(body->materialRegion.size());for(size_t m=0;m<pieceMaterials.size();++m)pieceMaterials[m]=body->materialRegion[m]!=ModelAsset::Head;pieceProjection.hiddenMaterials=&pieceMaterials;pieceProjection.hiddenTriangles=nullptr;pieceProjection.keepBones=~0u;}
+        else{pieceTriangles.resize(body->triangleBone.size());for(size_t t=0;t<pieceTriangles.size();++t){const unsigned b=body->triangleBone[t];pieceTriangles[t]=uint8_t(!((pieceBones[k]>>b)&1u)||((partGone>>b)&1u));}pieceProjection.hiddenTriangles=&pieceTriangles;pieceProjection.keepBones=pieceBones[k]&~partGone;}
         const bool drawn=appendModelJobs(body,pose,pieceProjection,plan,actorTextures.empty()?nullptr:&actorTextures);
         if(drawn&&!region)if(auto caps=limbCaps(*body,pieceBones[k]))appendModelJobs(caps,pose,capProjection,plan);
         const float dx=raw.m[3]-bones[r].m[3],dy=raw.m[7]-bones[r].m[7],dz=raw.m[11]-bones[r].m[11],drift=std::sqrt(dx*dx+dy*dy+dz*dz);
         char note[96];sprintf_s(note,"piece:%p:%u:%u",context.actor,r,unsigned(drift>300));
         if(modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_PIECE %s model=%02x actor=%p part=%u parent=%d bones=%x flags=%x drift=%.0f region=%u drawn=%u",name.c_str(),context.modelId,context.actor,r,pieceParent[k],pieceBones[k],context.bones[r].flags,drift,unsigned(region),unsigned(drawn));
     }
-    projection.vertexTint=nullptr; // the body's own vertex order only
+    projection.vertexTint=nullptr;projection.boneTint=nullptr; // the body's own vertex order only
     if(partMaterials){projection.hiddenMaterials=nullptr;projection.sortWithinBucketByMaterial=false;} // the body's own materials only
-    projection.hiddenTriangles=nullptr;
+    projection.hiddenTriangles=nullptr;projection.keepBones=~0u;
     if(jill){const auto tag=recordModelPoseSequence(context,bodyReady?modelLastSkinMode:"native-fallback",bodyReady&&body->affineDualQuaternion?&modelLastShoulderFactors:nullptr);if(!tag.empty()&&!plan.jobs.empty())reinterpret_cast<ModelJob*>(plan.jobs.front().token)->captureTag=tag;}
     if(!bodyReady)return false;
     if(wearsOverlay)appendOverlay(name,rule->overlay,bodySkinned,projection,plan);
-    if(woundsWanted){takeShots(context,actor,*body,bodySkinned,zones||partMaterials?&hiddenMaterials:nullptr,name);appendWounds(actor.wounds,bodySkinned,zones||partMaterials?&hiddenMaterials:nullptr,projection,plan,body->id,&body->vertexBone,partGone|split);}
+    if(woundsWanted){const auto* hiddenBody=zones||partMaterials?&hiddenMaterials:nullptr;
+        if(!bodySkinned.empty())takeShots(context,actor,*body,bodySkinned,hiddenBody,name);
+        if(bodyDraw&&bodyDraw->skin==re3gpu::Skin::Linear)appendWoundsGpu(actor.wounds,*body,bodyDraw,hiddenBody,projection,plan,&body->vertexBone,partGone|split);
+        else appendWounds(actor.wounds,bodySkinned,hiddenBody,projection,plan,body->id,&body->vertexBone,partGone|split);}
     if(weapon&&context.bones[4].visible){
         std::vector<re3model::Matrix3x4> hand{bones[4]}; // same (smoothed) hand as the body
         if(!appendModelJobs(weapon,hand,projection,plan))return false;
@@ -1353,6 +1654,7 @@ static bool beginModelBuild(void*,uint32_t serial){
     // v12: wounds and damage red belong to the enemies of one room visit; queued hits wait 30 frames for their actor
     static uint32_t woundRoom=~0u;
     if((cameraKey>>8)!=woundRoom){
+        ruleMemos.clear();
         size_t cleared=0;for(auto& entry:actorRuntime){cleared+=entry.second.wounds.size();entry.second.wounds.clear();entry.second.damageTint.clear();entry.second.damagedParts=0;}
         if(cleared)log("MODEL_WOUND_CLEAR room=%04x wounds=%zu",unsigned(cameraKey>>8),cleared);
         woundRoom=cameraKey>>8;re3wound::pendingHits.clear();
@@ -1373,8 +1675,11 @@ static bool beginModelBuild(void*,uint32_t serial){
     // deferred frames whose jobs were never drawn: dropped from the queue (prepared alone if one is drawn after all)
     if(pendingFrames.size()>96){for(auto& pf:pendingFrames)pf->queued=false;pendingFrames.clear();}
     if(modelStateRestoreRequest>=0){modelRenderer.lightStateRestore=modelStateRestoreRequest!=0;modelStateRestoreRequest=-1;log("MODEL_STATE_RESTORE %s",modelRenderer.lightStateRestore?"light":"full");}
+    if(modelGpuRequestCommand>=0){modelGpuEnabled=modelGpuRequestCommand!=0;modelGpuRequestCommand=-1;log("MODEL_GPU %s",modelGpuEnabled?"on":"off");}
+    if(modelGpuPixelRequestCommand>=0){modelRenderer.gpuPixelLight=modelGpuPixelRequestCommand!=0;modelGpuPixelRequestCommand=-1;log("MODEL_GPU_LIGHT %s",modelRenderer.gpuPixelLight?"pixel":"vertex");}
+    if(serial%300==0&&gpuStats.flushes){const double n=300;log("MODEL_GPU_STATS builds=300 flushes=%.1f entries=%.1f draws=%.1f triangles=%.0f upload_kb=%.1f flush_ms=%.3f full_flushes=%.1f (per build; in-between frames add theirs)",gpuStats.flushes/n,gpuStats.entries/n,gpuStats.draws/n,gpuStats.triangles/n,gpuStats.bytes/n/1024,gpuStats.milliseconds/n,gpuStats.flushesFull/n);gpuStats=re3gpu::Stats{};}
     pollToggle();modelDraws=0;
-    previousMode=desiredEnabled;modelAutoCapture=GetPrivateProfileIntA("pilot","auto_capture",1,(root+"\\pilot.ini").c_str())!=0;
+    previousMode=desiredEnabled;if(serial%300==1)modelAutoCapture=GetPrivateProfileIntA("pilot","auto_capture",1,(root+"\\pilot.ini").c_str())!=0;
     diagnosticActorControl();
     if(modelReloadRequested){modelReloadRequested=false;modelAssets.clear();modelObserved.clear();modelFatal=false;log("MODEL_RELOAD next-build assets refreshed; queued GPU payloads retained");}
     if(!modelLoadRequest.empty()&&gameDevice){const bool ready=getModel(modelLoadRequest)!=nullptr;log("MODEL_LOAD_TEST %s ready=%u",modelLoadRequest.c_str(),ready);modelLoadRequest.clear();}
@@ -1418,8 +1723,11 @@ static const re3model::GpuFrame* fps60Mid(const std::shared_ptr<re3model::GpuFra
     return mid?mid.get():real.get();
 }
 static bool drawModelJob(void*,void* renderer,uintptr_t token){
+    if(auto gpuJob=reinterpret_cast<ModelJob*>(token);gpuJob&&gpuJob->gpu){
+        ModelCostTimer cost(fps60Pass?fps60PassDrawMs:modelFrameDrawMs);gpuInJob=true;if(!fps60Pass)++modelFrameJobs;const bool okay=drawGpuJob(*gpuJob,renderer);gpuInJob=false;return okay;}
     if(fps60Pass){
         auto job=reinterpret_cast<ModelJob*>(token);if(!job||!gameDevice)return false;
+        gpuFlushPending();
         if(job->pending){const double resolving=modelClockMs();const bool any=resolvePendingJob(*job);fps60PassResolveMs+=modelClockMs()-resolving;if(!any)return true;}
         if(!job->geometry)return false;
         const auto* shown=fps60Mid(job->geometry);
@@ -1432,12 +1740,14 @@ static bool drawModelJob(void*,void* renderer,uintptr_t token){
         return SUCCEEDED(hr)||re3model::IsTransientDrawStatus(hr);
     }
     ModelCostTimer cost(modelFrameDrawMs);++modelFrameJobs;
+    gpuFlushPending();
     auto job=reinterpret_cast<ModelJob*>(token);if(!job||!gameDevice)return false;
     if(job->pending&&!resolvePendingJob(*job))return true;   // deferred: empty bucket (or its frame failed, logged once)
     if(!job->geometry)return false;
     flushGame(renderer);auto dd=gogWrapper;if(!dd)return false;
     auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);
     bool ownScene=!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))return false;
+    if(gpuTraceNow()){char text[128];sprintf_s(text,"cpu-slice %s slice=%zu",job->name.c_str(),size_t(job->slice));gpuTraceNote(text);}
     auto hr=modelRenderer.drawSlice(*job->geometry,job->slice,job->options);
     if(ownScene)gameDevice->EndScene();
     if(re3model::IsTransientDrawStatus(hr)){if(modelObserved.insert("transient-device").second)log("MODEL_DEVICE_WAIT hr=%08lx",hr);return true;}
@@ -1451,12 +1761,13 @@ static bool drawModelJob(void*,void* renderer,uintptr_t token){
     return true;
 }
 static size_t releaseModelDeviceResources(ULONG* deviceReferences){
+    gpuDropDraws();
     if(deviceReferences)*deviceReferences=modelRenderer.deviceReferences();
     const size_t assets=modelAssets.size();
     modelRenderer.releaseDeviceResources();modelAssets.clear();modelObserved.clear();modelFatal=false;
     return assets;
 }
-static void beforeModelDeviceReset(){modelRenderer.beforeReset();}
+static void beforeModelDeviceReset(){gpuDropDraws();modelRenderer.beforeReset();}
 static void afterModelDeviceReset(HRESULT result){modelRenderer.afterReset(result);if(SUCCEEDED(result)){modelFatal=false;modelObserved.erase("transient-device");}}
 // v12 wounds: the enemy shot test 452DB0 (hand matrix, per-model weapon table, weapon) walks the enemy list (A5CDCC up
 // to the end pointer at A5CE6C: the actor loop's own actor pointers past the player and partner) and writes a hit into
@@ -1564,6 +1875,8 @@ static void installModels(){
     fps60Enabled=GetPrivateProfileIntA("pilot","fps60",1,(root+"\\pilot.ini").c_str())!=0;
     modelMotionSmoothing=GetPrivateProfileIntA("pilot","motion_smoothing",1,(root+"\\pilot.ini").c_str())!=0;
     modelCharactersAllRooms=GetPrivateProfileIntA("pilot","characters_all_rooms",1,(root+"\\pilot.ini").c_str())!=0;
+    modelGpuEnabled=GetPrivateProfileIntA("pilot","gpu_models",1,(root+"\\pilot.ini").c_str())!=0;
+    modelRenderer.gpuPixelLight=GetPrivateProfileIntA("pilot","gpu_pixel_light",0,(root+"\\pilot.ini").c_str())!=0;
     if(!modelActive)return;modelRenderer.setLogger(modelMessage);
     if(GetPrivateProfileIntA("pilot","characters",1,(root+"\\pilot.ini").c_str())){loadActorRules();loadLooks();}
     loadWeapons();

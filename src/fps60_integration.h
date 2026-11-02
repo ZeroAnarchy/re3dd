@@ -144,6 +144,9 @@ static void fps60DrawNotice(){
 using FlipFn=int(__thiscall*)(void*,int);
 static double fps60FlipMs=0;
 static int __fastcall fps60FlipHook(void* display,void*,int argument){
+    {std::lock_guard<std::recursive_mutex> guard(mutex);keepDeviceHooks();}
+    gpuFlushPending();   // the queue is drawn: the models still gathered go down before the flip
+    {std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceFrame();gpuTraceNote(fps60Pass?"flip in-between":"flip");}
     {std::lock_guard<std::recursive_mutex> guard(mutex);fps60DrawNotice();fps60CutFlip();
         if(fps60Pass&&fps60ShownBackground&&frame==fps60PassFrame&&++fps60TornPasses<=20)log("FPS60_TORN_PASS queue=%u scene=%s (in-between frame drawn without the background)",fps60CutPassQueue,currentScene.c_str());}
     const double started=modelClockMs();const int result=reinterpret_cast<FlipFn>(gameBase+0x10fe0)(display,argument);fps60FlipMs+=modelClockMs()-started;

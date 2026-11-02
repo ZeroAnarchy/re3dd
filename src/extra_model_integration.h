@@ -138,6 +138,25 @@ inline bool prepareDoor(void* objectPointer,void* packets,void* temporary,bool& 
     auto cameraMatrix=re3model::FromNativeMatrix(read<re3bridge::Matrix32>(object,0x4c));
     if(rule->transformed)cameraMatrix=re3model::Multiply(cameraMatrix,rule->transform);
     re3model::FrameGeometry geometry;std::string error;
+    // GPU path: the static mesh with the door's camera matrix as its one bone, in camera space like the CPU path
+    const auto table0=read<std::uint32_t*>(reinterpret_cast<void*>(gameBase+(style==0x20?0x65c7e8:0x65c7a4)));
+    const std::size_t byteOffset0=style==0x10?0x81c:style==0x30?0x20:0;const unsigned slots0=style==0x20?2u:64u;
+    if(projection.shadeVertex&&table0&&accessible(reinterpret_cast<const std::uint8_t*>(table0)+byteOffset0,slots0*4,true)){
+        auto gpuProjection=projection;gpuProjection.camera=re3model::Matrix3x4{};re3bridge::ActorPlan gpuPlan;
+        gpuBucketShift=depth.shift;gpuNearCut=false;gpuDoorLight=&doorShade;gpuPlainLight=false;
+        const int gpu=appendGpuJobs(asset,{cameraMatrix},gpuProjection,gpuPlan,nullptr,nullptr,nullptr);
+        gpuBucketShift=3;gpuNearCut=true;gpuDoorLight=nullptr;
+        if(gpu>0&&!gpuPlan.jobs.empty()){
+            std::vector<re3bridge::AbsoluteJob> absolute;absolute.reserve(gpuPlan.jobs.size());bool fits=true;
+            for(const auto& job:gpuPlan.jobs){fits=fits&&job.bucket<slots0;absolute.push_back({reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(table0)+byteOffset0)+job.bucket,job});}
+            if(fits&&re3bridge::EnqueueAbsoluteBatch(absolute)){
+                published=true;originalDoorObject(objectPointer,packets,&empty);re3prop::noteUse(rule->asset);
+                if(modelObserved.insert(std::string("door-prepared:")+part+rule->asset).second)log("MODEL_DOOR_PREPARED %s asset=%s identity=%s xf=%u object=%p flags=%04x style=%02x jobs=%zu matrix=camera-space gpu",part,rule->asset.c_str(),
+                    re3prop::identityText(identity).c_str(),rule->transformed?1u:0u,objectPointer,flags,style,gpuPlan.jobs.size());
+                return true;}
+        }
+        if(gpu==0)return false;
+    }
     if(!re3model::PrepareRigidByCameraMatrix(asset->mesh,cameraMatrix,projection,geometry,&error)||geometry.vertices.empty()){
         once(rule->asset+"-prepare",error.c_str());return false;
     }

@@ -58,11 +58,10 @@ inline bool Load(const std::string& path,const std::string& meshPath,const Mesh&
     result.valid=true;output=std::move(result);if(error)error->clear();return true;
 }
 
-// factors[side] receives the blend factor used this frame; skinned must be the plain skin of mesh with world.
-inline bool Apply(const PoseWeights& weights,const Mesh& mesh,const std::vector<Matrix3x4>& world,std::vector<SkinnedVertex>& skinned,float factors[2],std::string* error){
+// factors[side]: how far this pose blends the second skin in.
+inline bool Factors(const PoseWeights& weights,const std::vector<Matrix3x4>& world,float factors[2],std::string* error){
     auto fail=[&](const char* text){if(error)*error=text;return false;};
     factors[0]=factors[1]=0;
-    if(!weights.valid||skinned.size()!=mesh.vertices.size()||world.size()<mesh.inverseBind.size())return fail("pose weights: unbound or incomplete pose");
     const auto& torso=world[0];double a[9];for(unsigned r=0;r<3;++r)for(unsigned c=0;c<3;++c)a[r*3+c]=torso.m[r*4+c];
     const double det=a[0]*(a[4]*a[8]-a[5]*a[7])-a[1]*(a[3]*a[8]-a[5]*a[6])+a[2]*(a[3]*a[7]-a[4]*a[6]);
     if(!(std::abs(det)>1.e-12)||!std::isfinite(det))return fail("pose weights: singular torso");
@@ -76,6 +75,13 @@ inline bool Apply(const PoseWeights& weights,const Mesh& mesh,const std::vector<
         if(!(length>1.e-9)||!std::isfinite(length))return fail("pose weights: degenerate arm direction");
         factors[side]=Smoothstep(d.forwardLow,d.forwardHigh,float(local[0]/length))*(1-Smoothstep(d.downLow,d.downHigh,float(local[1]/length)));
     }
+    return true;
+}
+// factors[side] receives the blend factor used this frame; skinned must be the plain skin of mesh with world.
+inline bool Apply(const PoseWeights& weights,const Mesh& mesh,const std::vector<Matrix3x4>& world,std::vector<SkinnedVertex>& skinned,float factors[2],std::string* error){
+    auto fail=[&](const char* text){if(error)*error=text;return false;};
+    if(!weights.valid||skinned.size()!=mesh.vertices.size()||world.size()<mesh.inverseBind.size())return fail("pose weights: unbound or incomplete pose");
+    if(!Factors(weights,world,factors,error))return false;
     if(factors[0]<=0&&factors[1]<=0)return true;   // lowered arms: the plain skin, untouched
     std::vector<Matrix3x4> transforms(mesh.inverseBind.size()),normals(mesh.inverseBind.size());std::vector<std::uint8_t> ready(mesh.inverseBind.size(),0);
     for(const auto& e:weights.entries){const float s=factors[e.side];if(s<=0)continue;

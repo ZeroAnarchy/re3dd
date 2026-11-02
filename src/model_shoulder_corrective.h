@@ -39,6 +39,7 @@ public:
     // The bound Mesh is immutable after loading, as are normal runtime assets.
     bool Matches(const Mesh& mesh)const{return valid_&&boundVertices_==mesh.vertices.data()&&byVertex_.size()==mesh.vertices.size()&&boundIndices_==mesh.indices.data()&&indexCount_==mesh.indices.size()&&boundInverse_==mesh.inverseBind.data()&&boneCount_==mesh.inverseBind.size();}
     std::size_t EntryCount()const{return entries_.size();}
+    const std::vector<Entry>& Entries()const{return entries_;}
     std::size_t MemoryBytes()const{return entries_.capacity()*sizeof(Entry)+(byVertex_.capacity()+raisedByVertex_.capacity())*sizeof(std::uint32_t);}
     bool HasRaised()const{return hasRaised_;}
     unsigned FormatVersion()const{return valid_?(hasRaised_?2u:1u):0u;}

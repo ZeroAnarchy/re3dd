@@ -37,6 +37,7 @@ public:
     bool Valid()const{return valid_;}
     std::size_t DeformerCount()const{return deformers_.size();}
     std::size_t AffectedCount()const{return affected_.size();}
+    const std::vector<std::uint32_t>& Affected()const{return affected_;}
     Vec3 EyeCentre()const{return eyeCentre_;}
     std::size_t MemoryBytes()const{return entries_.capacity()*sizeof(Entry)+slot_.capacity()*4+affected_.capacity()*4+basePosition_.capacity()*4*sizeof(Vec3);}
     // Writes deformed positions/normals of the affected vertices into mesh (same object it was loaded for).

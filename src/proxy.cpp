@@ -53,6 +53,7 @@ static void glockDiagnostic();
 static const void* glockCombatFor(const void* combat,int weapon); // glock18c.h: AUTO hit table for the enemy shot test
 static void glockShotDone(int weapon,const uint8_t* actor,int lifeBefore);
 static int modelStateRestoreRequest=-1; // diagnostic A/B: 1 light per-slice state restore, 0 full state block
+static int modelGpuRequestCommand=-1,modelGpuPixelRequestCommand=-1;   // pilot.command gpu-on/off, gpu-pixel/vertex (taken at the next build)
 static bool f8WasDown = false;
 static volatile LONG toggleRequested=0;
 static volatile LONG fps60ToggleRequested=0;   // F7: 60 fps HD models on/off (fps60_integration.h)
@@ -85,6 +86,12 @@ static bool uiRawReady=false;
 static bool uiReady=false;
 static unsigned uiFrameSerial=0,uiDraws=0;
 static void installGameHooks();
+static void gpuFlushPending();   // model_integration.h: models gathered by the GPU path go down before any other draw
+static bool gpuFlushingNow();
+static void gpuTraceNote(const char* text);
+static void keepDeviceHooks();
+static void gpuFlushRect(float left,float top,float right,float bottom);
+static size_t gpuPendingCount();
 static void beforeModelDeviceReset();
 static void afterModelDeviceReset(HRESULT);
 static size_t releaseModelDeviceResources(ULONG*);
@@ -401,20 +408,74 @@ static HRESULT STDMETHODCALLTYPE setTexture(IDirect3DDevice9* d,DWORD stage,IDir
   if(stage<16){boundHash[stage]=hash;boundReplaced[stage]=replaced;}
   return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,DWORD,IDirect3DBaseTexture9*)>(devices.at(d),65)(d,stage,t);
 }
+// The originals of a device call. A device the hooks were not installed for (another device on a shared table) gets
+// the originals of its table, never the hooked entries themselves.
+static Object& deviceObject(IDirect3DDevice9* d){
+  auto it=devices.find(d);if(it!=devices.end())return it->second;
+  static Object other;void** table=*(void***)d;auto found=originalTables.find(table);other={found!=originalTables.end()?found->second:table,table,0};return other;
+}
+// pilot.ini gpu_device_trace=1: what reaches the device besides draws, one line per frame whose sequence differs from the last
+static bool gpuTraceOn=false;static std::string gpuTraceText,gpuTraceSign,gpuTraceLast;static unsigned gpuTraceLogged=0,gpuTraceDraws=0;
+static void gpuTraceEvent(const std::string& text){
+  if(gpuTraceText.size()<1500){if(gpuTraceDraws)gpuTraceText+="d"+std::to_string(gpuTraceDraws)+" ";gpuTraceText+=text;gpuTraceText+=' ';}
+  gpuTraceDraws=0;gpuTraceSign+=text.substr(0,text.find(':'));gpuTraceSign+=gpuPendingCount()?'+':'-';
+}
+static void gpuTraceFrame(){
+  if(!gpuTraceOn)return;
+  if(gpuTraceSign!=gpuTraceLast&&gpuTraceLogged<600){++gpuTraceLogged;log("GPU_TRACE frame=%u %s d%u",frame,gpuTraceText.c_str(),gpuTraceDraws);gpuTraceLast=gpuTraceSign;}
+  gpuTraceText.clear();gpuTraceSign.clear();gpuTraceDraws=0;
+}
+// pilot.ini gpu_trace_frames=a,b,...: every gather, flush, quad and device draw of those frames, in order
+static std::vector<unsigned> gpuTraceFrames;static bool gpuTraceNow(){return !gpuTraceFrames.empty()&&std::find(gpuTraceFrames.begin(),gpuTraceFrames.end(),frame)!=gpuTraceFrames.end();}
+static void gpuTraceDetail(IDirect3DDevice9* d,const char* kind,D3DPRIMITIVETYPE type,UINT count,const void* data,UINT stride){
+  if(!gpuTraceNow())return;DWORD z=0,alpha=0,src=0,dst=0,fvf=0;d->GetRenderState(D3DRS_ZENABLE,&z);d->GetRenderState(D3DRS_ALPHABLENDENABLE,&alpha);d->GetRenderState(D3DRS_SRCBLEND,&src);d->GetRenderState(D3DRS_DESTBLEND,&dst);d->GetFVF(&fvf);
+  IDirect3DBaseTexture9* texture=nullptr;d->GetTexture(0,&texture);if(texture)texture->Release();
+  char extra[160]="";if(data&&stride>=20&&(fvf&D3DFVF_POSITION_MASK)==D3DFVF_XYZRHW){const float* v=static_cast<const float*>(data);float l=v[0],t=v[1],r=v[0],b=v[1];const unsigned n=type==D3DPT_TRIANGLESTRIP||type==D3DPT_TRIANGLEFAN?count+2:count*3;
+    for(unsigned i=1;i<n&&i<4096;++i){const float* w=reinterpret_cast<const float*>(static_cast<const uint8_t*>(data)+i*stride);l=(std::min)(l,w[0]);r=(std::max)(r,w[0]);t=(std::min)(t,w[1]);b=(std::max)(b,w[1]);}
+    sprintf_s(extra," rect=%.0f,%.0f,%.0f,%.0f colour=%08lx",l,t,r,b,*reinterpret_cast<const DWORD*>(static_cast<const uint8_t*>(data)+16));}
+  log("GPU_TRACE_EVENT draw-%s type=%u n=%u pending=%zu z=%lu alpha=%lu %lu/%lu fvf=%lx tex=%p%s",kind,unsigned(type),count,gpuPendingCount(),z,alpha,src,dst,fvf,(void*)texture,extra);
+}
+static void gpuTraceNote(const char* text){if(gpuTraceNow())log("GPU_TRACE_EVENT %s pending=%zu",text,gpuPendingCount());}
+static void gpuTraceDraw(){if(!gpuTraceOn)return;if(gpuPendingCount())gpuTraceEvent("drawflush:"+std::to_string(gpuPendingCount()));++gpuTraceDraws;}
 static void drawInfo(IDirect3DDevice9* d,const char* kind,UINT count){
   if(!trace||!boundHash[0]||!drawnHashes.insert(boundHash[0]).second)return;
   DWORD z=0,zb=0,alpha=0,src=0,dst=0;d->GetRenderState(D3DRS_ZENABLE,&z);d->GetRenderState(D3DRS_ZWRITEENABLE,&zb);d->GetRenderState(D3DRS_ALPHABLENDENABLE,&alpha);d->GetRenderState(D3DRS_SRCBLEND,&src);d->GetRenderState(D3DRS_DESTBLEND,&dst);
   log("DRAW %s hash=%016llx count=%u z=%lu zw=%lu alpha=%lu src=%lu dst=%lu replaced=%u",kind,boundHash[0],count,z,zb,alpha,src,dst,boundReplaced[0]);
 }
-static HRESULT STDMETHODCALLTYPE drawPrimitive(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT s,UINT n){std::lock_guard<std::recursive_mutex> guard(mutex);drawInfo(d,"primitive",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,UINT)>(devices.at(d),81)(d,t,s,n);}
-static HRESULT STDMETHODCALLTYPE drawIndexed(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,INT b,UINT m,UINT v,UINT s,UINT n){std::lock_guard<std::recursive_mutex> guard(mutex);drawInfo(d,"indexed",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,INT,UINT,UINT,UINT,UINT)>(devices.at(d),82)(d,t,b,m,v,s,n);}
-static HRESULT STDMETHODCALLTYPE drawUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT n,const void* v,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);drawInfo(d,"up",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,const void*,UINT)>(devices.at(d),83)(d,t,n,v,stride);}
-static HRESULT STDMETHODCALLTYPE drawIndexedUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT m,UINT v,UINT n,const void* i,D3DFORMAT f,const void* data,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);drawInfo(d,"indexedup",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,UINT,UINT,const void*,D3DFORMAT,const void*,UINT)>(devices.at(d),84)(d,t,m,v,n,i,f,data,stride);}
+static HRESULT STDMETHODCALLTYPE drawPrimitive(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT s,UINT n){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"primitive",t,n,nullptr,0);gpuTraceDraw();gpuFlushPending();drawInfo(d,"primitive",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,UINT)>(deviceObject(d),81)(d,t,s,n);}
+static HRESULT STDMETHODCALLTYPE drawIndexed(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,INT b,UINT m,UINT v,UINT s,UINT n){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"indexed",t,n,nullptr,0);gpuTraceDraw();gpuFlushPending();drawInfo(d,"indexed",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,INT,UINT,UINT,UINT,UINT)>(deviceObject(d),82)(d,t,b,m,v,s,n);}
+static HRESULT STDMETHODCALLTYPE drawUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT n,const void* v,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"up",t,n,v,stride);gpuTraceDraw();gpuFlushPending();drawInfo(d,"up",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,const void*,UINT)>(deviceObject(d),83)(d,t,n,v,stride);}
+static HRESULT STDMETHODCALLTYPE drawIndexedUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT m,UINT v,UINT n,const void* i,D3DFORMAT f,const void* data,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"indexedup",t,n,nullptr,0);gpuTraceDraw();gpuFlushPending();drawInfo(d,"indexedup",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,UINT,UINT,const void*,D3DFORMAT,const void*,UINT)>(deviceObject(d),84)(d,t,m,v,n,i,f,data,stride);}
+static HRESULT STDMETHODCALLTYPE endSceneHook(IDirect3DDevice9* d){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceNote("endscene");gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*)>(deviceObject(d),42)(d);}
+// Anything that fills pixels or changes where they land also has to wait for the models gathered before it
+static HRESULT STDMETHODCALLTYPE clearHook(IDirect3DDevice9* d,DWORD count,const D3DRECT* rects,DWORD flags,D3DCOLOR colour,float z,DWORD stencil){std::lock_guard<std::recursive_mutex> guard(mutex);
+  if(gpuTraceOn&&!gpuFlushingNow()){char text[96];const D3DRECT r=count&&rects?rects[0]:D3DRECT{};sprintf_s(text,"clear:%lu,%lx,%08lx,%ld,%ld,%ld,%ld",count,flags,colour,r.x1,r.y1,r.x2,r.y2);gpuTraceEvent(text);}
+  gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,DWORD,const D3DRECT*,DWORD,D3DCOLOR,float,DWORD)>(deviceObject(d),43)(d,count,rects,flags,colour,z,stencil);}
+static HRESULT STDMETHODCALLTYPE colorFillHook(IDirect3DDevice9* d,IDirect3DSurface9* surface,const RECT* r,D3DCOLOR colour){std::lock_guard<std::recursive_mutex> guard(mutex);
+  if(gpuTraceOn){char text[96];const RECT q=r?*r:RECT{};sprintf_s(text,"fill:%08lx,%ld,%ld,%ld,%ld",colour,q.left,q.top,q.right,q.bottom);gpuTraceEvent(text);}
+  gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,IDirect3DSurface9*,const RECT*,D3DCOLOR)>(deviceObject(d),35)(d,surface,r,colour);}
+static HRESULT STDMETHODCALLTYPE stretchRectHook(IDirect3DDevice9* d,IDirect3DSurface9* source,const RECT* from,IDirect3DSurface9* target,const RECT* to,D3DTEXTUREFILTERTYPE filter){std::lock_guard<std::recursive_mutex> guard(mutex);
+  if(gpuTraceOn){char text[96];const RECT q=to?*to:RECT{};sprintf_s(text,"stretch:%ld,%ld,%ld,%ld",q.left,q.top,q.right,q.bottom);gpuTraceEvent(text);}
+  gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,IDirect3DSurface9*,const RECT*,IDirect3DSurface9*,const RECT*,D3DTEXTUREFILTERTYPE)>(deviceObject(d),34)(d,source,from,target,to,filter);}
+static HRESULT STDMETHODCALLTYPE setRenderTargetHook(IDirect3DDevice9* d,DWORD index,IDirect3DSurface9* surface){std::lock_guard<std::recursive_mutex> guard(mutex);
+  if(gpuTraceOn)gpuTraceEvent("target");
+  gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,DWORD,IDirect3DSurface9*)>(deviceObject(d),37)(d,index,surface);}
+static HRESULT STDMETHODCALLTYPE setViewportHook(IDirect3DDevice9* d,const D3DVIEWPORT9* v){std::lock_guard<std::recursive_mutex> guard(mutex);
+  D3DVIEWPORT9 now{};if(v&&SUCCEEDED(d->GetViewport(&now))&&(now.X!=v->X||now.Y!=v->Y||now.Width!=v->Width||now.Height!=v->Height||now.MinZ!=v->MinZ||now.MaxZ!=v->MaxZ)){
+    if(gpuTraceOn&&!gpuFlushingNow()){char text[96];sprintf_s(text,"viewport:%lu,%lu,%lu,%lu",v->X,v->Y,v->Width,v->Height);gpuTraceEvent(text);}
+    gpuFlushPending();}
+  return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,const D3DVIEWPORT9*)>(deviceObject(d),47)(d,v);}
+static HRESULT STDMETHODCALLTYPE setRenderStateTrace(IDirect3DDevice9* d,D3DRENDERSTATETYPE state,DWORD value){std::lock_guard<std::recursive_mutex> guard(mutex);
+  if(gpuTraceOn&&state==D3DRS_SCISSORTESTENABLE&&!gpuFlushingNow()){DWORD now=0;d->GetRenderState(state,&now);if(now!=value)gpuTraceEvent("scissor:"+std::to_string(value));}
+  return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DRENDERSTATETYPE,DWORD)>(deviceObject(d),57)(d,state,value);}
+static HRESULT STDMETHODCALLTYPE setScissorTrace(IDirect3DDevice9* d,const RECT* r){std::lock_guard<std::recursive_mutex> guard(mutex);
+  if(gpuTraceOn&&r&&!gpuFlushingNow()){char text[96];sprintf_s(text,"rect:%ld,%ld,%ld,%ld",r->left,r->top,r->right,r->bottom);gpuTraceEvent(text);}
+  return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,const RECT*)>(deviceObject(d),75)(d,r);}
 static fpsprobe::Rate probePresent{"present"};
 static HRESULT STDMETHODCALLTYPE present(IDirect3DDevice9* d,const RECT* s,const RECT* t,HWND h,const RGNDATA* dirty){
   const double probeStart=fpsprobe::on?fpsprobe::Now():0;
   if(fpsprobe::on){static unsigned chains=0;if(chains<4){++chains;log("FPS_PROBE present thread=%lu caller=%s",GetCurrentThreadId(),fpsprobe::Describe(_ReturnAddress()).c_str());}fpsprobe::Mark('P',0,0,_ReturnAddress());}
-  std::lock_guard<std::recursive_mutex> guard(mutex);auto hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,const RECT*,const RECT*,HWND,const RGNDATA*)>(devices.at(d),17)(d,s,t,h,dirty);
+  std::lock_guard<std::recursive_mutex> guard(mutex);auto hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,const RECT*,const RECT*,HWND,const RGNDATA*)>(deviceObject(d),17)(d,s,t,h,dirty);
   if(fpsprobe::on)probePresent.Tick(probeStart,fpsprobe::Now()-probeStart);
   // F8 is consumed only at the next native background command, once per scene frame.
   return hr;
@@ -429,13 +490,39 @@ static void releasePilotDeviceResources(const char* reason);
 static HRESULT STDMETHODCALLTYPE resetDeviceHook(IDirect3DDevice9* d,D3DPRESENT_PARAMETERS* parameters){
   // Our textures live in D3DPOOL_DEFAULT: Reset fails while any exists. Caches reload on first use.
   std::lock_guard<std::recursive_mutex> guard(mutex);beforeModelDeviceReset();releasePilotDeviceResources("reset");
-  auto hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRESENT_PARAMETERS*)>(devices.at(d),16)(d,parameters);
+  auto hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRESENT_PARAMETERS*)>(deviceObject(d),16)(d,parameters);
   afterModelDeviceReset(hr);log("DEVICE_RESET result=%08lx",hr);return hr;
+}
+// Fix 2026-11-02 (GPU round): this Windows' d3d9 keeps the device table on the heap and rewrites its entries after
+// CreateDevice (seen: every hook gone by the first frame). The draw/EndScene/Clear hooks are what puts gathered GPU
+// models down before native work (letterbox bands and black screens drawn after the last model job), so they are put
+// back at every frame and every gathered job; the entry the runtime wrote becomes the original that is called.
+static std::vector<std::pair<unsigned,void*>> deviceHooks;static unsigned deviceHookRestores=0;
+static void keepDeviceHooks(){
+  if(!gameDevice||deviceHooks.empty())return;auto it=devices.find(gameDevice);if(it==devices.end())return;auto& o=it->second;
+  void** table=*(void***)gameDevice;
+  if(table!=o.hooked){
+    // a table of its own now: hook it too, with its own originals
+    auto other=cloneTable(gameDevice,119);for(const auto& h:deviceHooks)other.hooked[h.first]=h.second;DWORD unused;VirtualProtect(other.hooked,119*sizeof(void*),other.protection,&unused);
+    o=other;++deviceHookRestores;log("DEVICE_HOOKS_TABLE new device table %p",(void*)table);return;}
+  bool open=false;DWORD protection=0;unsigned restored=0;
+  for(const auto& h:deviceHooks){if(table[h.first]==h.second)continue;
+    if(!open){open=VirtualProtect(table,119*sizeof(void*),PAGE_READWRITE,&protection)!=FALSE;if(!open)return;}
+    o.original[h.first]=table[h.first];table[h.first]=h.second;++restored;}
+  if(open){DWORD unused;VirtualProtect(table,119*sizeof(void*),protection,&unused);}
+  if(restored&&++deviceHookRestores<=6)log("DEVICE_HOOKS_RESTORED entries=%u time=%u frame=%u",restored,deviceHookRestores,frame);
 }
 static void hookDevice(IDirect3DDevice9* d){
   gameDevice=d;
   auto o=cloneTable(d,119);o.hooked[16]=(void*)resetDeviceHook;if(fpsprobe::on)o.hooked[17]=(void*)present;if(trace){o.hooked[17]=(void*)present;o.hooked[23]=(void*)createTexture;o.hooked[30]=(void*)updateSurface;o.hooked[31]=(void*)updateTexture;o.hooked[36]=(void*)createOffscreen;o.hooked[65]=(void*)setTexture;
-  o.hooked[81]=(void*)drawPrimitive;o.hooked[82]=(void*)drawIndexed;o.hooked[83]=(void*)drawUP;o.hooked[84]=(void*)drawIndexedUP;}devices.emplace(d,o);
+  }
+  // always: the GPU path holds models back until something else draws (gpuFlushPending)
+  o.hooked[42]=(void*)endSceneHook;o.hooked[81]=(void*)drawPrimitive;o.hooked[82]=(void*)drawIndexed;o.hooked[83]=(void*)drawUP;o.hooked[84]=(void*)drawIndexedUP;
+  o.hooked[34]=(void*)stretchRectHook;o.hooked[35]=(void*)colorFillHook;o.hooked[37]=(void*)setRenderTargetHook;o.hooked[43]=(void*)clearHook;o.hooked[47]=(void*)setViewportHook;
+  gpuTraceOn=GetPrivateProfileIntA("pilot","gpu_device_trace",0,(root+"\\pilot.ini").c_str())!=0;
+  {char list[256]{};GetPrivateProfileStringA("pilot","gpu_trace_frames","",list,sizeof(list),(root+"\\pilot.ini").c_str());gpuTraceFrames.clear();for(char* p=list;*p;){char* end=nullptr;const unsigned long n=strtoul(p,&end,10);if(end==p)break;gpuTraceFrames.push_back(unsigned(n));p=*end?end+1:end;}}if(gpuTraceOn){o.hooked[57]=(void*)setRenderStateTrace;o.hooked[75]=(void*)setScissorTrace;}
+  deviceHooks.clear();for(unsigned i=0;i<119;++i)if(o.hooked[i]!=o.original[i])deviceHooks.push_back({i,o.hooked[i]});
+  devices.erase(d);devices.emplace(d,o);
   DWORD unused;VirtualProtect(o.hooked,119*sizeof(void*),o.protection,&unused);
   if(fpsprobe::on&&!originalSwapPresent){IDirect3DSwapChain9* chain=nullptr;
     if(SUCCEEDED(d->GetSwapChain(0,&chain))&&chain){void** vt=*(void***)chain;originalSwapPresent=(SwapPresentFn)vt[3];DWORD prot;VirtualProtect(&vt[3],4,PAGE_READWRITE,&prot);vt[3]=(void*)swapPresent;VirtualProtect(&vt[3],4,prot,&unused);chain->Release();log("FPS_PROBE swapchain present hooked");}}
@@ -614,6 +701,8 @@ static void diagnosticControl(){
   if(command=="remastered"){desiredEnabled=true;log("COMMAND remastered queued");}
   if(command=="pose")modelPoseRequested=true;
   if(command=="state-light"||command=="state-full"){modelStateRestoreRequest=command=="state-light";log("COMMAND %s queued",command.c_str());}
+  if(command=="gpu-on"||command=="gpu-off"){modelGpuRequestCommand=command=="gpu-on";log("COMMAND %s queued",command.c_str());}
+  if(command=="gpu-pixel"||command=="gpu-vertex"){modelGpuPixelRequestCommand=command=="gpu-pixel";log("COMMAND %s queued",command.c_str());}
   if(command=="reload-models")modelReloadRequested=true;
   if(command=="pause")setDiagnosticPause(true);
   if(command=="resume")setDiagnosticPause(false);
@@ -641,7 +730,7 @@ static void diagnosticControl(){
 }
 static void flushGame(void* renderer){
   auto batch=(uint8_t*)renderer+0x84;
-  if(*(uint32_t*)(batch+0x8088)){((void(__thiscall*)(void*))(gameBase+0x13090))(batch);*(uint32_t*)(batch+0x8084)=0;*(uint32_t*)(batch+0x8088)=0;}
+  if(*(uint32_t*)(batch+0x8088)){gpuFlushPending();((void(__thiscall*)(void*))(gameBase+0x13090))(batch);*(uint32_t*)(batch+0x8084)=0;*(uint32_t*)(batch+0x8088)=0;}
 }
 static std::string sceneName(const char* filename){
   if(!filename)return {};std::string s(filename);auto slash=s.find_last_of("/\\");if(slash!=std::string::npos)s.erase(0,slash+1);auto dot=s.find_last_of('.');if(dot!=std::string::npos)s.resize(dot);for(auto& c:s)c=(char)toupper(c);return s;
@@ -736,6 +825,7 @@ static bool drawQuad(IDirect3DTexture9* tex,float left,float top,float right,flo
   if(H&&(!backgroundShader||backgroundShaderDevice!=gameDevice))return false;
   if((base||Hbase||stateAlpha)&&(!H||!base||!Hbase||!stateAlpha))return false;
   QuadTimer quadTimer;
+  if(supplied){float l=supplied[0].x,t=supplied[0].y,r=l,b=t;for(unsigned i=1;i<4;++i){l=(std::min)(l,supplied[i].x);r=(std::max)(r,supplied[i].x);t=(std::min)(t,supplied[i].y);b=(std::max)(b,supplied[i].y);}gpuFlushRect(l,t,r,b);}else gpuFlushRect(left,top,right,bottom);
   // The GOG legacy wrapper owns a second deferred vertex queue. Drain it before
   // direct D3D9 work, otherwise those old vertices overwrite the replacement.
   auto dd=gogWrapper;
@@ -802,6 +892,7 @@ enum UiBlend{UiBlendAlpha,UiBlendAdd,UiBlendSubtract};
 struct UiVertex{float x,y,z,rhw;DWORD diffuse,specular;float u,v;};
 static bool drawUiVertices(IDirect3DTexture9* tex,const UiVertex* v,unsigned count,UiBlend blend,bool specular){
   QuadTimer quadTimer;
+  {float l=v[0].x,t=v[0].y,r=l,b=t;for(unsigned i=1;i<count;++i){l=(std::min)(l,v[i].x);r=(std::max)(r,v[i].x);t=(std::min)(t,v[i].y);b=(std::max)(b,v[i].y);}gpuFlushRect(l,t,r,b);}
   auto dd=gogWrapper;
   if(dd){auto cs=(CRITICAL_SECTION*)(dd+0x181fb0);EnterCriticalSection(cs);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(cs);}
   auto d=gameDevice;QuadState state;if(FAILED(state.capture(d)))return false;
@@ -901,7 +992,7 @@ static void __fastcall texturedTriangleHook(void* renderer,void*,void* packet){s
 static void __fastcall gouraudQuadHook(void* renderer,void*,void* packet){std::lock_guard<std::recursive_mutex> guard(mutex);auto p=(uint8_t*)packet;if(drawUiPacket(renderer,p,*(uint16_t*)(p+26),UiGouraudQuad))return;originalGouraudQuad(renderer,packet);}
 static void __fastcall backgroundHook(void* renderer,void*,void* packet){
   std::lock_guard<std::recursive_mutex> guard(mutex);auto p=(uint8_t*)packet;
-  frame++;
+  frame++;keepDeviceHooks();
   auto id=sceneName(*(const char**)(p+8));if(currentScene!=id){currentScene=id;D3DVIEWPORT9 vp{};if(gameDevice)gameDevice->GetViewport(&vp);log("BACKGROUND %s xywh=%d,%d,%d,%d viewport=%ux%u",id.c_str(),*(int*)(p+12),*(int*)(p+16),*(int*)(p+20),*(int*)(p+24),vp.Width,vp.Height);}
   nativeFrameRemastered=false;
   auto scene=enabled&&gameDevice?getScene(id):nullptr;
