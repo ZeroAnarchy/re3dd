@@ -49,6 +49,47 @@ float4 main(float2 screenUV : TEXCOORD0) : COLOR0
 }
 )HLSL";
 
+// Scaled YCoCg DXT5 (pack\*\*.r3tx, r3tx_format.h): luma in alpha, chroma in red/green divided by the block scale in blue.
+// The background variant: single scenes only (composite scenes stay PNG), the same projection, no state alpha.
+static const char kYcocgSource[] = R"HLSL(
+sampler2D variantImage : register(s1);
+float4 variantRow0 : register(c3);
+float4 variantRow1 : register(c4);
+float4 variantRow2 : register(c5);
+
+float2 projectUV(float2 uv, float4 row0, float4 row1, float4 row2)
+{
+    float3 p = float3(uv, 1.0);
+    float w = dot(row2.xyz, p);
+    w = (abs(w) < 1.0e-8) ? ((w < 0.0) ? -1.0e-8 : 1.0e-8) : w;
+    return float2(dot(row0.xyz, p), dot(row1.xyz, p)) / w;
+}
+
+float4 main(float2 screenUV : TEXCOORD0) : COLOR0
+{
+    float4 c = tex2D(variantImage, projectUV(screenUV, variantRow0, variantRow1, variantRow2));
+    float s = 1.0 / (31.875 * c.b + 1.0);
+    float co = (c.r - 0.5019608) * s;
+    float cg = (c.g - 0.5019608) * s;
+    return float4(c.a + co - cg, c.a + cg, c.a - co - cg, 1.0);
+}
+)HLSL";
+
+// Mask atlas: YCoCg colour in s0, the mask alpha in the alpha blocks of the DXT5 texture in s1.
+static const char kMaskYcocgSource[] = R"HLSL(
+sampler2D colourImage : register(s0);
+sampler2D alphaImage  : register(s1);
+
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float4 c = tex2D(colourImage, uv);
+    float s = 1.0 / (31.875 * c.b + 1.0);
+    float co = (c.r - 0.5019608) * s;
+    float cg = (c.g - 0.5019608) * s;
+    return float4(c.a + co - cg, c.a + cg, c.a - co - cg, tex2D(alphaImage, uv).a);
+}
+)HLSL";
+
 inline void ReportCompilerErrors(ID3DBlob* errors)
 {
     if (errors && errors->GetBufferPointer()) {
@@ -59,12 +100,15 @@ inline void ReportCompilerErrors(ID3DBlob* errors)
 
 } // namespace re3_background_shader_detail
 
+enum class BackgroundShaderKind { Png, Ycocg, MaskYcocg };
+
 // No d3dcompiler import library is required. Windows 10/11 supply the compiler
 // in the system directory; use an absolute path to avoid loading a local DLL.
 // Caller owns the returned shader and must Release it before releasing device.
 // D3D9 shader objects survive Reset; recreate only for a new device instance.
 inline IDirect3DPixelShader9* CreateBackgroundShader(
-    IDirect3DDevice9* device, HRESULT* result = nullptr)
+    IDirect3DDevice9* device, HRESULT* result = nullptr,
+    BackgroundShaderKind kind = BackgroundShaderKind::Png)
 {
     if (result) *result = E_INVALIDARG;
     if (!device) return nullptr;
@@ -110,8 +154,12 @@ inline IDirect3DPixelShader9* CreateBackgroundShader(
     IDirect3DPixelShader9* shader = nullptr;
     const char* profile = caps.PixelShaderVersion >= D3DPS_VERSION(3, 0)
         ? "ps_3_0" : "ps_2_0";
-    hr = compile(re3_background_shader_detail::kSource,
-        sizeof(re3_background_shader_detail::kSource) - 1,
+    using namespace re3_background_shader_detail;
+    const char* source = kind == BackgroundShaderKind::Ycocg ? kYcocgSource
+        : kind == BackgroundShaderKind::MaskYcocg ? kMaskYcocgSource : kSource;
+    const size_t length = kind == BackgroundShaderKind::Ycocg ? sizeof(kYcocgSource) - 1
+        : kind == BackgroundShaderKind::MaskYcocg ? sizeof(kMaskYcocgSource) - 1 : sizeof(kSource) - 1;
+    hr = compile(source, length,
         "RE3 pilot background composition", nullptr, nullptr, "main", profile,
         D3DCOMPILE_OPTIMIZATION_LEVEL3,
         0, &bytecode, &errors);

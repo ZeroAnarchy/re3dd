@@ -41,6 +41,12 @@ static unsigned frame;
 static bool enabled = true, desiredEnabled = true, trace = true;
 static bool quadLightState=true;   // pilot.ini quad_light_state (QuadState below)
 static bool textureStrips=true;    // pilot.ini texture_strips (loadReplacement, texture_strips.h)
+static int packDxtMode=1;          // pilot.ini pack_dxt (pack_texture.h): 1 .r3tx on the GPU, 2 .r3tx decoded on the CPU, 0 PNG only
+static volatile LONG packModeRequest=-1;   // debug commands pack-dxt / pack-cpu / pack-png
+// pilot.ini render_width / render_height (Lite 2026-11-02): the size the 1024x768 entry of the game's and the GOG wrapper's mode
+// tables becomes (installGameHooks). 2560x1920 = 8x the PSX screen (Full); Lite 1440x1080 = 4.5x, the Codex size of its
+// backgrounds, 1:1 on a Full HD screen. The installer writes the same size into bio3.ini.
+static UINT renderWidth=2560,renderHeight=1920;
 static UINT debugVaSqueezeMb=0;    // pilot.ini debug_va_squeeze_mb (QA: fragment the address space like a long session)
 static bool modelPoseRequested=false,modelReloadRequested=false;
 static std::string modelLoadRequest; // pilot.command model-load <asset> (debug_warp)
@@ -234,6 +240,9 @@ static void init() {
   enabled=GetPrivateProfileIntA("pilot","enabled",1,(root+"\\pilot.ini").c_str())!=0;desiredEnabled=enabled;
   quadLightState=GetPrivateProfileIntA("pilot","quad_light_state",1,(root+"\\pilot.ini").c_str())!=0;
   textureStrips=GetPrivateProfileIntA("pilot","texture_strips",1,(root+"\\pilot.ini").c_str())!=0;
+  packDxtMode=(int)GetPrivateProfileIntA("pilot","pack_dxt",1,(root+"\\pilot.ini").c_str());
+  {const UINT w=GetPrivateProfileIntA("pilot","render_width",2560,(root+"\\pilot.ini").c_str()),h=GetPrivateProfileIntA("pilot","render_height",1920,(root+"\\pilot.ini").c_str());
+    if(w>=640&&w<=4096&&w%4==0&&w*3==h*4){renderWidth=w;renderHeight=h;}else log("RENDER_SIZE %ux%u refused (4:3, 640..4096, width a multiple of 4): 2560x1920",w,h);}
   debugVaSqueezeMb=(UINT)GetPrivateProfileIntA("pilot","debug_va_squeeze_mb",0,(root+"\\pilot.ini").c_str());
   CoInitializeEx(nullptr,COINIT_MULTITHREADED);loadMap();std::string uiError;uiReady=uiRegistry.load(root+"\\ui-pack\\manifest.txt",&uiError);log("UI_REGISTRY ready=%u %s",uiReady,uiError.c_str());installGameHooks();
   if(GetPrivateProfileIntA("pilot","fps_probe",0,(root+"\\pilot.ini").c_str()))fpsprobe::Install([](const char* line){log("%s",line);});
@@ -587,6 +596,7 @@ static void __cdecl inputPollHook(){
       log("DIAGNOSTIC_CHAIN program=%d",program);((void(__cdecl*)(int))(gameBase+0x2af60))(program);}
     else log("DIAGNOSTIC_CHAIN program=%d refused: chain code or program table differs",program);}
 }
+#include "pack_texture.h"
 struct Scene {
   IDirect3DTexture9* background=nullptr;
   IDirect3DTexture9* mask=nullptr;
@@ -594,7 +604,13 @@ struct Scene {
   // entry that could be evicted while loading the variant.
   IDirect3DTexture9* baseBackground=nullptr;
   IDirect3DTexture9* stateAlpha=nullptr;
+  // .r3tx on the GPU (pack_texture.h): background / mask colour in scaled YCoCg, the mask alpha in its own DXT5 texture
+  IDirect3DTexture9* maskAlpha=nullptr;
+  bool backgroundYcocg=false;
   UINT atlasWidth=0,atlasHeight=0;
+  // atlas pixels per mask page pixel = the background's pixels per PSX screen pixel (width / 320): 8 in the Full pack
+  // (2560x1920), 4.5 in Lite (1440x1080; every mask tile is a multiple of 8 page pixels, so x4.5 stays pixel-exact)
+  float maskScale=8;
   bool missing=false,composite=false;
   unsigned lastUsed=0;
   size_t bytes=0;
@@ -603,25 +619,30 @@ struct Scene {
 };
 static std::unordered_map<std::string,Scene> scenes;
 static IDirect3DPixelShader9* backgroundShader=nullptr;
+static IDirect3DPixelShader9* backgroundYcocgShader=nullptr;   // YCoCg .r3tx background / mask atlas (state_shader.h)
+static IDirect3DPixelShader9* maskYcocgShader=nullptr;
 static IDirect3DDevice9* backgroundShaderDevice=nullptr;
 static bool backgroundShaderAttempted=false;
+static void releaseBackgroundShaders(){ReleaseBackgroundShader(backgroundShader);ReleaseBackgroundShader(backgroundYcocgShader);ReleaseBackgroundShader(maskYcocgShader);}
 static void releaseScene(Scene& scene){
-  for(auto slot:{&scene.background,&scene.mask,&scene.baseBackground,&scene.stateAlpha}){
+  for(auto slot:{&scene.background,&scene.mask,&scene.baseBackground,&scene.stateAlpha,&scene.maskAlpha}){
     if(*slot)(*slot)->Release();*slot=nullptr;
   }
-  scene.bytes=0;
+  scene.bytes=0;scene.backgroundYcocg=false;
 }
 static bool ensureBackgroundShader(){
   if(backgroundShaderDevice!=gameDevice){
     for(auto& entry:scenes)releaseScene(entry.second);
-    scenes.clear();ReleaseBackgroundShader(backgroundShader);
+    scenes.clear();releaseBackgroundShaders();
     backgroundShaderDevice=gameDevice;backgroundShaderAttempted=false;
   }
   if(!gameDevice)return false;
   if(!backgroundShaderAttempted){
-    backgroundShaderAttempted=true;HRESULT hr=E_FAIL;
+    backgroundShaderAttempted=true;HRESULT hr=E_FAIL,ycocg=E_FAIL,mask=E_FAIL;
     backgroundShader=CreateBackgroundShader(gameDevice,&hr);
-    log("BACKGROUND_SHADER result=%08lx ready=%u",hr,backgroundShader!=nullptr);
+    backgroundYcocgShader=CreateBackgroundShader(gameDevice,&ycocg,BackgroundShaderKind::Ycocg);
+    maskYcocgShader=CreateBackgroundShader(gameDevice,&mask,BackgroundShaderKind::MaskYcocg);
+    log("BACKGROUND_SHADER result=%08lx ready=%u ycocg=%08lx mask_ycocg=%08lx",hr,backgroundShader!=nullptr,ycocg,mask);
   }
   return backgroundShader!=nullptr;
 }
@@ -703,6 +724,9 @@ static void diagnosticControl(){
   if(command=="state-light"||command=="state-full"){modelStateRestoreRequest=command=="state-light";log("COMMAND %s queued",command.c_str());}
   if(command=="gpu-on"||command=="gpu-off"){modelGpuRequestCommand=command=="gpu-on";log("COMMAND %s queued",command.c_str());}
   if(command=="gpu-pixel"||command=="gpu-vertex"){modelGpuPixelRequestCommand=command=="gpu-pixel";log("COMMAND %s queued",command.c_str());}
+  // QA (dxt round 2026-11-02): scenes again from .r3tx on the GPU / decoded on the CPU / from the PNGs (backgroundHook applies it)
+  if((command=="pack-dxt"||command=="pack-cpu"||command=="pack-png")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
+    InterlockedExchange(&packModeRequest,command=="pack-dxt"?1:command=="pack-cpu"?2:0);log("COMMAND %s queued",command.c_str());}
   if(command=="reload-models")modelReloadRequested=true;
   if(command=="pause")setDiagnosticPause(true);
   if(command=="resume")setDiagnosticPause(false);
@@ -753,24 +777,36 @@ static Scene* getScene(const std::string& id){
     if(state>>extra)return fail("unexpected state metadata");
     if(!readSceneMatrix(absolute+"uv.txt",candidate.uv))return fail("variant UV missing/invalid");
     if(candidate.composite&&!readSceneMatrix(absolute+"base_uv.txt",candidate.baseUv))return fail("base UV missing/invalid");
-    for(const char* name:{"background.png","atlas.png"})if(GetFileAttributesA((absolute+name).c_str())==INVALID_FILE_ATTRIBUTES)return fail("background/atlas missing");
-    if(candidate.composite)for(const char* name:{"base.png","alpha.png"})if(GetFileAttributesA((absolute+name).c_str())==INVALID_FILE_ATTRIBUTES)return fail("canonical composition resource missing");
-    candidate.background=loadReplacement(gameDevice,0,relative+"background.png");
-    candidate.mask=loadReplacement(gameDevice,0,relative+"atlas.png");
+    // background.r3tx / atlas.r3tx first (pack_texture.h): blocks copied, no PNG decode. Composite scenes stay PNG.
+    LARGE_INTEGER loadStart,loadEnd,frequency;QueryPerformanceCounter(&loadStart);
+    const bool ycocgShaders=backgroundYcocgShader&&maskYcocgShader;
+    PackTexture packedBackground,packedAtlas;
+    const bool haveBackground=!candidate.composite&&loadPackTexture(gameDevice,relative+"background",ycocgShaders,packedBackground);
+    const bool haveAtlas=!candidate.composite&&loadPackTexture(gameDevice,relative+"atlas",ycocgShaders,packedAtlas);
+    if(haveBackground){candidate.background=packedBackground.colour;candidate.backgroundYcocg=packedBackground.ycocg;candidate.bytes+=packedBackground.bytes;}
+    if(haveAtlas){candidate.mask=packedAtlas.colour;candidate.maskAlpha=packedAtlas.alpha;candidate.bytes+=packedAtlas.bytes;}
+    std::vector<const char*> pngs;if(!haveBackground)pngs.push_back("background.png");if(!haveAtlas)pngs.push_back("atlas.png");
+    if(candidate.composite){pngs.push_back("base.png");pngs.push_back("alpha.png");}
+    for(const char* name:pngs)if(GetFileAttributesA((absolute+name).c_str())==INVALID_FILE_ATTRIBUTES)
+      return fail(!strcmp(name,"base.png")||!strcmp(name,"alpha.png")?"canonical composition resource missing":"background/atlas missing");
+    D3DSURFACE_DESC desc{};
+    auto png=[&](const char* name)->IDirect3DTexture9*{auto t=loadReplacement(gameDevice,0,relative+name);if(t&&SUCCEEDED(t->GetLevelDesc(0,&desc)))candidate.bytes+=(size_t)desc.Width*desc.Height*4;return t;};
+    if(!haveBackground)candidate.background=png("background.png");
+    if(!haveAtlas)candidate.mask=png("atlas.png");
     if(candidate.composite){
-      candidate.baseBackground=loadReplacement(gameDevice,0,relative+"base.png");
-      candidate.stateAlpha=loadReplacement(gameDevice,0,relative+"alpha.png");
+      candidate.baseBackground=png("base.png");
+      candidate.stateAlpha=png("alpha.png");
     }
     if(!candidate.background||!candidate.mask||(candidate.composite&&(!candidate.baseBackground||!candidate.stateAlpha)))return fail("texture load failed");
-    D3DSURFACE_DESC desc{};
+    if(FAILED(candidate.background->GetLevelDesc(0,&desc))||desc.Width<320)return fail("background description failed");
+    candidate.maskScale=desc.Width/320.f;
     if(FAILED(candidate.mask->GetLevelDesc(0,&desc)))return fail("atlas description failed");
     candidate.atlasWidth=desc.Width;candidate.atlasHeight=desc.Height;
-    for(auto texture:{candidate.background,candidate.mask,candidate.baseBackground,candidate.stateAlpha})if(texture){
-      if(FAILED(texture->GetLevelDesc(0,&desc)))return fail("texture description failed");
-      candidate.bytes+=(size_t)desc.Width*desc.Height*4;
-    }
+    QueryPerformanceCounter(&loadEnd);QueryPerformanceFrequency(&frequency);
     s=candidate;
-    log("SCENE_READY %s atlas=%ux%u composition=%u base=%s bytes=%zu",id.c_str(),s.atlasWidth,s.atlasHeight,s.composite,baseId.c_str(),s.bytes);
+    auto how=[](bool packed,bool ycocg){return packed?(ycocg?"r3tx":"r3tx-cpu"):"png";};
+    log("SCENE_READY %s atlas=%ux%u composition=%u base=%s bytes=%zu background=%s atlas_format=%s mask_scale=%g load_ms=%.2f",id.c_str(),s.atlasWidth,s.atlasHeight,s.composite,baseId.c_str(),s.bytes,
+      how(haveBackground,packedBackground.ycocg),how(haveAtlas,packedAtlas.alpha!=nullptr),s.maskScale,double(loadEnd.QuadPart-loadStart.QuadPart)*1000.0/double(frequency.QuadPart));
     for(;;){size_t total=0;Scene* oldest=nullptr;for(auto& kv:scenes){total+=kv.second.bytes;if(kv.first!=id&&kv.second.background&&(!oldest||kv.second.lastUsed<oldest->lastUsed))oldest=&kv.second;}if(total<=192u*1024*1024||!oldest)break;releaseScene(*oldest);log("SCENE_CACHE_EVICT residentBytes=%zu",total);}
   }return &s;
 }
@@ -821,9 +857,12 @@ struct QuadState {
   }
 };
 struct QuadTimer{LARGE_INTEGER t0;QuadTimer(){QueryPerformanceCounter(&t0);++quadCalls;}~QuadTimer(){static const double f=[]{LARGE_INTEGER q;QueryPerformanceFrequency(&q);return double(q.QuadPart);}();LARGE_INTEGER t1;QueryPerformanceCounter(&t1);quadMs+=double(t1.QuadPart-t0.QuadPart)*1000.0/f;}};
-static bool drawQuad(IDirect3DTexture9* tex,float left,float top,float right,float bottom,float u0,float v0,float u1,float v1,bool alpha,const float* H=nullptr,IDirect3DTexture9* base=nullptr,const float* Hbase=nullptr,IDirect3DTexture9* stateAlpha=nullptr,const ScreenVertex* supplied=nullptr){
+// ycocg: tex is a YCoCg .r3tx texture. With H the background (backgroundYcocgShader); without it a mask atlas, whose alpha
+// comes from ycocgAlpha (maskYcocgShader).
+static bool drawQuad(IDirect3DTexture9* tex,float left,float top,float right,float bottom,float u0,float v0,float u1,float v1,bool alpha,const float* H=nullptr,IDirect3DTexture9* base=nullptr,const float* Hbase=nullptr,IDirect3DTexture9* stateAlpha=nullptr,const ScreenVertex* supplied=nullptr,bool ycocg=false,IDirect3DTexture9* ycocgAlpha=nullptr){
   if(H&&(!backgroundShader||backgroundShaderDevice!=gameDevice))return false;
   if((base||Hbase||stateAlpha)&&(!H||!base||!Hbase||!stateAlpha))return false;
+  if(ycocg&&(backgroundShaderDevice!=gameDevice||(H?!backgroundYcocgShader||Hbase:!maskYcocgShader||!ycocgAlpha||supplied)))return false;
   QuadTimer quadTimer;
   if(supplied){float l=supplied[0].x,t=supplied[0].y,r=l,b=t;for(unsigned i=1;i<4;++i){l=(std::min)(l,supplied[i].x);r=(std::max)(r,supplied[i].x);t=(std::min)(t,supplied[i].y);b=(std::max)(b,supplied[i].y);}gpuFlushRect(l,t,r,b);}else gpuFlushRect(left,top,right,bottom);
   // The GOG legacy wrapper owns a second deferred vertex queue. Drain it before
@@ -842,8 +881,15 @@ static bool drawQuad(IDirect3DTexture9* tex,float left,float top,float right,flo
   d->SetSamplerState(0,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);d->SetSamplerState(0,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);d->SetSamplerState(0,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);d->SetSamplerState(0,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);d->SetSamplerState(0,D3DSAMP_MIPFILTER,D3DTEXF_NONE);
   // Canonical ordinary frames and state variants use this exact per-pixel
   // projection path, avoiding a sampling change outside the state-alpha area.
-  HRESULT hr=H?SetBackgroundShader(d,backgroundShader,Hbase?Hbase:H,H,base?base:tex,tex,stateAlpha?stateAlpha:tex)
-    :method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,DWORD,IDirect3DBaseTexture9*)>(devices.at(d),65)(d,0,tex);
+  using SetTextureFn=HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,DWORD,IDirect3DBaseTexture9*);
+  HRESULT hr=H?SetBackgroundShader(d,ycocg?backgroundYcocgShader:backgroundShader,Hbase?Hbase:H,H,base?base:tex,tex,stateAlpha?stateAlpha:tex)
+    :method<SetTextureFn>(devices.at(d),65)(d,0,tex);
+  if(SUCCEEDED(hr)&&ycocg&&!H){   // mask alpha in s1, sampled like s0
+    hr=method<SetTextureFn>(devices.at(d),65)(d,1,ycocgAlpha);
+    for(auto [sampler,value]:{std::pair<D3DSAMPLERSTATETYPE,DWORD>{D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP},{D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP},{D3DSAMP_MINFILTER,D3DTEXF_LINEAR},
+        {D3DSAMP_MAGFILTER,D3DTEXF_LINEAR},{D3DSAMP_MIPFILTER,D3DTEXF_NONE},{D3DSAMP_SRGBTEXTURE,FALSE}})if(SUCCEEDED(hr))hr=d->SetSamplerState(1,sampler,value);
+    if(SUCCEEDED(hr))hr=d->SetPixelShader(maskYcocgShader);
+  }
   if(SUCCEEDED(hr))hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,const void*,UINT)>(devices.at(d),83)(d,D3DPT_TRIANGLESTRIP,2,v,sizeof(ScreenVertex));if(ownScene)d->EndScene();state.restore(d);return SUCCEEDED(hr);
 }
 struct UiTexture {IDirect3DTexture9* texture=nullptr;unsigned lastUsed=0;size_t bytes=0;bool missing=false;};
@@ -995,6 +1041,7 @@ static void __fastcall backgroundHook(void* renderer,void*,void* packet){
   frame++;keepDeviceHooks();
   auto id=sceneName(*(const char**)(p+8));if(currentScene!=id){currentScene=id;D3DVIEWPORT9 vp{};if(gameDevice)gameDevice->GetViewport(&vp);log("BACKGROUND %s xywh=%d,%d,%d,%d viewport=%ux%u",id.c_str(),*(int*)(p+12),*(int*)(p+16),*(int*)(p+20),*(int*)(p+24),vp.Width,vp.Height);}
   nativeFrameRemastered=false;
+  if(const LONG mode=InterlockedExchange(&packModeRequest,-1);mode>=0){packDxtMode=mode;for(auto& entry:scenes)releaseScene(entry.second);scenes.clear();log("PACK_MODE %d scenes reloaded",packDxtMode);}
   auto scene=enabled&&gameDevice?getScene(id):nullptr;
   if(scene&&gogWrapper){
     // GOG initializes/clears its D3D9 render pass lazily on the first legacy draw.
@@ -1004,7 +1051,7 @@ static void __fastcall backgroundHook(void* renderer,void*,void* packet){
     // pan, 423C26): there y moves and a raw16 half from the RDT (+44) is drawn above/below by rawBackgroundHook.
     D3DVIEWPORT9 vp;gameDevice->GetViewport(&vp);const float sx=vp.Width/320.f,sy=vp.Height/240.f;
     int bx=*(int*)(p+12),by=*(int*)(p+16),bw=*(int*)(p+20),bh=*(int*)(p+24);if(bw<=0||bh<=0){bx=by=0;bw=320;bh=240;}
-    nativeFrameRemastered=drawQuad(scene->background,bx*sx,by*sy,(bx+bw)*sx,(by+bh)*sy,0,0,1,1,false,scene->uv,scene->baseBackground,scene->composite?scene->baseUv:nullptr,scene->stateAlpha);
+    nativeFrameRemastered=drawQuad(scene->background,bx*sx,by*sy,(bx+bw)*sx,(by+bh)*sy,0,0,1,1,false,scene->uv,scene->baseBackground,scene->composite?scene->baseUv:nullptr,scene->stateAlpha,nullptr,scene->backgroundYcocg);
     if(frame%120==0)log("REMASTER_FRAME %s viewport=%ux%u succeeded=%u",id.c_str(),vp.Width,vp.Height,nativeFrameRemastered);return;
   }
   originalBackground(renderer,packet);
@@ -1019,8 +1066,8 @@ static void __fastcall spriteHook(void* renderer,void*,void* packet,unsigned tpa
   if(nativeFrameRemastered&&nativeMask&&tpage==0x95&&*(uint16_t*)(p+14)==0x7800){
     auto scene=getScene(currentScene);if(scene){flushGame(renderer);D3DVIEWPORT9 vp;gameDevice->GetViewport(&vp);
       float sx=vp.Width/320.f,sy=vp.Height/240.f;float x=*(int16_t*)(p+8),y=*(int16_t*)(p+10),w=*(int16_t*)(p+16),h=*(int16_t*)(p+18);
-      float u=p[12]*8.f,v=p[13]*8.f;
-      if(drawQuad(scene->mask,x*sx,y*sy,(x+w)*sx,(y+h)*sy,u/scene->atlasWidth,v/scene->atlasHeight,(u+w*8)/scene->atlasWidth,(v+h*8)/scene->atlasHeight,true)){maskDraws++;maskDrawnTotal++;return;}
+      const float k=scene->maskScale,u=p[12]*k,v=p[13]*k;
+      if(drawQuad(scene->mask,x*sx,y*sy,(x+w)*sx,(y+h)*sy,u/scene->atlasWidth,v/scene->atlasHeight,(u+w*k)/scene->atlasWidth,(v+h*k)/scene->atlasHeight,true,nullptr,nullptr,nullptr,nullptr,nullptr,scene->maskAlpha!=nullptr,scene->maskAlpha)){maskDraws++;maskDrawnTotal++;return;}
     }
   }if(drawUiItemGrid(renderer,p,tpage)||drawUiPacket(renderer,p,tpage,UiSprite))return;originalSprite(renderer,packet,tpage);
 }
@@ -1102,11 +1149,11 @@ static int __fastcall movieHook(void* renderer,void*,const char* path){
 }
 static void installGameHooks(){
   gameBase=(uintptr_t)GetModuleHandleA(nullptr);auto* nt=(IMAGE_NT_HEADERS*)(gameBase+((IMAGE_DOS_HEADER*)gameBase.value)->e_lfanew);
-  if(nt->OptionalHeader.SizeOfImage!=0x667000){log("Native hooks disabled: unexpected image size %x",nt->OptionalHeader.SizeOfImage);return;}
-  {uint64_t fileHash=0;const auto exe=re3exe::Detect(gameBase.value,&fileHash);
+  {uint64_t fileHash=0;const auto exe=re3exe::Detect(gameBase.value,&fileHash);   // GOG, or the Steam build in memory (exe_map.h)
     re3exe::gMissLog=[](uint32_t rva){log("EXE_MAP_MISS rva=%x not in the verified RE3_MERCE.exe map: its guard fails, feature stays native",rva);};
-    log("GAME_EXE %s file_fnv64=%016llx",exe==re3exe::Exe::Main?"ResidentEvil3.exe direct":exe==re3exe::Exe::Merce?"RE3_MERCE.exe via verified address map":"unknown",(unsigned long long)fileHash);
-    if(exe==re3exe::Exe::Unknown){log("Native hooks disabled: unknown game exe");return;}
+    log("GAME_EXE %s%s file_fnv64=%016llx",exe==re3exe::Exe::Main?"ResidentEvil3.exe direct":exe==re3exe::Exe::Merce?"RE3_MERCE.exe via verified address map":"unknown",
+      re3exe::gSteam?" (Steam build: unpacked code = GOG)":"",(unsigned long long)fileHash);
+    if(exe==re3exe::Exe::Unknown){log("Native hooks disabled: unknown game exe (image size %x)",nt->OptionalHeader.SizeOfImage);return;}
     re3exe::gRunning=exe;}
   // v14 movies: X8R8G8B8 movie texture/surface instead of R5G6B5 (no 565 banding in the HD movies); before the opening
   // movie, independent of the remaster toggle. video-v14/runtime-proposal/MOVIES-RUNTIME.ru.txt 4.2.
@@ -1137,12 +1184,12 @@ static void installGameHooks(){
   if(GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str()))for(unsigned rva:{0x238c6u,0x2fb60u}){auto call=(uint8_t*)(gameBase+rva);if(call[0]==0xe8&&(uintptr_t)(call+5+*(int32_t*)(call+1))==gameBase+0x2cad0){DWORD prot;VirtualProtect(call,5,PAGE_EXECUTE_READWRITE,&prot);*(int32_t*)(call+1)=(int32_t)((uint8_t*)inputPollHook-(call+5));VirtualProtect(call,5,prot,&unused);FlushInstructionCache(GetCurrentProcess(),call,5);log("Diagnostic input hook installed at %x",rva);}}
   const unsigned gameModes[]={0x10a550,0x10a554,0x10a594,0x10a598};bool gm=true;
   for(int i=0;i<4;i++)if(*(uint32_t*)(gameBase+gameModes[i])!=(i%2?768u:1024u))gm=false;
-  if(gm){for(int i=0;i<4;i++){DWORD prot;auto ptr=(void*)(gameBase+gameModes[i]);VirtualProtect(ptr,4,PAGE_READWRITE,&prot);*(uint32_t*)ptr=i%2?1920:2560;VirtualProtect(ptr,4,prot,&unused);}log("Native resolution filter/rank table 1024x768 -> 2560x1920 patched in memory");}
+  if(gm){for(int i=0;i<4;i++){DWORD prot;auto ptr=(void*)(gameBase+gameModes[i]);VirtualProtect(ptr,4,PAGE_READWRITE,&prot);*(uint32_t*)ptr=i%2?renderHeight:renderWidth;VirtualProtect(ptr,4,prot,&unused);}log("Native resolution filter/rank table 1024x768 -> %ux%u patched in memory",renderWidth,renderHeight);}
   auto dd=(uint8_t*)GetModuleHandleA("ddraw.dll");
   if(dd){const uint8_t sig[]={0x81,0xec,0xa8,0,0,0,0x57,0x33,0xff,0x3b};if(dd[0x45b30]==0x8b&&dd[0x45b31]==0x15&&memcmp(dd+0x45b36,sig,sizeof(sig))==0){gogWrapper=dd;log("GOG wrapper deferred-queue flush signature verified");}else log("GOG wrapper flush signature mismatch: remaster disabled");
     const unsigned offsets[]={0x1d1a7,0x1d1ae,0x21cf7,0x21cfe};bool match=true;
     for(int i=0;i<4;i++){if(*(uint32_t*)(dd+offsets[i])!=(i%2?768u:1024u))match=false;}
-    if(match){for(int i=0;i<4;i++){DWORD prot;VirtualProtect(dd+offsets[i],4,PAGE_EXECUTE_READWRITE,&prot);*(uint32_t*)(dd+offsets[i])=i%2?1920:2560;VirtualProtect(dd+offsets[i],4,prot,&unused);}FlushInstructionCache(GetCurrentProcess(),dd,0x23000);log("GOG synthetic display mode 1024x768 -> 2560x1920 patched in memory");}
+    if(match){for(int i=0;i<4;i++){DWORD prot;VirtualProtect(dd+offsets[i],4,PAGE_EXECUTE_READWRITE,&prot);*(uint32_t*)(dd+offsets[i])=i%2?renderHeight:renderWidth;VirtualProtect(dd+offsets[i],4,prot,&unused);}FlushInstructionCache(GetCurrentProcess(),dd,0x23000);log("GOG synthetic display mode 1024x768 -> %ux%u patched in memory",renderWidth,renderHeight);}
     else log("GOG synthetic mode patch skipped: signature mismatch");
   }
   installModels();installPropModels();installExtraModels();installMerceSelect();installTitleCostume();installFps60();glock::install();
@@ -1163,7 +1210,7 @@ static void installGameHooks(){
 static void releasePilotDeviceResources(const char* reason){
   ULONG references=0;const size_t assets=releaseModelDeviceResources(&references);
   const size_t sceneCount=scenes.size();for(auto& entry:scenes)releaseScene(entry.second);scenes.clear();
-  ReleaseBackgroundShader(backgroundShader);backgroundShaderDevice=nullptr;backgroundShaderAttempted=false;
+  releaseBackgroundShaders();backgroundShaderDevice=nullptr;backgroundShaderAttempted=false;packCapsDevice=nullptr;
   size_t ui=0;for(auto& item:uiTextures)if(item.second.texture){item.second.texture->Release();++ui;}uiTextures.clear();
   size_t replaced=0;for(auto& entry:textures)if(entry.second.replacement){entry.second.replacement->Release();entry.second.replacement=nullptr;++replaced;}
   fps60ReleaseDevice();

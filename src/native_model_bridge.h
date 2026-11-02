@@ -639,7 +639,7 @@ inline bool Install(re3exe::Base gameBase, const Callbacks& callbacks, void* exp
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 0x800) return false;
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(gameBase + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
-        nt->OptionalHeader.SizeOfImage != 0x667000) return false;
+        (nt->OptionalHeader.SizeOfImage != 0x667000 && !re3exe::gSteam)) return false;   // Steam: the protector's header
     if (!expectedFrameHook) expectedFrameHook = reinterpret_cast<void*>(gameBase + 0xb9c0);
     auto& p = s.patches;
     const bool guards =

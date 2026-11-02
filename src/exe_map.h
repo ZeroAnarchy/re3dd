@@ -33,6 +33,16 @@ struct Base {
         return Translate(value, static_cast<uint32_t>(rva));
     }
 };
+// Steam (app 4249120, folder english\): the same two GOG exes wrapped by Enigma Protector. Once the protector has unpacked
+// them (before the game creates its DirectDraw device, so before init()), their sections in memory are byte-identical to
+// the GOG build; only the PE header is the protector's (image size 0x1053000 / 0x105c000, entry in its own section).
+// qa/steam-2026-11-02/memcmp.py. They are recognised by the FNV-1a 64 of the unpacked .text.
+inline bool gSteam = false;
+inline uint64_t CodeHash(uintptr_t base, uint32_t size) {
+    uint64_t hash = 0xcbf29ce484222325ull; const auto* p = reinterpret_cast<const uint8_t*>(base + 0x1000);
+    for (uint32_t i = 0; i < size; ++i) hash = (hash ^ p[i]) * 0x100000001b3ull;
+    return hash;
+}
 // Which exe is loaded: PE header identity (link time stamp, entry, .text size, image size); RE3_MERCE.exe also needs
 // the FNV-1a 64 of its file. ResidentEvil3.exe keeps the old behaviour (header only, file hash just reported).
 inline Exe Detect(uintptr_t base, uint64_t* fileHash) {
@@ -57,6 +67,8 @@ inline Exe Detect(uintptr_t base, uint64_t* fileHash) {
     if (stamp == 0x39d81b32 && entry == 0xef59c && size == 0x667000 && textSize == 0x10847a) return Exe::Main;
     if (stamp == 0x39d819f2 && entry == 0xef60c && size == 0x667000 && textSize == 0x1084ea && hashed &&
         hash == 0x470ce52d7955fee1ull) return Exe::Merce;
+    if (stamp == 0x39d81b32 && size == 0x1053000 && CodeHash(base, 0x10847a) == 0xf58a00a3a2f39b0aull) { gSteam = true; return Exe::Main; }
+    if (stamp == 0x39d819f2 && size == 0x105c000 && CodeHash(base, 0x1084ea) == 0x3e83f7c7fc05774cull) { gSteam = true; return Exe::Merce; }
     return Exe::Unknown;
 }
 } // namespace re3exe

@@ -24,9 +24,11 @@ try {
   $version = Get-Content -LiteralPath (Join-Path $modDir 'version.txt') -TotalCount 1 -ErrorAction SilentlyContinue
   Say ("Resident Evil 3DD Mod $version - " + (L 'removal' 'удаление')) Cyan
   Say ((L 'Game folder: ' 'Папка игры: ') + $GamePath)
-  $running = @(Get-Process -Name ResidentEvil3, RE3_MERCE, RE3Launcher -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($GamePath, [StringComparison]::OrdinalIgnoreCase) })
+  $steamRoot = Split-Path $GamePath -Parent   # Steam: the mod is in <game folder>\english, the launcher one level up
+  $running = @(Get-Process -Name ResidentEvil3, RE3_MERCE, RE3Launcher, '4249120_Launcher' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path.StartsWith($GamePath, [StringComparison]::OrdinalIgnoreCase) -or
+    ((Test-Path -LiteralPath (Join-Path $steamRoot '4249120_Launcher.exe')) -and $_.Path.StartsWith($steamRoot, [StringComparison]::OrdinalIgnoreCase))) })
   if ($running.Count) { Fail (L 'the game is running - close it and start the removal again' 'игра запущена - закройте её и запустите удаление снова') }
-  if (-not (Ask (L 'Remove the mod from this folder? Saves and GOG files stay' 'Удалить мод из этой папки? Сохранения и файлы GOG останутся'))) { Say (L 'Cancelled.' 'Отменено.'); Finish 0 }
+  if (-not (Ask (L 'Remove the mod from this folder? Saves and game files stay' 'Удалить мод из этой папки? Сохранения и файлы игры останутся'))) { Say (L 'Cancelled.' 'Отменено.'); Finish 0 }
 
   $writable = $true
   try { [IO.File]::WriteAllText((Join-Path $modDir 'write-test.tmp'), 'ok'); Remove-Item -LiteralPath (Join-Path $modDir 'write-test.tmp') }
@@ -81,6 +83,6 @@ try {
   Set-Location -LiteralPath $GamePath
   Remove-Item -LiteralPath $modDir -Recurse -Force
   Say ''
-  Say (L "Done: the mod is removed ($removed files), the game is back to the plain GOG version." "Готово: мод удалён (файлов: $removed), игра снова в исходном виде GOG.") Green
+  Say (L "Done: the mod is removed ($removed files), the game is back to its original files." "Готово: мод удалён (файлов: $removed), игра снова в исходном виде.") Green
   Finish 0
 } catch { Fail $_.Exception.Message }
