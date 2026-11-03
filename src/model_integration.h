@@ -4,6 +4,7 @@
 #include "model_wounds.h"
 #include "model_fps60.h"
 #include <map>
+#include <tuple>
 
 // Native pose/order adapter glue. Included after the established D3D9 and
 // background helpers in proxy.cpp; all disk game resources remain original.
@@ -26,7 +27,8 @@ struct ModelAsset {
     // parts.txt (fix 2026-10-25, EM36 acid R509): per material the native parts that must be present / absent (bit masks)
     std::vector<std::pair<uint32_t,uint32_t>> materialParts;
     // fix 2026-10-25: bone with the largest summed weight of every triangle / vertex (enemy parts gone or split off), on first use
-    std::vector<uint8_t> triangleBone,vertexBone;std::map<uint32_t,std::shared_ptr<ModelAsset>> caps;
+    std::vector<uint8_t> triangleBone,vertexBone;std::map<std::tuple<uint32_t,uint64_t,std::string>,std::shared_ptr<ModelAsset>> caps;   // (bones, skipped materials, lent stump)
+    uint32_t triangleBoneMask=0;bool triangleBoneMaskReady=false;   // round models-2026-11-03: bones of triangleBone (< 32), once per kit part
     // var-<group>.png textures of the swap-set looks, loaded on first use (nullptr = missing file)
     std::unordered_map<std::string,IDirect3DTexture9*> variantTextures;
     // wrap.r3wrap (v10 overlays, Jill's harness): every overlay vertex rides a triangle of the actor's skinned HD body:
@@ -157,6 +159,9 @@ struct ActorRuntime{
     re3handik::State handIk;   // fix 2026-10-25b: player left-hand pose rows (hand-ik.txt)
     uint32_t dropSerial=0;float drop=0;   // fix 2026-10-25c: Western Custom aim, arms lowered (0..1)
     float damageBone[32][3]{};            // GPU path: damage red per bone (same parts as damageTint)
+    uint32_t detachedParts=0;             // round models-2026-11-02: parts latched as torn off on their own matrix (crawler legs)
+    // kit parts on the CPU path: the damage red per part vertex (the GPU path tints by bone), from the native colours
+    uint32_t damageColour[32]{};std::vector<uint32_t> kitTint[3];const void* kitTintAsset[3]{};uint32_t kitTintParts[3]{};
 };
 static std::unordered_map<void*,ActorRuntime> actorRuntime;
 static ActorRuntime& actorState(void* actor,uint8_t modelId,const std::string& asset,uint32_t serial){
@@ -387,6 +392,61 @@ static void loadLooks(){
         r.slot=uint8_t(slot);modelLooks[uint8_t(id)][(int64_t(int32_t(tri))<<32)|uint32_t(int32_t(quad))].push_back(r);++count;
     }
     if(count||bad)log("MODEL_LOOKS records=%u models=%zu invalid_lines=%u",count,modelLooks.size(),bad);
+}
+// ---------------------------------------------------------------- zombie kit (model-pack/kit.txt, round models-2026-11-02)
+//   part <body> <region> <native-group|-> <part-asset> [w=<weight>]
+// Per actor and region (upper, lower, head) of an HD body with regions.txt: the region's materials of <body> are replaced by
+// <part-asset>, its own pack skinned to the same native skeleton (same bone count, inverse binds equal to the body's within
+// 1e-3 relative), drawn with the actor's bones. <native-group>: '-' = the region shows the native main look, else the
+// looks.txt group the region resolves to (ResolvedLook::regionGroup, composites a+b literally). Several rows of one
+// (body, region, group): one is picked per actor by a stable hash of room, actor slot, body and region, weighted by w=
+// (default 1, 1..1000). No file or no matching row: the body draws exactly as before. See runtime\MODELS-2026-11-02-RUNTIME.ru.txt.
+// <part-asset> 'body' (reserved): the body's own region as before (var texture or base albedo) is one of the weighted choices.
+// pair=<tag> ([a-z0-9_-], 1..32): parts of one donor stay together. Regions resolve upper, lower, head; once a region picked a
+// row tagged T, a later region whose candidate rows include T-tagged rows picks only among those (same weights and hash).
+// Round models-2026-11-03 (anti-repeat, user D6 "the same head five times in a room"): identity of a row = the look it shows,
+// the same look on several bodies counts once: the part-asset name without its "kit-<em>-" prefix and without a variant
+// suffix from the first "--" (kit-em16-head-young, kit-em10-head-young--blood2 are both "head-young"); a `body` row =
+// "<body>-<region>-<group>". See resolveKit below.
+struct KitRow{std::string asset,pair,identity;unsigned weight=1;};
+static std::unordered_map<std::string,std::vector<KitRow>> modelKit;   // "<body>|<region 0..2>|<group or ->"
+static std::unordered_set<std::string> modelKitAssets;                // every part pack named in kit.txt (room eviction)
+static const char* const kitRegionName[3]={"upper","lower","head"};
+// Orchestrator addition (3 Nov): then an optional variant suffix from the first "--" goes too: kit-em18-head-young--flay,
+// kit-em16-head-young and kit-em10-head-young--blood2 are all "head-young" (the same face with other blood or skin).
+static std::string kitIdentity(const std::string& body,unsigned region,const std::string& group,const std::string& asset){
+    if(asset=="body")return body+"-"+kitRegionName[region]+"-"+group;   // no variant cut here (group '-' gives "...-head--")
+    std::string name=asset;
+    if(!asset.compare(0,4,"kit-")){
+        const size_t dash=asset.find('-',4);
+        // "kit-" + "em" + hex digits + "-": the body tag goes; other names keep everything after "kit-"
+        if(dash!=std::string::npos&&dash>6&&dash+1<asset.size()&&(asset[4]=='e'||asset[4]=='E')&&(asset[5]=='m'||asset[5]=='M')&&
+            asset.find_first_not_of("0123456789abcdefABCDEF",6)==dash)name=asset.substr(dash+1);
+        else name=asset.substr(4);
+    }
+    const size_t variant=name.find("--");
+    if(variant!=std::string::npos&&variant>0)name.resize(variant);
+    return name;
+}
+static void kitPicksForget();
+static void loadKit(){
+    kitPicksForget();   // cached picks point into the old table
+    modelKit.clear();modelKitAssets.clear();std::ifstream in(root+"/model-pack/kit.txt");if(!in)return;std::string line;unsigned number=0,rows=0,bad=0;std::unordered_set<std::string> bodies,assets;
+    auto safe=[](const std::string& v){return !v.empty()&&v.size()<=64&&v.find_first_of("/\\.")==std::string::npos;};
+    while(std::getline(in,line)){
+        ++number;const auto hash=line.find('#');if(hash!=std::string::npos)line.resize(hash);
+        std::istringstream fields(line);std::string kind,body,region,group,asset,option;if(!(fields>>kind))continue;
+        bool ok=kind=="part"&&(fields>>body>>region>>group>>asset)&&safe(body)&&safe(asset)&&!group.empty()&&group.size()<=96&&group.find_first_of("/\\.")==std::string::npos;
+        const int r=region=="upper"?0:region=="lower"?1:region=="head"?2:-1;ok=ok&&r>=0;KitRow row;row.asset=asset;
+        while(ok&&(fields>>option)){char* end=nullptr;
+            if(option.compare(0,2,"w=")==0){const unsigned long w=strtoul(option.c_str()+2,&end,10);ok=option.size()>2&&*end==0&&w>=1&&w<=1000;row.weight=unsigned(w);}
+            else if(option.compare(0,5,"pair=")==0){row.pair=option.substr(5);ok=!row.pair.empty()&&row.pair.size()<=32&&row.pair.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-")==std::string::npos;}
+            else ok=false;}
+        if(!ok){++bad;log("MODEL_KIT_RULE_INVALID line=%u",number);continue;}
+        row.identity=kitIdentity(body,unsigned(r),group,asset);
+        modelKit[body+"|"+char('0'+r)+"|"+group].push_back(row);++rows;bodies.insert(body);if(asset!="body"){assets.insert(asset);modelKitAssets.insert(asset);}
+    }
+    log("MODEL_KIT_TABLE rows=%u bodies=%zu parts=%zu invalid=%u",rows,bodies.size(),assets.size(),bad);
 }
 static bool partLookKey(const re3bridge::PartSnapshot& part,int64_t& key){
     if(!part.runtimeMesh||!re3bridge::detail::Accessible(part.runtimeMesh,24))return false;
@@ -894,9 +954,11 @@ static int appendGpuJobs(const std::shared_ptr<ModelAsset>& asset,const std::vec
 }
 // Wounds of a body drawn by the GPU path: the corners keep the body's bind vertex and weights, the shader adds the offset and
 // the pull toward the eye of appendWounds. Rebuilt each frame (a few hundred vertices at most per wound).
+// 03.11b: meshFilter = only the wounds of that mesh (Wound::mesh; "" = the body); null = all (unused).
 static void appendWoundsGpu(const std::vector<re3wound::Wound>& wounds,const ModelAsset& body,const std::shared_ptr<re3gpu::Draw>& bodyDraw,const std::vector<uint8_t>* hidden,
-    const re3model::Projection& bodyProjection,re3bridge::ActorPlan& plan,const std::vector<uint8_t>* vertexBone,uint32_t goneBones){
+    const re3model::Projection& bodyProjection,re3bridge::ActorPlan& plan,const std::vector<uint8_t>* vertexBone,uint32_t goneBones,const std::string* meshFilter=nullptr){
     if(wounds.empty())return;
+    if(meshFilter&&std::none_of(wounds.begin(),wounds.end(),[&](const re3wound::Wound& w){return w.mesh==*meshFilter;}))return;
     re3model::Matrix3x4 view;if(!re3model::InverseAffine(bodyProjection.camera,view))return;
     auto decals=getModel("wound-decals");
     if(!decals||decals->mesh.materials.size()!=re3wound::kTextures){if(modelObserved.insert("wound-decals-unavailable").second)log("MODEL_WOUND_DECALS_UNAVAILABLE materials=%zu",decals?decals->mesh.materials.size():0);return;}
@@ -911,6 +973,7 @@ static void appendWoundsGpu(const std::vector<re3wound::Wound>& wounds,const Mod
     for(unsigned texture=0;texture<re3wound::kTextures;++texture){
         const uint32_t first=uint32_t(draw->decal.size());
         for(const auto& wound:wounds){
+            if(meshFilter&&wound.mesh!=*meshFilter)continue;
             if(wound.texture!=texture||std::any_of(wound.corners.begin(),wound.corners.end(),[&](uint32_t v){return v>=body.mesh.vertices.size();}))continue;
             for(size_t t=0;t<wound.material.size();++t){
                 if(hidden&&wound.material[t]<hidden->size()&&(*hidden)[wound.material[t]])continue;
@@ -937,17 +1000,52 @@ static void gpuDrawEntries(const re3gpu::Entry* entries,size_t count){
     if(FAILED(hr)&&!re3model::IsTransientDrawStatus(hr)){
         log("MODEL_GPU_DRAW_FAILED hr=%08lx: the rest of the session uses the CPU path (%s)",hr,modelRenderer.gpuShaderError().c_str());modelGpuEnabled=false;}
 }
+// ---------------------------------------------------------------- CPU path AlphaBlend (round models-2026-11-03)
+// The GPU path draws a gathered stretch of models in two phases: opaque materials with depth writes, then AlphaBlend (flag 4)
+// materials with the depth test and without depth writes (ModelRenderer::drawGpu). The CPU path drew every run of a slice in
+// its order, so a blended material could come before opaque surfaces behind it in the same bucket (another material of the
+// model, the next model of the bucket: the body under Nemesis' pustules) and those painted over it. Now a CPU slice with
+// AlphaBlend runs draws its other runs at once and queues the blended runs; the queue is drawn where native work is about to
+// go over the models, the same points that put the GPU path's gathered models down (gpuFlushPending: every foreign device
+// draw, EndScene, Clear, target and viewport changes, the flip; gpuFlushRect: masks and UI quads), i.e. after every opaque HD
+// slice of that stretch, in OT order (far buckets first). Slices without AlphaBlend runs draw exactly as before.
+struct CpuBlendSlice{std::shared_ptr<re3model::GpuFrame> geometry;size_t slice=0;re3model::DrawOptions options{};unsigned stamp=0;};
+static std::vector<CpuBlendSlice> cpuBlendPending;
+static bool cpuBlendHold=false,cpuBlendDrawing=false,cpuJobActive=false;
+static uint64_t cpuBlendDeferred=0,cpuBlendDrawn=0,cpuBlendStale=0;
+static void cpuBlendFlush(){
+    if(cpuBlendPending.empty()||cpuBlendHold||cpuBlendDrawing||gpuFlushing||!gameDevice)return;
+    cpuBlendDrawing=true;const double started=modelClockMs();
+    if(!gpuList.empty()){gpuTraceNote("flush-full cpu-blend");++gpuStats.flushesFull;gpuDrawEntries(gpuList.data(),gpuList.size());gpuList.clear();++gpuListSerial;}
+    auto dd=gogWrapper;bool ownScene=dd&&!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))ownScene=false;
+    for(const auto& e:cpuBlendPending){
+        if(e.stamp!=frame||!e.geometry){++cpuBlendStale;continue;}   // never a frame late
+        const HRESULT hr=modelRenderer.drawSlice(*e.geometry,e.slice,e.options,2);
+        if(SUCCEEDED(hr))++cpuBlendDrawn;
+        else if(!re3model::IsTransientDrawStatus(hr)&&modelObserved.insert("cpu-blend-failed").second)log("MODEL_BLEND_DRAW_FAILED hr=%08lx (AlphaBlend runs of a CPU slice left out)",hr);}
+    if(ownScene)gameDevice->EndScene();
+    cpuBlendPending.clear();cpuBlendDrawing=false;
+    if(!cpuJobActive){const double spent=modelClockMs()-started;if(fps60Pass)fps60PassDrawMs+=spent;else modelFrameDrawMs+=spent;}
+}
+static void cpuBlendDropStale(){
+    if(cpuBlendPending.empty()||cpuBlendDrawing)return;const size_t before=cpuBlendPending.size();
+    cpuBlendPending.erase(std::remove_if(cpuBlendPending.begin(),cpuBlendPending.end(),[](const CpuBlendSlice& e){return e.stamp!=frame;}),cpuBlendPending.end());
+    cpuBlendStale+=before-cpuBlendPending.size();
+}
 // Native work is about to go over everything gathered so far: draw it. Called before the native queues reach the device,
 // from every device draw that is not ours, the flip and EndScene; re-entered by our own draws.
 static void gpuFlushPending(){
-    if(gpuList.empty()||gpuFlushing||!gameDevice)return;
+    if(!(gpuList.empty()||gpuFlushing||!gameDevice)){
     gpuTraceNote("flush-full");
     ++gpuStats.flushesFull;gpuDrawEntries(gpuList.data(),gpuList.size());gpuList.clear();++gpuListSerial;
+    }
+    if(!cpuBlendPending.empty())cpuBlendFlush();   // round models-2026-11-03 (held while our own CPU slices draw)
 }
 // A quad of known extent (mask, UI): only the models it touches have to be down first. The others stay gathered, their
 // next jobs extend them: one draw instead of a split at every mask of the room.
 static void gpuFlushRect(float left,float top,float right,float bottom){
     if(gpuTraceNow()){char text[128];sprintf_s(text,"quad %.0f,%.0f,%.0f,%.0f",left,top,right,bottom);gpuTraceNote(text);}
+    if(!cpuBlendPending.empty())cpuBlendFlush();   // round models-2026-11-03: the CPU path's queued AlphaBlend runs (all; GPU list first)
     if(gpuList.empty()||gpuFlushing||!gameDevice)return;
     static std::vector<re3gpu::Entry> now;now.clear();size_t kept=0;
     for(size_t i=0;i<gpuList.size();++i){auto& entry=gpuList[i];const float* q=entry.draw->rect;
@@ -968,7 +1066,9 @@ static bool drawGpuJob(ModelJob& job,void* renderer){
     const bool queuedWrapper=!wrapperKnown||*(uint32_t*)(dd+0x18197c)||*(uint32_t*)(dd+0x4b1944);
     if(gpuTraceNow()){char text[160];sprintf_s(text,"gather %s bucket=%u game=%u wrapper=%u rect=%.0f,%.0f,%.0f,%.0f",job.name.c_str(),unsigned(job.bucket),queuedGame,unsigned(queuedWrapper),draw.rect[0],draw.rect[1],draw.rect[2],draw.rect[3]);gpuTraceNote(text);}
     if(gpuList.empty()||queuedGame||queuedWrapper){
-        gpuFlushPending();flushGame(renderer);
+        // round models-2026-11-03: the CPU path's queued AlphaBlend runs stay queued unless native work lies in between
+        {const bool hold=cpuBlendHold;cpuBlendHold=hold||!(queuedGame||queuedWrapper);gpuFlushPending();cpuBlendHold=hold;}
+        flushGame(renderer);
         auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);
     }
     if(draw.listSerial==gpuListSerial){auto& entry=gpuList[draw.listIndex];entry.high=(std::max)(entry.high,job.bucket);entry.low=(std::min)(entry.low,job.bucket);}
@@ -981,6 +1081,7 @@ static bool drawGpuJob(ModelJob& job,void* renderer){
 static size_t gpuPendingCount(){return gpuList.size();}
 static bool gpuFlushingNow(){return gpuFlushing;}
 static void gpuDropDraws(){
+    cpuBlendPending.clear();   // round models-2026-11-03: queued AlphaBlend slices of the CPU path
     gpuList.clear();++gpuListSerial;gpuLastBody.reset();
     for(auto& weak:gpuLiveDraws)if(auto draw=weak.lock()){draw->owner.reset();draw->mesh=nullptr;draw->indices.reset();draw->textures.clear();}
     gpuLiveDraws.clear();
@@ -1099,13 +1200,39 @@ static void takeShots(const re3bridge::ActorContext& context,ActorRuntime& actor
         it=hits.erase(it);
     }
 }
+// 03.11b: a kit zombie (model-pack/kit.txt) takes the shot into every mesh drawn this frame: the body's shown regions and each
+// part pack, posed now (re3wound::woundFromShotTargets); the wound belongs to the mesh it hit (Wound::mesh = the part's id,
+// empty = the body) and is a patch of that mesh's own triangles and UVs. Same limit per actor (kMaxWounds, oldest first) and
+// lifetime (the room visit, actorState) as on bodies.
+struct WoundTestCandidate{void* actor=nullptr;float distance=0;re3model::Vec3 eye{},target{};uint32_t serial=0;unsigned region=0;};
+static WoundTestCandidate woundTestBest;   // QA wound-test (proxy.cpp modelWoundTestRegion): nearest candidate of the last build
+struct KitShotTarget{const ModelAsset* asset=nullptr;const std::vector<re3model::SkinnedVertex>* skinned=nullptr;const std::vector<uint8_t>* hidden=nullptr;std::string mesh;};
+static void takeShotsKit(const re3bridge::ActorContext& context,ActorRuntime& actor,const std::vector<KitShotTarget>& targets,const std::string& name){
+    static unsigned logged=0;
+    std::vector<re3wound::ShotTarget> shot;for(const auto& t:targets)shot.push_back({&t.asset->mesh,t.skinned,t.hidden});
+    auto& hits=re3wound::pendingHits;
+    for(auto it=hits.begin();it!=hits.end();){
+        if(it->actor!=context.actor){++it;continue;}
+        re3wound::Wound wound;re3model::Vec3 where;bool onLine=false;
+        const uint32_t seed=uint32_t(context.serial*2654435761u)^uint32_t(reinterpret_cast<uintptr_t>(context.actor))^uint32_t(actor.wounds.size()*40503u);
+        const int chosen=re3wound::woundFromShotTargets(shot.data(),shot.size(),it->hand,it->weapon,seed,wound,where,onLine);
+        if(chosen>=0){wound.mesh=targets[size_t(chosen)].mesh;
+            if(actor.wounds.size()>=re3wound::kMaxWounds)actor.wounds.erase(actor.wounds.begin());
+            if(logged<200){++logged;log("MODEL_WOUND %s model=%02x actor=%p weapon=%02x at=%.0f,%.0f,%.0f line=%u triangles=%zu texture=%u wounds=%zu delay=%u mesh=%s targets=%zu",name.c_str(),context.modelId,context.actor,it->weapon,where.x,where.y,where.z,
+                unsigned(onLine),wound.material.size(),unsigned(wound.texture),actor.wounds.size()+1,context.serial-it->serial,wound.mesh.empty()?"body":wound.mesh.c_str(),targets.size());}
+            actor.wounds.push_back(std::move(wound));
+        }else if(logged<200){++logged;log("MODEL_WOUND_MISS %s model=%02x weapon=%02x targets=%zu (no body or kit part surface near the barrel line)",name.c_str(),context.modelId,it->weapon,targets.size());}
+        it=hits.erase(it);
+    }
+}
 // The wounds as extra triangles over the skinned body (wound-decals: one alpha-cutout material per texture). Each
 // vertex sits 1.5 units out along the normal and is then pulled 10 units toward the camera eye along its own view
 // ray: the screen position stays exactly the same, the depth is always in front of the body (v12 used the normal
 // offset alone, 2 units: at grazing angles that is less than the depth step and the body won the depth test).
 static void appendWounds(const std::vector<re3wound::Wound>& wounds,const std::vector<re3model::SkinnedVertex>& body,const std::vector<uint8_t>* hidden,
-    const re3model::Projection& bodyProjection,re3bridge::ActorPlan& plan,const std::string& bodyId,const std::vector<uint8_t>* vertexBone=nullptr,uint32_t goneBones=0){
+    const re3model::Projection& bodyProjection,re3bridge::ActorPlan& plan,const std::string& bodyId,const std::vector<uint8_t>* vertexBone=nullptr,uint32_t goneBones=0,const std::string* meshFilter=nullptr){
     if(wounds.empty())return;
+    if(meshFilter&&std::none_of(wounds.begin(),wounds.end(),[&](const re3wound::Wound& w){return w.mesh==*meshFilter;}))return;
     re3model::Matrix3x4 view;if(!re3model::InverseAffine(bodyProjection.camera,view))return;
     const re3model::Vec3 eye{view.m[3],view.m[7],view.m[11]};
     auto decals=getModel("wound-decals");
@@ -1118,6 +1245,7 @@ static void appendWounds(const std::vector<re3wound::Wound>& wounds,const std::v
     for(unsigned texture=0;texture<re3wound::kTextures;++texture){
         auto material=decals->mesh.materials[texture];material.firstIndex=uint32_t(mesh.indices.size());
         for(const auto& wound:wounds){
+            if(meshFilter&&wound.mesh!=*meshFilter)continue;
             if(wound.texture!=texture||std::any_of(wound.corners.begin(),wound.corners.end(),[&](uint32_t v){return v>=body.size();}))continue;
             for(size_t t=0;t<wound.material.size();++t){
                 if(hidden&&wound.material[t]<hidden->size()&&(*hidden)[wound.material[t]])continue;
@@ -1183,16 +1311,35 @@ static std::vector<re3model::Matrix3x4> followNativePart(ModelAsset& asset,const
 // border vertex's weights (the centre with the loop's summed weights), so one cap closes both the body and the falling piece.
 // Packs with a Stump material (zombies) get stump.png projected on the loop plane, others (creatures) one texel of the
 // surface around the hole. Built once per mask (nullptr: none).
-static std::shared_ptr<ModelAsset> limbCaps(ModelAsset& body,uint32_t mask){
-    const auto found=body.caps.find(mask);if(found!=body.caps.end())return found->second;
-    auto& slot=body.caps[mask];const auto& mesh=body.mesh;size_t stump=SIZE_MAX;
+// fix 2026-10-25: the bone with the largest summed weight of every vertex and triangle (enemy parts gone or split off), on first use
+static void ensureTriangleBones(ModelAsset& asset){
+    if(!asset.triangleBone.empty())return;
+    const auto& mesh=asset.mesh;asset.vertexBone.resize(mesh.vertices.size());asset.triangleBone.resize(mesh.indices.size()/3);
+    for(size_t v=0;v<mesh.vertices.size();++v){const auto& x=mesh.vertices[v];unsigned best=0;for(unsigned k=1;k<4;++k)if(x.weight[k]>x.weight[best])best=k;asset.vertexBone[v]=uint8_t(x.bone[best]);}
+    for(size_t t=0;t<asset.triangleBone.size();++t){uint16_t bone[12];uint32_t sum[12]{};unsigned n=0,best=0;
+        for(unsigned c=0;c<3;++c){const auto& x=mesh.vertices[mesh.indices[t*3+c]];
+            for(unsigned k=0;k<4;++k){if(!x.weight[k])continue;unsigned j=0;while(j<n&&bone[j]!=x.bone[k])++j;if(j==n){bone[n++]=x.bone[k];}sum[j]+=x.weight[k];}}
+        for(unsigned j=1;j<n;++j)if(sum[j]>sum[best])best=j;
+        asset.triangleBone[t]=uint8_t(n?bone[best]:0);}
+}
+// Kit (round models-2026-11-02): skip = materials left out (the body's regions a kit part replaces: no cap where the body's
+// own trousers would have been); stumpFrom = the pack whose Stump material caps a part without one (the body: kit parts).
+static std::shared_ptr<ModelAsset> limbCaps(ModelAsset& body,uint32_t mask,uint64_t skip=0,const ModelAsset* stumpFrom=nullptr){
+    const auto cacheKey=std::make_tuple(mask,skip,stumpFrom?stumpFrom->id:std::string());
+    const auto found=body.caps.find(cacheKey);if(found!=body.caps.end())return found->second;
+    auto& slot=body.caps[cacheKey];const auto& mesh=body.mesh;size_t stump=SIZE_MAX;
     for(size_t m=0;m<body.materialRegion.size();++m)if(body.materialRegion[m]==ModelAsset::Stump){stump=m;break;}
     if(body.triangleBone.size()*3!=mesh.indices.size()||body.textures.size()!=mesh.materials.size())return slot;
-    const bool stumpTexture=stump<body.textures.size()&&body.textures[stump].albedo;
+    // a borrowed stump: material index mesh.materials.size() stands for stumpFrom's Stump material and texture
+    size_t borrowed=SIZE_MAX;
+    if(!(stump<body.textures.size()&&body.textures[stump].albedo)&&stumpFrom&&stumpFrom->textures.size()==stumpFrom->mesh.materials.size())
+        for(size_t m=0;m<stumpFrom->materialRegion.size()&&m<stumpFrom->textures.size();++m)if(stumpFrom->materialRegion[m]==ModelAsset::Stump&&stumpFrom->textures[m].albedo){borrowed=m;break;}
+    const bool stumpTexture=(stump<body.textures.size()&&body.textures[stump].albedo)||borrowed!=SIZE_MAX;
+    if(borrowed!=SIZE_MAX)stump=mesh.materials.size();
     std::map<std::array<uint32_t,3>,uint32_t> keys;std::vector<uint32_t> key(mesh.vertices.size());
     for(size_t v=0;v<key.size();++v){std::array<uint32_t,3> k;std::memcpy(k.data(),&mesh.vertices[v].position,12);key[v]=keys.emplace(k,uint32_t(keys.size())).first->second;}
     struct Edge{unsigned visible=0,hidden=0;uint32_t a=0,b=0,material=0;re3model::Vec3 away{};};std::map<std::pair<uint32_t,uint32_t>,Edge> edges;
-    for(size_t m=0;m<mesh.materials.size();++m){if(m==stump)continue;
+    for(size_t m=0;m<mesh.materials.size();++m){if(m==stump||(m<64&&((skip>>m)&1u)))continue;
         for(uint32_t t=mesh.materials[m].firstIndex/3;t<(mesh.materials[m].firstIndex+mesh.materials[m].indexCount)/3;++t){const bool hidden=((mask>>body.triangleBone[t])&1u)!=0;
             for(unsigned k=0;k<3;++k){const uint32_t a=mesh.indices[t*3+k],b=mesh.indices[t*3+(k+1)%3],c=mesh.indices[t*3+(k+2)%3];
                 auto& e=edges[{(std::min)(key[a],key[b]),(std::max)(key[a],key[b])}];
@@ -1225,11 +1372,154 @@ static std::shared_ptr<ModelAsset> limbCaps(ModelAsset& body,uint32_t mask){
         ++loops;
     }
     if(!loops)return slot;
-    for(const auto& [m,list]:byMaterial){auto material=mesh.materials[m];material.firstIndex=uint32_t(cap->mesh.indices.size());material.indexCount=uint32_t(list.size());
+    for(const auto& [m,list]:byMaterial){const bool lent=m==mesh.materials.size();auto material=lent?stumpFrom->mesh.materials[borrowed]:mesh.materials[m];
+        material.firstIndex=uint32_t(cap->mesh.indices.size());material.indexCount=uint32_t(list.size());
         cap->mesh.indices.insert(cap->mesh.indices.end(),list.begin(),list.end());cap->mesh.materials.push_back(material);
-        auto capTextures=body.textures[m];if(capTextures.albedo)capTextures.albedo->AddRef();if(capTextures.stp)capTextures.stp->AddRef();cap->textures.push_back(capTextures);}
-    log("MODEL_PART_CAPS %s mask=%x loops=%u triangles=%zu",body.id.c_str(),mask,loops,cap->mesh.indices.size()/3);
+        auto capTextures=lent?stumpFrom->textures[borrowed]:body.textures[m];if(capTextures.albedo)capTextures.albedo->AddRef();if(capTextures.stp)capTextures.stp->AddRef();cap->textures.push_back(capTextures);}
+    if(skip||stumpFrom)log("MODEL_PART_CAPS %s mask=%x loops=%u triangles=%zu skip=%llx stump=%s",body.id.c_str(),mask,loops,cap->mesh.indices.size()/3,(unsigned long long)skip,borrowed!=SIZE_MAX?stumpFrom->id.c_str():"own");
+    else log("MODEL_PART_CAPS %s mask=%x loops=%u triangles=%zu",body.id.c_str(),mask,loops,cap->mesh.indices.size()/3);
     return slot=cap;
+}
+// Round models-2026-11-02 (user item 12, the crawler): how far the engine left a part from where its skeleton parent puts
+// it. 435750 composes every part with flags&1 as world(+40) = *(+6C) * local(+14) (425270 -> 507440, fixed point 4.12),
+// +6C normally = parent part (+A4) + 0x40. A part on its own matrix (flags 2: skipped there) or re-parented to another
+// matrix keeps where it was while its parent moves on: the distance of its origin from parent world * local translation.
+static float nativeComposeDrift(const re3bridge::PartSnapshot& part,const re3bridge::PartSnapshot& parent){
+    const auto local=re3bridge::detail::Read<re3bridge::Matrix32>(part.nativePart,0x14);const auto& p=parent.world;float d2=0;
+    for(unsigned r=0;r<3;++r){
+        const float expected=float(p.translation[r])+float(int64_t(p.rotation[r*3])*local.translation[0]+int64_t(p.rotation[r*3+1])*local.translation[1]+int64_t(p.rotation[r*3+2])*local.translation[2])/4096.f;
+        const float d=expected-float(part.world.translation[r]);d2+=d*d;}
+    return std::sqrt(d2);
+}
+// ---------------------------------------------------------------- zombie kit: choice and checks (round models-2026-11-02)
+// part[r] = the pack drawn instead of the body's region r (Upper, Lower, Head); ownStump: the upper part has a Stump material
+// (its neck stump replaces the body's when the head is blown off). bones: the bones that carry triangles in each part.
+struct KitChoice{std::shared_ptr<ModelAsset> part[3];uint32_t bones[3]{};bool any=false,ownStump=false;uint32_t seed=0;};
+static std::unordered_map<std::string,std::string> modelKitChecked;   // "<body>|<part>" -> "" usable, else the reason
+static uint32_t kitMix(uint32_t h){h^=h>>16;h*=0x85ebca6bu;h^=h>>13;h*=0xc2b2ae35u;h^=h>>16;return h;}
+// A part is drawn with the body's palette: same bone count and inverse binds (1e-3 relative), the body's linear skin, nothing
+// the body path adds per asset (face rig, overlay wrap, worm stations, pose weights), at most 64 materials (GPU draw mask);
+// textures above 2048 are refused (2 GB address space, FIX-2026-10-31-BIGTEX), heads above 1024 only logged
+static std::string kitPartProblem(const ModelAsset& body,ModelAsset& part,unsigned region){
+    char why[160];
+    if(part.mesh.inverseBind.size()!=body.mesh.inverseBind.size()){sprintf_s(why,"bones=%zu body=%zu",part.mesh.inverseBind.size(),body.mesh.inverseBind.size());return why;}
+    for(size_t b=0;b<body.mesh.inverseBind.size();++b)for(unsigned k=0;k<12;++k){const float x=part.mesh.inverseBind[b].m[k],y=body.mesh.inverseBind[b].m[k];
+        if(!(std::abs(x-y)<=1e-3f*(std::max)(1.f,std::abs(y)))){sprintf_s(why,"inverse-bind bone=%zu element=%u part=%.4f body=%.4f",b,k,x,y);return why;}}
+    if(part.dualQuaternion!=body.dualQuaternion||part.affineDualQuaternion!=body.affineDualQuaternion)return "skinning differs from the body";
+    if(part.face.Valid()||part.poseWeights.valid||!part.wrap.empty()||!part.followStations.empty())return "face/pose-weights/wrap/follow not supported in a part";
+    if(part.mesh.materials.empty()||part.mesh.materials.size()>64)return "materials 1..64";
+    for(const auto& t:part.textures){D3DSURFACE_DESC desc{};if(!t.albedo||FAILED(t.albedo->GetLevelDesc(0,&desc)))continue;
+        if(desc.Width>2048||desc.Height>2048){sprintf_s(why,"texture %ux%u > 2048",desc.Width,desc.Height);return why;}
+        if(region==ModelAsset::Head&&(desc.Width>1024||desc.Height>1024)&&modelObserved.insert("kit-texture:"+part.id).second)log("MODEL_KIT_TEXTURE %s %ux%u above the head budget 1024 (drawn)",part.id.c_str(),desc.Width,desc.Height);}
+    return {};
+}
+// ---------------------------------------------------------------- zombie kit: anti-repeat per room visit (round models-2026-11-03)
+// User 3 Nov (D6): "in many rooms the same head shows up five times". The 2 Nov pick hashed every actor on its own, so a room
+// of zombies of one look drew the same row again and again (single-row groups always, several rows by chance). Now, per room
+// visit (stage and room; a change of either starts a new visit), the identities shown per region are counted over ALL
+// bodies (KitRow::identity, the same look on two bodies counts once). A zombie's regions are resolved ONCE, at its first
+// prepare in the visit (cached by actor object; again only when its body or a region's group changes, or kit.txt reloads):
+// among the candidate rows of a region (after pair=, which wins over anti-repeat) only those whose identity the room shows
+// least (none shown yet: all of them, so the first zombie gets exactly the 2 Nov pick); among those the weights and the same
+// per-actor hash of 2 Nov (stage, room, actor slot, body) in the table order. Deterministic for the same order of first
+// prepares. A zombie keeps its choice for its life in the visit; later (scripted) spawns join the same counts. A picked part
+// that fails its checks (region drawn by the body) also counts the body's own identity of that region.
+struct KitActorPick{std::string body,group[3];const std::vector<KitRow>* rows[3]{};int row[3]{-1,-1,-1};uint32_t seed=0;std::vector<std::pair<unsigned,std::string>> counted;};
+struct KitRoomPicks{uint32_t room=~0u,entered=0,logged=0;bool changed=false;std::unordered_map<std::string,unsigned> shown[3];std::unordered_map<const void*,KitActorPick> actors;};
+static KitRoomPicks kitPicks;
+static unsigned modelKitLines=0,modelKitRoomLines=0;
+static void kitPicksForget(){kitPicks.actors.clear();for(auto& s:kitPicks.shown)s.clear();kitPicks.changed=false;}
+// once per room: MODEL_KIT_ROOM room= key= at=enter|update|leave actors= head=<identity:actors,...> upper= lower= (most shown first)
+static void kitRoomSummary(const char* at){
+    if(kitPicks.actors.empty()||modelKitRoomLines>=4000){kitPicks.changed=false;return;}
+    std::string text[3];
+    for(unsigned r=0;r<3;++r){std::vector<std::pair<std::string,unsigned>> list(kitPicks.shown[r].begin(),kitPicks.shown[r].end());
+        std::sort(list.begin(),list.end(),[](const std::pair<std::string,unsigned>& a,const std::pair<std::string,unsigned>& b){return a.second!=b.second?a.second>b.second:a.first<b.first;});
+        for(const auto& e:list){if(!text[r].empty())text[r]+=",";text[r]+=e.first+":"+std::to_string(e.second);}
+        if(text[r].empty())text[r]="-";}
+    ++modelKitRoomLines;
+    log("MODEL_KIT_ROOM room=R%X%02X key=%04x at=%s actors=%zu head=%s upper=%s lower=%s",(kitPicks.room>>8)+1,kitPicks.room&255u,kitPicks.room,at,kitPicks.actors.size(),text[2].c_str(),text[0].c_str(),text[1].c_str());
+    kitPicks.changed=false;kitPicks.logged=re3bridge::BuildSerial();
+}
+// beginModelBuild (every build) and resolveKit: a new visit when stage or room differ; the summary 90 builds (3 s) after the
+// arrival and after later picks (at most every 90 builds), and at the leave if something changed since
+static void kitRoomTick(uint32_t roomKey,uint32_t serial){
+    if(roomKey!=kitPicks.room){if(kitPicks.changed)kitRoomSummary("leave");kitPicksForget();kitPicks.room=roomKey;kitPicks.entered=kitPicks.logged=serial;return;}
+    if(kitPicks.changed&&serial-kitPicks.entered>=90&&serial-kitPicks.logged>=90)kitRoomSummary(kitPicks.logged==kitPicks.entered?"enter":"update");
+}
+static void kitCount(KitActorPick& pick,unsigned region,const std::string& identity){++kitPicks.shown[region][identity];pick.counted.push_back({region,identity});kitPicks.changed=true;}
+static void kitRelease(KitActorPick& pick){
+    for(const auto& c:pick.counted){auto it=kitPicks.shown[c.first].find(c.second);if(it!=kitPicks.shown[c.first].end()&&!--it->second)kitPicks.shown[c.first].erase(it);}
+    pick.counted.clear();kitPicks.changed=true;
+}
+// Per actor and region: the row resolved for this visit (above); per frame the part pack of that row (lazy getModel, the
+// checks once per (body, part)), as on 2 Nov.
+static void resolveKit(const re3bridge::ActorContext& context,const std::string& bodyName,ModelAsset& body,const ResolvedLook& look,KitChoice& kit){
+    kit=KitChoice{};
+    const uint16_t stage=*(uint16_t*)(gameBase+0x661fa6),room=*(uint16_t*)(gameBase+0x661fa8);
+    kitRoomTick(((uint32_t(stage)<<16)|(uint32_t(room)<<8))>>8,re3bridge::BuildSerial());
+    std::string group[3];const std::vector<KitRow>* rows[3]{};bool matched=false;
+    for(unsigned r=0;r<3;++r){group[r]=look.valid&&!look.regionGroup[r].empty()?look.regionGroup[r]:std::string("-");
+        const auto hit=modelKit.find(bodyName+"|"+char('0'+r)+"|"+group[r]);if(hit!=modelKit.end()&&!hit->second.empty()){rows[r]=&hit->second;matched=true;}}
+    if(!matched)return;   // no row for this actor: the 1.19 drawing, nothing counted
+    uint32_t seed=2166136261u;auto mix=[&](uint32_t v){for(unsigned k=0;k<4;++k){seed^=(v>>(8*k))&255u;seed*=16777619u;}};
+    mix(stage);mix(room);mix(uint32_t(reinterpret_cast<uintptr_t>(context.actor)));for(const char c:bodyName)mix(uint8_t(c));
+    kit.seed=seed=kitMix(seed);
+    auto cached=kitPicks.actors.find(context.actor);
+    bool fresh=cached==kitPicks.actors.end()||cached->second.body!=bodyName||cached->second.seed!=seed;
+    for(unsigned r=0;r<3&&!fresh;++r)fresh=cached->second.group[r]!=group[r]||cached->second.rows[r]!=rows[r];
+    unsigned least[3]{},candidates[3]{};
+    if(fresh){
+        if(cached!=kitPicks.actors.end())kitRelease(cached->second);
+        auto& pick=kitPicks.actors[context.actor];pick=KitActorPick{};pick.body=bodyName;pick.seed=seed;std::vector<std::string> tags;
+        for(unsigned r=0;r<3;++r){pick.group[r]=group[r];pick.rows[r]=rows[r];if(!rows[r])continue;const auto& list=*rows[r];
+            // pair=: the first tag picked by an earlier region that these rows carry keeps the choice among its rows
+            const std::string* tag=nullptr;
+            for(const auto& t:tags){for(const auto& row:list)if(row.pair==t){tag=&t;break;}if(tag)break;}
+            // anti-repeat: the least shown identities of the room among the candidates
+            unsigned low=~0u;std::vector<unsigned> shown(list.size(),0);
+            for(size_t i=0;i<list.size();++i){if(tag&&list[i].pair!=*tag)continue;const auto it=kitPicks.shown[r].find(list[i].identity);shown[i]=it==kitPicks.shown[r].end()?0:it->second;low=(std::min)(low,shown[i]);++candidates[r];}
+            unsigned total=0;for(size_t i=0;i<list.size();++i)if((!tag||list[i].pair==*tag)&&shown[i]==low)total+=list[i].weight;
+            unsigned pickAt=kitMix(seed^(0x9e3779b9u*(r+1)))%total;int chosen=-1;
+            for(size_t i=0;i<list.size();++i){if((tag&&list[i].pair!=*tag)||shown[i]!=low)continue;if(chosen<0)chosen=int(i);if(pickAt<list[i].weight){chosen=int(i);break;}pickAt-=list[i].weight;}
+            pick.row[r]=chosen;least[r]=low;
+            const auto& row=list[size_t(chosen)];if(!row.pair.empty()&&std::find(tags.begin(),tags.end(),row.pair)==tags.end())tags.push_back(row.pair);
+            kitCount(pick,r,row.identity);
+        }
+        cached=kitPicks.actors.find(context.actor);
+    }
+    auto& pick=cached->second;
+    const char* chosen[3]={"body","body","body"};
+    for(unsigned r=0;r<3;++r){if(!pick.rows[r]||pick.row[r]<0)continue;const KitRow* row=&(*pick.rows[r])[size_t(pick.row[r])];
+        if(row->asset=="body")continue;   // the body's own region won the pick
+        auto part=getModel(row->asset);const std::string key=bodyName+"|"+row->asset;
+        auto fallback=[&]{const auto own=kitIdentity(bodyName,r,group[r],"body");if(fresh&&own!=row->identity)kitCount(pick,r,own);};
+        if(!part){if(modelObserved.size()<4000&&modelObserved.insert("kit-missing:"+key).second)log("MODEL_KIT_INVALID %s part=%s region=%u group=%s reason=unavailable (body region drawn)",bodyName.c_str(),row->asset.c_str(),r,group[r].c_str());fallback();continue;}
+        auto checked=modelKitChecked.find(key);
+        if(checked==modelKitChecked.end()){checked=modelKitChecked.emplace(key,kitPartProblem(body,*part,r)).first;
+            if(!checked->second.empty())log("MODEL_KIT_INVALID %s part=%s region=%u group=%s reason=%s (body region drawn)",bodyName.c_str(),row->asset.c_str(),r,group[r].c_str(),checked->second.c_str());}
+        if(!checked->second.empty()){fallback();continue;}
+        part->characterBody=true;
+        if(!part->triangleBoneMaskReady){ensureTriangleBones(*part);uint32_t mask=0;for(const auto b:part->triangleBone)if(b<32)mask|=1u<<b;part->triangleBoneMask=mask;part->triangleBoneMaskReady=true;}
+        kit.bones[r]=part->triangleBoneMask;
+        kit.part[r]=part;kit.any=true;chosen[r]=part->id.c_str();
+    }
+    if(kit.part[ModelAsset::Upper])for(const auto region:kit.part[ModelAsset::Upper]->materialRegion)kit.ownStump|=region==ModelAsset::Stump;
+    // once per resolution (an actor's first prepare in the visit): the 2 Nov fields, then the identities, groups, how many
+    // candidates each region had and how often the room already showed the picked identity (0 = not shown before)
+    if(fresh&&modelKitLines<20000){++modelKitLines;std::string ids,groups,tail,pairText;
+        for(unsigned r=0;r<3;++r){const char* tag=r==0?"u:":r==1?",l:":",h:";ids+=tag;groups+=tag;groups+=group[r];
+            if(pick.rows[r]&&pick.row[r]>=0){const auto& row=(*pick.rows[r])[size_t(pick.row[r])];ids+=row.identity;char n[32];sprintf_s(n,"%s%u/%u",tag,least[r],candidates[r]);tail+=n;
+                if(!row.pair.empty())pairText+=(pairText.empty()?"":",")+std::string(1,"ulh"[r])+":"+row.pair;}
+            else{ids+="-";tail+=tag;tail+="-";}}
+        log("MODEL_KIT %s model=%02x actor=%p upper=%s lower=%s head=%s seed=%08x stump=%s pair=%s ids=%s groups=%s shown/candidates=%s",bodyName.c_str(),context.modelId,context.actor,chosen[0],chosen[1],chosen[2],seed,kit.ownStump?"upper":"body",pairText.empty()?"-":pairText.c_str(),ids.c_str(),groups.c_str(),tail.c_str());}
+}
+// The visibility of a part's materials: its regions.txt tags, untagged = the region it replaces. Stump only in the upper part,
+// while the head is blown off; Head while it is on.
+static void kitPartMaterials(const ModelAsset& part,unsigned region,bool headGone,std::vector<uint8_t>& hidden){
+    hidden.assign(part.mesh.materials.size(),0);
+    for(size_t m=0;m<hidden.size();++m){const uint8_t tag=m<part.materialRegion.size()?part.materialRegion[m]:uint8_t(region);
+        hidden[m]=uint8_t(tag==ModelAsset::Stump?!(headGone&&region==ModelAsset::Upper):tag==ModelAsset::Head?headGone:false);}
 }
 static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3bridge::ActorPlan& plan){
     ModelCostTimer cost(modelFramePrepareMs);
@@ -1313,7 +1603,7 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     // fix 2026-10-25: native 4A32D0/4A3460/4A4BB0 (EM36 acid, R509) drop the left arm (6,8 fall), head (2 hidden, spare 22
     // falls) and right forearm (4 hidden, spare 23 and hand 5 fall); the EM38 death 476840 shatters limbs (render 0x20).
     // A cut= part hidden, falling (flags 2|8) or shattering is absent; a shattering one keeps its native draw (the effect).
-    uint32_t cutAbsent=0,cutShatter=0;int cutParent[32];
+    uint32_t cutAbsent=0,cutShatter=0,cutTree=0;int cutParent[32];
     if(rule&&rule->cutParts){const uintptr_t first=reinterpret_cast<uintptr_t>(context.parts);const unsigned cutBones=boneCount<32u?boneCount:32u;
         for(unsigned i=0;i<cutBones;++i){const uintptr_t p=re3bridge::detail::Read<uintptr_t>(context.bones[i].nativePart,0xa4);
             cutParent[i]=p>=first&&(p-first)%re3bridge::kPartStride==0&&(p-first)/re3bridge::kPartStride<cutBones?int((p-first)/re3bridge::kPartStride):-1;}
@@ -1322,7 +1612,7 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
             if((b.renderAttributes&0x20)&&b.visible)cutShatter|=1u<<i;}
         // the native children of an absent cut part (EM36 part 7 gets flags 8 under the falling arm 6) are the cut's business
         // too (their triangles sit in its parts.txt materials): no enemyParts split, reattach or limb caps for them
-        uint32_t cutTree=0;for(unsigned i=0;i<cutBones;++i)for(int a=cutParent[i],n=0;a>=0&&n<32;a=cutParent[a],++n)if((cutAbsent>>a)&1u){cutTree|=1u<<i;break;}
+        for(unsigned i=0;i<cutBones;++i)for(int a=cutParent[i],n=0;a>=0&&n<32;a=cutParent[a],++n)if((cutAbsent>>a)&1u){cutTree|=1u<<i;break;}
         partGone&=~cutTree;partFalling&=~cutTree;partScaled&=~cutTree;}
     if(cutAbsent&&body->materialParts.empty()){if(modelObserved.insert("cut-native:"+name).second)log("MODEL_NATIVE_PART_FALLBACK %s absent=%x (no parts.txt)",name.c_str(),cutAbsent);return false;}
     // Body regions (zombies): per-actor clothing textures of the resolved look, head/stump switch.
@@ -1330,18 +1620,58 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     const bool hasHeadRegion=zones&&std::find(body->materialRegion.begin(),body->materialRegion.end(),uint8_t(ModelAsset::Head))!=body->materialRegion.end();
     if(headGone&&context.isPlayer&&modelObserved.insert("headless:"+name).second)log("MODEL_HEADLESS %s model=%02x head flags=%x render=%x torso render=%x",name.c_str(),context.modelId,context.bones[1].flags,context.bones[1].renderAttributes,context.bones[0].renderAttributes);
     const int head=enemyParts?rule->headPart:-1;
-    if(head>=0&&head<32&&hasHeadRegion&&(((partGone|partFalling|partScaled)>>head)&1u)){headGone=true;partGone&=~(1u<<head);partScaled&=~(1u<<head);}
-    // falling pieces: the part and its native children (parent part pointer at +0xA4); nested falling parts ride the outer one.
-    // reattach: bones whose native matrix left the skeleton (falling, shattering, own matrix, or stale: 435750 only updates
-    // parts with flags&1) follow their parent in the bind relation on the body, so no border vertex is pulled after them
-    unsigned pieces=0,pieceRoot[32]{},depth[32]{};int pieceParent[32]{},parent[32]{};uint32_t pieceBones[32]{},split=0,reattach=0;
-    if(partGone|partFalling){
-        const uintptr_t first=reinterpret_cast<uintptr_t>(context.parts);
+    unsigned pieces=0,pieceRoot[32]{},depth[32]{};int pieceParent[32]{},parent[32]{};uint32_t pieceBones[32]{},split=0,reattach=0,partDetached=0;
+    // parent part pointer at +0xA4 (enemies: always, the torn-off test below needs it)
+    if(enemyParts){const uintptr_t first=reinterpret_cast<uintptr_t>(context.parts);
         for(unsigned i=0;i<boneCount;++i){const uintptr_t p=re3bridge::detail::Read<uintptr_t>(context.bones[i].nativePart,0xa4);
             parent[i]=p>=first&&(p-first)%re3bridge::kPartStride==0&&(p-first)/re3bridge::kPartStride<boneCount?int((p-first)/re3bridge::kPartStride):-1;}
-        for(unsigned i=0;i<boneCount;++i)for(int a=parent[i];a>=0&&depth[i]<32;a=parent[a])++depth[i];
-        for(unsigned r=0;r<boneCount;++r)if((partFalling>>r)&1u){
-            bool inner=false;for(int a=parent[r],n=0;a>=0&&n<32;a=parent[a],++n)inner|=((partFalling>>a)&1u)!=0;
+        for(unsigned i=0;i<boneCount;++i)for(int a=parent[i];a>=0&&depth[i]<32;a=parent[a])++depth[i];}
+    // Round models-2026-11-02 (user item 12): the zombie torn at the waist. Its damage routine for the strong hits (table
+    // 52E960 / 52F190 by the hit kind +12C: 4-8, 10, 24, 27 = shotgun, magnum, grenade rounds...) is 4C1090 (EM10 family:
+    // EM10-15, 17, 2C...; 4C119B) and 4D1480 (EM16 family: EM16, 18-1F; 4D15AD). With chance 1/4 (always when +133 bit 4,
+    // never in the censored build: 425540) it gives the hips (EM10 family part 8, EM16 family part 6) and both thighs
+    // (9, 12 / 7, 9) flags |= 0x22 (2: own matrix, 435750 stops composing them; 0x20: own visibility test) and render |=
+    // 0x1000 (4358F0: lit at the part's own position, hips also 4 = red), shins and feet flags |= 0x20. The torso, root
+    // part 0, then crawls away with the actor while the legs keep their frozen matrices and kick (shins and feet still
+    // animate on the frozen thighs). The HD body skinned the waist with bones 0 and the hips on these two matrices: the
+    // strip from the legs to the crawling torso. Same test catches EM10's flying head (4BC780: part 1 flags |= 0x22, own
+    // physics) and a part re-parented to another matrix (4C043D: hips +6C -> actor+4C).
+    // A part on its own matrix (flags 2 or +6C not its parent's +40) that lies more than 12 units from where its parent
+    // would put it (nativeComposeDrift; an attached part is exact to rounding) is torn off: it and its native children are
+    // one HD piece on the game's matrices, as a falling part, the body caps the cut. Latched per actor while it stays on
+    // its own matrix (no flicker as the drift passes the threshold).
+    // A torn-off part whose frozen matrix was never composed (the zombie torn while it was not drawn yet: 435750 runs from the
+    // draw path, the parts' world matrices are still zero, QA 2026-11-02 R10D) collapses to a point natively: it and its
+    // children are gone for the HD body too (the old drawing stretched the waist to the world origin).
+    uint32_t partCollapsed=0;
+    if(enemyParts){auto& latched=actorState(context.actor,context.modelId,name,context.serial).detachedParts;uint32_t own=0;
+        for(unsigned i=0;i<boneCount&&i<32;++i){const uint32_t bit=1u<<i;const auto& b=context.bones[i];
+            if(parent[i]<0||((partGone|partFalling|cutTree|cutAbsent|rule->cutParts)&bit)||(b.renderAttributes&0x20)||!(b.flags&1))continue;
+            const auto& up=context.bones[parent[i]];
+            const bool redirected=re3bridge::detail::Read<uintptr_t>(b.nativePart,0x6c)!=reinterpret_cast<uintptr_t>(up.nativePart)+0x40;
+            if(!(b.flags&2)&&!redirected)continue;
+            own|=bit;
+            {const auto* m=b.world.rotation;const double det=(double(m[0])*(double(m[4])*m[8]-double(m[5])*m[7])-double(m[1])*(double(m[3])*m[8]-double(m[5])*m[6])+double(m[2])*(double(m[3])*m[7]-double(m[4])*m[6]))/(4096.0*4096.0*4096.0);
+                if(std::abs(det)<0.25){partCollapsed|=bit;continue;}}
+            if((latched&bit)||((partGone|partFalling|latched)>>parent[i])&1u)continue;
+            const float drift=nativeComposeDrift(b,up);if(!(drift>12.f))continue;
+            latched|=bit;char note[96];sprintf_s(note,"detached:%s:%u:%x:%u",name.c_str(),i,b.flags,unsigned(redirected));
+            if(modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_DETACHED %s model=%02x actor=%p part=%u parent=%d flags=%x render=%x redirected=%u drift=%.0f",
+                name.c_str(),context.modelId,context.actor,i,parent[i],b.flags,b.renderAttributes,unsigned(redirected),drift);}
+        latched&=own&~partCollapsed;partDetached=modelDetachFix?latched:0u;
+        if(partCollapsed&&modelDetachFix){uint32_t tree=0;
+            for(unsigned b=0;b<boneCount&&b<32;++b)for(int a=int(b),n=0;a>=0&&n<32;a=parent[a],++n)if((partCollapsed>>a)&1u){tree|=1u<<b;break;}
+            partGone|=tree;partDetached&=~tree;char note[96];sprintf_s(note,"collapsed:%s:%x",name.c_str(),tree);
+            if(modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_COLLAPSED %s model=%02x actor=%p parts=%x (own matrix never composed: drawn as gone, as natively)",name.c_str(),context.modelId,context.actor,tree);}}
+    if(head>=0&&head<32&&hasHeadRegion&&(((partGone|partFalling|partScaled|partDetached)>>head)&1u)){headGone=true;partGone&=~(1u<<head);partScaled&=~(1u<<head);}
+    // falling (and torn-off) pieces: the part and its native children (parent part pointer at +0xA4); nested falling parts
+    // ride the outer one.
+    // reattach: bones whose native matrix left the skeleton (falling, shattering, own matrix, or stale: 435750 only updates
+    // parts with flags&1) follow their parent in the bind relation on the body, so no border vertex is pulled after them
+    const uint32_t partLoose=partFalling|partDetached;
+    if(partGone|partLoose){
+        for(unsigned r=0;r<boneCount;++r)if((partLoose>>r)&1u){
+            bool inner=false;for(int a=parent[r],n=0;a>=0&&n<32;a=parent[a],++n)inner|=((partLoose>>a)&1u)!=0;
             if(inner)continue;
             if(parent[r]<0){if(modelObserved.insert("native-falling-root:"+name).second)log("MODEL_NATIVE_PART_FALLBACK %s part=%u flags=%x falling without a parent",name.c_str(),r,context.bones[r].flags);return false;}
             uint32_t members=0;for(unsigned b=0;b<boneCount;++b)for(int a=int(b),n=0;a>=0&&n<32;a=parent[a],++n)if(a==int(r)){members|=1u<<b;break;}
@@ -1352,29 +1682,26 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     }
     // nothing of the body left (zombies appearing part by part, everything shot off): the native draws the rest
     if(enemyParts&&((partGone|split)&rule->geometry)==rule->geometry)return false;
-    if((partGone|split)&&body->triangleBone.empty()){
-        const auto& mesh=body->mesh;body->vertexBone.resize(mesh.vertices.size());body->triangleBone.resize(mesh.indices.size()/3);
-        for(size_t v=0;v<mesh.vertices.size();++v){const auto& x=mesh.vertices[v];unsigned best=0;for(unsigned k=1;k<4;++k)if(x.weight[k]>x.weight[best])best=k;body->vertexBone[v]=uint8_t(x.bone[best]);}
-        for(size_t t=0;t<body->triangleBone.size();++t){uint16_t bone[12];uint32_t sum[12]{};unsigned n=0,best=0;
-            for(unsigned c=0;c<3;++c){const auto& x=mesh.vertices[mesh.indices[t*3+c]];
-                for(unsigned k=0;k<4;++k){if(!x.weight[k])continue;unsigned j=0;while(j<n&&bone[j]!=x.bone[k])++j;if(j==n){bone[n++]=x.bone[k];}sum[j]+=x.weight[k];}}
-            for(unsigned j=1;j<n;++j)if(sum[j]>sum[best])best=j;
-            body->triangleBone[t]=uint8_t(n?bone[best]:0);}
-    }
+    if(partGone|split)ensureTriangleBones(*body);
     std::vector<re3model::MaterialTextures> actorTextures;std::vector<uint8_t> hiddenMaterials;
     const bool partMaterials=rule&&!body->materialParts.empty();
     if(partMaterials){hiddenMaterials.assign(body->materialParts.size(),0);
         for(size_t m=0;m<hiddenMaterials.size();++m)hiddenMaterials[m]=uint8_t((body->materialParts[m].first&cutAbsent)||(body->materialParts[m].second&~cutAbsent));
         char note[128];sprintf_s(note,"cut:%s:%x",name.c_str(),cutAbsent);
         if(cutAbsent&&modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_CUT %s model=%02x absent=%x",name.c_str(),context.modelId,cutAbsent);}
+    // kit (round models-2026-11-02): the parts of this actor; the body's materials of replaced regions are hidden (and skipped by
+    // its caps), the body's stump too when the upper part brings its own
+    KitChoice kit;uint64_t kitBodySkip=0;
     if(zones){
         actorTextures=body->textures;if(!partMaterials)hiddenMaterials.assign(body->materialRegion.size(),0);
         auto look=modelLastLook;
         // the spare torso replaces the base torso only; an upper swap set already wears its own (EM17 set0 = same torso)
         if(torso15Shown&&look.regionGroup[ModelAsset::Upper].empty()){look.valid=true;look.regionGroup[ModelAsset::Upper]=rule->torso15;}
+        if(!modelKit.empty()&&modelKitEnabled&&enemyParts&&!modelParity)resolveKit(context,name,*body,look,kit);
         for(size_t m=0;m<body->materialRegion.size();++m){const auto region=body->materialRegion[m];
             if(region==ModelAsset::Stump)hiddenMaterials[m]|=uint8_t(!headGone);
             if(region==ModelAsset::Head)hiddenMaterials[m]|=uint8_t(headGone);
+            if(kit.any&&((region<=ModelAsset::Head&&kit.part[region])||(region==ModelAsset::Stump&&kit.ownStump))){hiddenMaterials[m]=1;if(m<64)kitBodySkip|=1ull<<m;continue;}
             if(region<=ModelAsset::Head&&look.valid&&!look.regionGroup[region].empty()){
                 auto variant=[&](const std::string& group)->IDirect3DTexture9*{auto hit=body->variantTextures.find(group);
                     if(hit==body->variantTextures.end()){
@@ -1472,8 +1799,8 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     if(zones||partMaterials){projection.hiddenMaterials=&hiddenMaterials;projection.sortWithinBucketByMaterial=true;}
     std::vector<uint8_t> bodyHidden;
     if(partGone|split){bodyHidden.resize(body->triangleBone.size());for(size_t t=0;t<bodyHidden.size();++t)bodyHidden[t]=uint8_t(((partGone|split)>>body->triangleBone[t])&1u);projection.hiddenTriangles=&bodyHidden;projection.keepBones=~(partGone|split);}
-    if(partGone|partShatter|partFalling|partScaled){char note[160];sprintf_s(note,"parts:%s:%x:%x:%x:%x:%u",name.c_str(),partGone,partShatter,partFalling,partScaled,unsigned(headGone));
-        if(modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_SPLIT %s model=%02x gone=%x shatter=%x falling=%x scaled=%x headless=%u pieces=%u",name.c_str(),context.modelId,partGone,partShatter,partFalling,partScaled,unsigned(headGone),pieces);}
+    if(partGone|partShatter|partFalling|partScaled|partDetached){char note[160];sprintf_s(note,"parts:%s:%x:%x:%x:%x:%u:%x",name.c_str(),partGone,partShatter,partFalling,partScaled,unsigned(headGone),partDetached);
+        if(modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_SPLIT %s model=%02x gone=%x shatter=%x falling=%x scaled=%x headless=%u pieces=%u detached=%x",name.c_str(),context.modelId,partGone,partShatter,partFalling,partScaled,unsigned(headGone),pieces,partDetached);}
     re3model::NativeLighting lighting;
     const auto tint=re3bridge::detail::Read<uint32_t>(context.bones[0].nativePart,0x68)&0xffffffu;
     if(re3model::CaptureNativeLighting(lighting,context.worldLight,context.gte.data(),context.gte.size(),tint)){
@@ -1526,7 +1853,7 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
         // The wounds stay for the whole room (cleared in beginModelBuild) and with the actor's model (actorState): a
         // part losing its native red only recolours it, and dead or downed enemies keep their wounds.
         if(damaged!=actor.damagedParts||(damaged&&actor.damageTint.size()!=body->mesh.vertices.size())){
-            actor.damagedParts=damaged;re3wound::damageTint(body->mesh,colour,damaged,actor.damageTint);re3wound::damageBoneTint(colour,damaged,actor.damageBone);
+            actor.damagedParts=damaged;re3wound::damageTint(body->mesh,colour,damaged,actor.damageTint);re3wound::damageBoneTint(colour,damaged,actor.damageBone);std::copy(colour,colour+32,actor.damageColour);
             char note[96];sprintf_s(note,"damage-red:%s:%x",name.c_str(),damaged);
             if(damaged&&modelObserved.size()<4000&&modelObserved.insert(note).second){unsigned first=0;while(!((damaged>>first)&1u))++first;
                 log("MODEL_DAMAGE_RED %s model=%02x parts=%x colour=%06x",name.c_str(),context.modelId,damaged,colour[first]);}
@@ -1543,14 +1870,55 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     std::shared_ptr<ModelAsset> worn=wearsOverlay&&!hitPending&&!cpuWounds?getModel(rule->overlay):nullptr;
     gpuBodySkinOnly=worn&&body->affineDualQuaternion&&gpuPathOn()&&!worn->wrapAnchors.empty()?&worn->wrapAnchors:nullptr;
     if(gpuBodySkinOnly)bodySkinned.swap(gpuOverlayBody);
-    const bool bodyReady=appendModelJobs(body,bones,projection,plan,actorTextures.empty()?nullptr:&actorTextures,(wearsOverlay||woundsWanted)?&bodySkinned:nullptr);
-    const auto bodyDraw=gpuLastBody;gpuBodySkinWanted=false;
+    // kit: the body draws only while one of its materials is left (all three regions replaced: the parts alone make it HD)
+    const bool bodyShown=!kit.any||std::find(hiddenMaterials.begin(),hiddenMaterials.end(),uint8_t(0))!=hiddenMaterials.end();
+    bool bodyReady=!bodyShown||appendModelJobs(body,bones,projection,plan,actorTextures.empty()?nullptr:&actorTextures,(wearsOverlay||woundsWanted)?&bodySkinned:nullptr);
+    const auto bodyDraw=bodyShown?gpuLastBody:std::shared_ptr<re3gpu::Draw>();gpuBodySkinWanted=false;
     const bool keptOverlayBody=gpuBodySkinOnly!=nullptr;gpuBodySkinOnly=nullptr;
     struct OverlayBodyBack{std::vector<re3model::SkinnedVertex>& a;bool on;~OverlayBodyBack(){if(on)a.swap(gpuOverlayBody);}} overlayBodyBack{bodySkinned,keptOverlayBody};
+    // kit parts: the body's bones, light, tint and depth; their materials by tag (kitPartMaterials), the triangles of the bones
+    // outside keep hidden as on the body (gone and split parts, or everything but a piece), the damage red per part vertex
+    // for the CPU path (the GPU path tints the bones). A part with nothing to draw this frame (wholly behind the near plane, all
+    // its kept triangles clipped: QA 2026-11-02 R10D, the actor went native for a frame) is left out; the actor stays HD.
+    std::vector<uint8_t> kitMaterials[3],kitTriangles[3];
+    auto kitProjection=[&](unsigned r,uint32_t keep,bool headOn)->re3model::Projection{
+        auto& part=*kit.part[r];auto p=projection;
+        kitPartMaterials(part,r,!headOn,kitMaterials[r]);p.hiddenMaterials=&kitMaterials[r];p.sortWithinBucketByMaterial=true;
+        if(keep!=~0u){kitTriangles[r].resize(part.triangleBone.size());for(size_t t=0;t<kitTriangles[r].size();++t){const unsigned b=part.triangleBone[t];kitTriangles[r][t]=uint8_t(b>=32||!((keep>>b)&1u));}
+            p.hiddenTriangles=&kitTriangles[r];p.keepBones=keep;}
+        else{p.hiddenTriangles=nullptr;p.keepBones=~0u;}
+        if(projection.vertexTint){auto& tint=actor.kitTint[r];
+            if(actor.kitTintAsset[r]!=&part||actor.kitTintParts[r]!=actor.damagedParts||tint.size()!=part.mesh.vertices.size()){re3wound::damageTint(part.mesh,actor.damageColour,actor.damagedParts,tint);actor.kitTintAsset[r]=&part;actor.kitTintParts[r]=actor.damagedParts;}
+            p.vertexTint=tint.empty()?nullptr:&tint;}
+        return p;};
+    const uint32_t kitKeep=(partGone|split)?~(partGone|split):~0u;
+    // 03.11b wounds on kit parts: a wounded or just hit actor keeps each drawn part's skinned vertices (CPU path: every frame,
+    // its decals ride them; GPU path: only in the frame of a hit, for the ray) and its GPU draw (the decals take its palette)
+    std::vector<re3model::SkinnedVertex> kitSkinned[3];std::shared_ptr<re3gpu::Draw> kitDraw[3];bool kitDrawn[3]{};
+    for(unsigned r=0;r<3&&bodyReady&&kit.any;++r){if(!kit.part[r]||(r==ModelAsset::Head&&headGone)||!(kit.bones[r]&kitKeep))continue;
+        if(woundsWanted){gpuBodySkinWanted=hitPending;gpuLastBody.reset();}
+        const bool drawnPart=appendModelJobs(kit.part[r],bones,kitProjection(r,kitKeep,!headGone),plan,nullptr,woundsWanted?&kitSkinned[r]:nullptr);
+        if(woundsWanted){gpuBodySkinWanted=false;kitDraw[r]=gpuLastBody;gpuLastBody.reset();}
+        kitDrawn[r]=drawnPart;
+        if(!drawnPart&&modelObserved.insert("kit-empty:"+kit.part[r]->id).second)
+            log("MODEL_KIT_PART_EMPTY %s part=%s (nothing to draw this frame, left out)",name.c_str(),kit.part[r]->id.c_str());}
+    // QA wound-test (03.11b, debug_warp command): the kit actor of this build whose part of that region is nearest to the camera eye;
+    // beginModelBuild queues one hit from the eye at the part's centre (its bind-pose centroid on its dominant bone)
+    if(modelWoundTestRegion>=0&&modelWoundTestRegion<3&&kit.any&&kitDrawn[modelWoundTestRegion]&&kit.part[modelWoundTestRegion]){
+        const unsigned r=unsigned(modelWoundTestRegion);const auto& part=*kit.part[r];re3model::Matrix3x4 view;
+        if(re3model::InverseAffine(projection.camera,view)&&!part.mesh.vertices.empty()){
+            unsigned count[32]{};for(const auto b:part.triangleBone)if(b<32)++count[b];unsigned bone=0;for(unsigned b=1;b<32;++b)if(count[b]>count[bone])bone=b;
+            if(bone<bones.size()&&bone<part.mesh.inverseBind.size()){
+                re3model::Vec3 centroid{};for(const auto& v:part.mesh.vertices)centroid=centroid+v.position;centroid=centroid*(1.f/float(part.mesh.vertices.size()));
+                const re3model::Vec3 eye{view.m[3],view.m[7],view.m[11]},target=re3model::TransformPoint(re3model::Multiply(bones[bone],part.mesh.inverseBind[bone]),centroid);
+                const re3model::Vec3 d=target-eye;const float distance=std::sqrt(re3model::Dot(d,d));
+                if(distance>1&&(woundTestBest.serial!=context.serial||distance<woundTestBest.distance)){woundTestBest={context.actor,distance,eye,target,context.serial,r};}}}}
     // falling pieces (R402 head from parts_down, limbs blown off): the piece's own native matrices, the rest of the mesh rigid
     // with its root, only the piece's triangles (a head of a pack with regions: the Head material); a failing piece skips itself
     auto capProjection=projection;capProjection.hiddenMaterials=nullptr;capProjection.hiddenTriangles=nullptr;capProjection.keepBones=~0u;capProjection.vertexTint=nullptr;capProjection.boneTint=nullptr;capProjection.sortWithinBucketByMaterial=false;
-    if(bodyReady&&rule&&reattach)if(auto caps=limbCaps(*body,reattach))appendModelJobs(caps,bones,capProjection,plan);
+    if(bodyReady&&rule&&reattach){if(bodyShown)if(auto caps=limbCaps(*body,reattach,kitBodySkip))appendModelJobs(caps,bones,capProjection,plan);
+        // kit parts close their own cuts (stump.png of the part, else the body's)
+        for(unsigned r=0;r<3;++r)if(kit.part[r]&&!(r==ModelAsset::Head&&headGone))if(auto caps=limbCaps(*kit.part[r],reattach,0,body.get()))appendModelJobs(caps,bones,capProjection,plan);}
     for(unsigned k=0;k<pieces&&bodyReady;++k){
         const unsigned r=pieceRoot[k];const bool region=headGone&&int(r)==head;
         const auto raw=re3model::FromNativeMatrix(context.bones[r].world),rigid=re3model::Multiply(raw,body->mesh.inverseBind[r]);
@@ -1560,8 +1928,14 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
         auto pieceProjection=projection;std::vector<uint8_t> pieceMaterials,pieceTriangles;
         if(region){pieceMaterials.resize(body->materialRegion.size());for(size_t m=0;m<pieceMaterials.size();++m)pieceMaterials[m]=body->materialRegion[m]!=ModelAsset::Head;pieceProjection.hiddenMaterials=&pieceMaterials;pieceProjection.hiddenTriangles=nullptr;pieceProjection.keepBones=~0u;}
         else{pieceTriangles.resize(body->triangleBone.size());for(size_t t=0;t<pieceTriangles.size();++t){const unsigned b=body->triangleBone[t];pieceTriangles[t]=uint8_t(!((pieceBones[k]>>b)&1u)||((partGone>>b)&1u));}pieceProjection.hiddenTriangles=&pieceTriangles;pieceProjection.keepBones=pieceBones[k]&~partGone;}
-        const bool drawn=appendModelJobs(body,pose,pieceProjection,plan,actorTextures.empty()?nullptr:&actorTextures);
-        if(drawn&&!region)if(auto caps=limbCaps(*body,pieceBones[k]))appendModelJobs(caps,pose,capProjection,plan);
+        // kit: a replaced head falls as the head part; the other parts' triangles of the piece ride it as the body's do
+        const bool bodyPiece=region?!kit.part[ModelAsset::Head]:bodyShown;bool drawn=false;
+        if(bodyPiece){drawn=appendModelJobs(body,pose,pieceProjection,plan,actorTextures.empty()?nullptr:&actorTextures);
+            if(drawn&&!region)if(auto caps=limbCaps(*body,pieceBones[k],kitBodySkip))appendModelJobs(caps,pose,capProjection,plan);}
+        for(unsigned kr=0;kr<3&&kit.any;++kr){if(!kit.part[kr])continue;
+            if(region){if(kr==ModelAsset::Head)drawn|=appendModelJobs(kit.part[kr],pose,kitProjection(kr,~0u,true),plan);continue;}
+            const uint32_t keep=pieceBones[k]&~partGone;if((kr==ModelAsset::Head&&headGone)||!(kit.bones[kr]&keep))continue;
+            if(appendModelJobs(kit.part[kr],pose,kitProjection(kr,keep,!headGone),plan)){drawn=true;if(auto caps=limbCaps(*kit.part[kr],pieceBones[k],0,body.get()))appendModelJobs(caps,pose,capProjection,plan);}}
         const float dx=raw.m[3]-bones[r].m[3],dy=raw.m[7]-bones[r].m[7],dz=raw.m[11]-bones[r].m[11],drift=std::sqrt(dx*dx+dy*dy+dz*dz);
         char note[96];sprintf_s(note,"piece:%p:%u:%u",context.actor,r,unsigned(drift>300));
         if(modelObserved.size()<4000&&modelObserved.insert(note).second)log("MODEL_PART_PIECE %s model=%02x actor=%p part=%u parent=%d bones=%x flags=%x drift=%.0f region=%u drawn=%u",name.c_str(),context.modelId,context.actor,r,pieceParent[k],pieceBones[k],context.bones[r].flags,drift,unsigned(region),unsigned(drawn));
@@ -1572,10 +1946,27 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     if(jill){const auto tag=recordModelPoseSequence(context,bodyReady?modelLastSkinMode:"native-fallback",bodyReady&&body->affineDualQuaternion?&modelLastShoulderFactors:nullptr);if(!tag.empty()&&!plan.jobs.empty())reinterpret_cast<ModelJob*>(plan.jobs.front().token)->captureTag=tag;}
     if(!bodyReady)return false;
     if(wearsOverlay)appendOverlay(name,rule->overlay,bodySkinned,projection,plan);
-    if(woundsWanted){const auto* hiddenBody=zones||partMaterials?&hiddenMaterials:nullptr;
-        if(!bodySkinned.empty())takeShots(context,actor,*body,bodySkinned,hiddenBody,name);
-        if(bodyDraw&&bodyDraw->skin==re3gpu::Skin::Linear)appendWoundsGpu(actor.wounds,*body,bodyDraw,hiddenBody,projection,plan,&body->vertexBone,partGone|split);
-        else appendWounds(actor.wounds,bodySkinned,hiddenBody,projection,plan,body->id,&body->vertexBone,partGone|split);}
+    if(woundsWanted){const auto* hiddenBody=zones||partMaterials?&hiddenMaterials:nullptr;static const std::string bodyMesh;
+        if(!kit.any){
+            // no kit part this frame: the 2 Nov path (wounds a kit part got earlier in the visit are not the body's: left out)
+            if(!bodySkinned.empty())takeShots(context,actor,*body,bodySkinned,hiddenBody,name);
+            if(bodyDraw&&bodyDraw->skin==re3gpu::Skin::Linear)appendWoundsGpu(actor.wounds,*body,bodyDraw,hiddenBody,projection,plan,&body->vertexBone,partGone|split,&bodyMesh);
+            else appendWounds(actor.wounds,bodySkinned,hiddenBody,projection,plan,body->id,&body->vertexBone,partGone|split,&bodyMesh);
+        }else{
+            // 03.11b: the shot goes into the body's shown regions and every part drawn now; each mesh draws its own wounds with
+            // its own vertices, materials (kitPartMaterials: a headless upper shows its stump, never the head's) and gone bones
+            std::vector<uint8_t> woundHidden[3];std::vector<KitShotTarget> targets;
+            if(bodyShown&&bodySkinned.size()==body->mesh.vertices.size())targets.push_back({body.get(),&bodySkinned,hiddenBody,std::string()});
+            for(unsigned r=0;r<3;++r)if(kitDrawn[r]){kitPartMaterials(*kit.part[r],r,headGone,woundHidden[r]);
+                if(kitSkinned[r].size()==kit.part[r]->mesh.vertices.size())targets.push_back({kit.part[r].get(),&kitSkinned[r],&woundHidden[r],kit.part[r]->id});}
+            if(!targets.empty()&&hitPending)takeShotsKit(context,actor,targets,name);
+            if(bodyShown){
+                if(bodyDraw&&bodyDraw->skin==re3gpu::Skin::Linear)appendWoundsGpu(actor.wounds,*body,bodyDraw,hiddenBody,projection,plan,&body->vertexBone,partGone|split,&bodyMesh);
+                else appendWounds(actor.wounds,bodySkinned,hiddenBody,projection,plan,body->id,&body->vertexBone,partGone|split,&bodyMesh);}
+            for(unsigned r=0;r<3;++r){if(!kitDrawn[r])continue;const auto& part=*kit.part[r];
+                if(kitDraw[r]&&kitDraw[r]->skin==re3gpu::Skin::Linear)appendWoundsGpu(actor.wounds,part,kitDraw[r],&woundHidden[r],projection,plan,&part.vertexBone,partGone|split,&part.id);
+                else if(kitSkinned[r].size()==part.mesh.vertices.size())appendWounds(actor.wounds,kitSkinned[r],&woundHidden[r],projection,plan,part.id,&part.vertexBone,partGone|split,&part.id);}
+        }}
     if(weapon&&context.bones[4].visible){
         std::vector<re3model::Matrix3x4> hand{bones[4]}; // same (smoothed) hand as the body
         if(!appendModelJobs(weapon,hand,projection,plan))return false;
@@ -1660,6 +2051,32 @@ static bool beginModelBuild(void*,uint32_t serial){
         woundRoom=cameraKey>>8;re3wound::pendingHits.clear();
     }
     re3wound::pendingHits.erase(std::remove_if(re3wound::pendingHits.begin(),re3wound::pendingHits.end(),[&](const re3wound::PendingHit& h){return serial-h.serial>30;}),re3wound::pendingHits.end());
+    // QA wound-test (03.11b): the nearest candidate of the last build gets one queued hit from the eye toward its part, as if
+    // the player had hit it (weapon 02 = handgun: one of the three bullet decals); picked up at its next preparation
+    if(modelWoundTestRegion>=0&&woundTestBest.actor&&woundTestBest.region==unsigned(modelWoundTestRegion)){
+        const auto d=woundTestBest.target-woundTestBest.eye;const float length=std::sqrt(re3model::Dot(d,d));
+        re3wound::PendingHit hit;hit.actor=woundTestBest.actor;hit.weapon=2;hit.serial=serial;hit.hand=re3model::Matrix3x4{};
+        hit.hand.m[3]=woundTestBest.eye.x;hit.hand.m[7]=woundTestBest.eye.y;hit.hand.m[11]=woundTestBest.eye.z;
+        hit.hand.m[1]=d.x/length;hit.hand.m[5]=d.y/length;hit.hand.m[9]=d.z/length;   // only the origin and the Y column (barrel) are read
+        if(re3wound::pendingHits.size()<32)re3wound::pendingHits.push_back(hit);
+        log("MODEL_WOUND_TEST region=%s actor=%p distance=%.0f target=%.0f,%.0f,%.0f (one queued hit from the camera eye)",kitRegionName[woundTestBest.region],woundTestBest.actor,woundTestBest.distance,woundTestBest.target.x,woundTestBest.target.y,woundTestBest.target.z);
+        modelWoundTestRegion=-1;woundTestBest=WoundTestCandidate{};}
+    // kit anti-repeat (round models-2026-11-03): a new room visit forgets the picks; the MODEL_KIT_ROOM summary
+    if(!modelKit.empty())kitRoomTick(cameraKey>>8,serial);
+    // AlphaBlend slices of the CPU path left over from the last OT (EndScene not seen): dropped, never drawn a frame late
+    cpuBlendDropStale();
+    // kit (round models-2026-11-02): 90 builds (3 s) after a room change the kit part packs that no actor of this room drew are
+    // released (a 2048 albedo is 16 MB + mips of video memory; MANAGED fallbacks and meshes are address space of the 2 GB
+    // process); a part needed again later loads again lazily
+    {static uint32_t kitRoom=~0u,kitRoomSerial=0;static bool kitSwept=true;
+        if((cameraKey>>8)!=kitRoom){kitRoom=cameraKey>>8;kitRoomSerial=serial;kitSwept=modelKitAssets.empty();}
+        if(!kitSwept&&serial-kitRoomSerial>=90){kitSwept=true;size_t n=0,bytes=0,texBytes=0;
+            for(auto it=modelAssets.begin();it!=modelAssets.end();){const auto& a=*it->second;
+                if(modelKitAssets.count(it->first)&&int32_t(a.lastUsed-kitRoomSerial)<0&&it->second.use_count()==1){++n;bytes+=a.bytes;texBytes+=a.textureBytes;
+                    log("MODEL_KIT_EVICT %s room=%04x bytes=%zu texture_bytes=%zu (not drawn in this room)",it->first.c_str(),unsigned(kitRoom),a.bytes,a.textureBytes);it=modelAssets.erase(it);}
+                else ++it;}
+            if(n){size_t freeBytes=0,largest=0;addressSpace(freeBytes,largest);PROCESS_MEMORY_COUNTERS_EX pm{};pm.cb=sizeof pm;K32GetProcessMemoryInfo(GetCurrentProcess(),(PROCESS_MEMORY_COUNTERS*)&pm,sizeof pm);
+                log("MODEL_KIT_EVICTED parts=%zu bytes=%zu texture_bytes=%zu; PROCESS_VA free_mb=%zu largest_mb=%zu private_mb=%zu",n,bytes,texBytes,freeBytes>>20,largest>>20,(size_t)pm.PrivateUsage>>20);}}}
     if(lastBuildTime&&previousMode&&delta>0&&delta<1000){
         if(modelPreparedActorMask==3){++dualSamples;dualTime+=delta;dualMax=(std::max)(dualMax,delta);if(dualSamples==300){log("MODEL_ACTOR_RATE actors=2 mode=remastered samples=%u elapsed_ms=%.3f fps=%.3f max_frame_ms=%.3f",dualSamples,dualTime,300000.0/dualTime,dualMax);dualSamples=0;dualTime=dualMax=0;}}
         else if(modelPreparedActorMask==1){++soloSamples;soloTime+=delta;soloMax=(std::max)(soloMax,delta);if(soloSamples==300){log("MODEL_ACTOR_RATE actors=1 mode=remastered samples=%u elapsed_ms=%.3f fps=%.3f max_frame_ms=%.3f",soloSamples,soloTime,300000.0/soloTime,soloMax);soloSamples=0;soloTime=soloMax=0;}}
@@ -1677,11 +2094,12 @@ static bool beginModelBuild(void*,uint32_t serial){
     if(modelStateRestoreRequest>=0){modelRenderer.lightStateRestore=modelStateRestoreRequest!=0;modelStateRestoreRequest=-1;log("MODEL_STATE_RESTORE %s",modelRenderer.lightStateRestore?"light":"full");}
     if(modelGpuRequestCommand>=0){modelGpuEnabled=modelGpuRequestCommand!=0;modelGpuRequestCommand=-1;log("MODEL_GPU %s",modelGpuEnabled?"on":"off");}
     if(modelGpuPixelRequestCommand>=0){modelRenderer.gpuPixelLight=modelGpuPixelRequestCommand!=0;modelGpuPixelRequestCommand=-1;log("MODEL_GPU_LIGHT %s",modelRenderer.gpuPixelLight?"pixel":"vertex");}
+    if(serial%300==0&&(cpuBlendDeferred||cpuBlendStale)){log("MODEL_BLEND_CPU builds=300 deferred_slices=%llu drawn=%llu stale=%llu (AlphaBlend runs of CPU slices drawn after the opaque stretch)",cpuBlendDeferred,cpuBlendDrawn,cpuBlendStale);cpuBlendDeferred=cpuBlendDrawn=cpuBlendStale=0;}
     if(serial%300==0&&gpuStats.flushes){const double n=300;log("MODEL_GPU_STATS builds=300 flushes=%.1f entries=%.1f draws=%.1f triangles=%.0f upload_kb=%.1f flush_ms=%.3f full_flushes=%.1f (per build; in-between frames add theirs)",gpuStats.flushes/n,gpuStats.entries/n,gpuStats.draws/n,gpuStats.triangles/n,gpuStats.bytes/n/1024,gpuStats.milliseconds/n,gpuStats.flushesFull/n);gpuStats=re3gpu::Stats{};}
     pollToggle();modelDraws=0;
     previousMode=desiredEnabled;if(serial%300==1)modelAutoCapture=GetPrivateProfileIntA("pilot","auto_capture",1,(root+"\\pilot.ini").c_str())!=0;
     diagnosticActorControl();
-    if(modelReloadRequested){modelReloadRequested=false;modelAssets.clear();modelObserved.clear();modelFatal=false;log("MODEL_RELOAD next-build assets refreshed; queued GPU payloads retained");}
+    if(modelReloadRequested){modelReloadRequested=false;modelAssets.clear();modelObserved.clear();modelFatal=false;modelKitChecked.clear();loadKit();log("MODEL_RELOAD next-build assets refreshed; queued GPU payloads retained");}
     if(!modelLoadRequest.empty()&&gameDevice){const bool ready=getModel(modelLoadRequest)!=nullptr;log("MODEL_LOAD_TEST %s ready=%u",modelLoadRequest.c_str(),ready);modelLoadRequest.clear();}
     if(gameDevice&&modelRenderer.resetDevice(gameDevice))modelRenderer.beginFrame(serial);
     if(serial%300==0&&modelRenderer.depthResets){log("MODEL_DEPTH_RESETS builds=300 resets=%llu (one per frame when every model of an OT shares its build epoch)",modelRenderer.depthResets);modelRenderer.depthResets=0;}
@@ -1725,9 +2143,13 @@ static const re3model::GpuFrame* fps60Mid(const std::shared_ptr<re3model::GpuFra
 static bool drawModelJob(void*,void* renderer,uintptr_t token){
     if(auto gpuJob=reinterpret_cast<ModelJob*>(token);gpuJob&&gpuJob->gpu){
         ModelCostTimer cost(fps60Pass?fps60PassDrawMs:modelFrameDrawMs);gpuInJob=true;if(!fps60Pass)++modelFrameJobs;const bool okay=drawGpuJob(*gpuJob,renderer);gpuInJob=false;return okay;}
+    // round models-2026-11-03: a slice with AlphaBlend runs draws its other runs now and queues the blended ones (cpuBlendFlush);
+    // the queue is held over our own draws (the slice, its EndScene) and goes down before the next native work
+    struct CpuJobScope{CpuJobScope(){cpuJobActive=true;}~CpuJobScope(){cpuJobActive=false;cpuBlendHold=false;}};
     if(fps60Pass){
         auto job=reinterpret_cast<ModelJob*>(token);if(!job||!gameDevice)return false;
-        gpuFlushPending();
+        CpuJobScope scope;
+        cpuBlendHold=true;gpuFlushPending();cpuBlendHold=false;
         if(job->pending){const double resolving=modelClockMs();const bool any=resolvePendingJob(*job);fps60PassResolveMs+=modelClockMs()-resolving;if(!any)return true;}
         if(!job->geometry)return false;
         const auto* shown=fps60Mid(job->geometry);
@@ -1735,12 +2157,17 @@ static bool drawModelJob(void*,void* renderer,uintptr_t token){
         flushGame(renderer);auto dd=gogWrapper;if(!dd)return false;
         auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);
         bool ownScene=!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))return false;
-        auto hr=modelRenderer.drawSlice(*shown,job->slice,job->options);
+        const bool deferBlend=re3model::ModelRenderer::sliceHasBlend(*shown,job->slice,job->options);
+        cpuBlendHold=true;
+        auto hr=modelRenderer.drawSlice(*shown,job->slice,job->options,deferBlend?1u:0u);
+        if(deferBlend&&SUCCEEDED(hr)){std::shared_ptr<re3model::GpuFrame> keep=job->geometry;const auto mid=fps60Mids.find(job->geometry.get());if(mid!=fps60Mids.end()&&mid->second)keep=mid->second;
+            cpuBlendPending.push_back({keep,job->slice,job->options,frame});++cpuBlendDeferred;}
         if(ownScene)gameDevice->EndScene();
         return SUCCEEDED(hr)||re3model::IsTransientDrawStatus(hr);
     }
     ModelCostTimer cost(modelFrameDrawMs);++modelFrameJobs;
-    gpuFlushPending();
+    CpuJobScope scope;
+    cpuBlendHold=true;gpuFlushPending();cpuBlendHold=false;
     auto job=reinterpret_cast<ModelJob*>(token);if(!job||!gameDevice)return false;
     if(job->pending&&!resolvePendingJob(*job))return true;   // deferred: empty bucket (or its frame failed, logged once)
     if(!job->geometry)return false;
@@ -1748,8 +2175,12 @@ static bool drawModelJob(void*,void* renderer,uintptr_t token){
     auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);
     bool ownScene=!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))return false;
     if(gpuTraceNow()){char text[128];sprintf_s(text,"cpu-slice %s slice=%zu",job->name.c_str(),size_t(job->slice));gpuTraceNote(text);}
-    auto hr=modelRenderer.drawSlice(*job->geometry,job->slice,job->options);
+    const bool deferBlend=re3model::ModelRenderer::sliceHasBlend(*job->geometry,job->slice,job->options);
+    cpuBlendHold=true;
+    auto hr=modelRenderer.drawSlice(*job->geometry,job->slice,job->options,deferBlend?1u:0u);
+    if(deferBlend&&SUCCEEDED(hr)){cpuBlendPending.push_back({job->geometry,job->slice,job->options,frame});++cpuBlendDeferred;}
     if(ownScene)gameDevice->EndScene();
+    cpuBlendHold=false;
     if(re3model::IsTransientDrawStatus(hr)){if(modelObserved.insert("transient-device").second)log("MODEL_DEVICE_WAIT hr=%08lx",hr);return true;}
     if(FAILED(hr)){log("MODEL_DRAW_FAILED %s hr=%08lx",job->name.c_str(),hr);modelFatal=true;return false;}
     modelDraws++;
@@ -1878,7 +2309,7 @@ static void installModels(){
     modelGpuEnabled=GetPrivateProfileIntA("pilot","gpu_models",1,(root+"\\pilot.ini").c_str())!=0;
     modelRenderer.gpuPixelLight=GetPrivateProfileIntA("pilot","gpu_pixel_light",0,(root+"\\pilot.ini").c_str())!=0;
     if(!modelActive)return;modelRenderer.setLogger(modelMessage);
-    if(GetPrivateProfileIntA("pilot","characters",1,(root+"\\pilot.ini").c_str())){loadActorRules();loadLooks();}
+    if(GetPrivateProfileIntA("pilot","characters",1,(root+"\\pilot.ini").c_str())){loadActorRules();loadLooks();loadKit();}
     loadWeapons();
     {unsigned bad=0;if(re3handik::Load(root+"/model-pack/hand-ik.txt",modelHandIk,bad)||bad)log("MODEL_HAND_IK_TABLE rows=%zu invalid=%u",modelHandIk.size(),bad);}
     if(modelFaceEnabled){

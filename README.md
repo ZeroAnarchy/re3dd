@@ -1,16 +1,16 @@
 # Resident Evil 3DD Mod: source of d3d9.dll
 
 This repository holds the source code of `files\d3d9.dll`, the only compiled file in
-[Resident Evil 3DD Mod](https://www.nexusmods.com/residentevil3nemesis/mods/136) 1.19 and its Lite
+[Resident Evil 3DD Mod](https://www.nexusmods.com/residentevil3nemesis/mods/136) 1.20 and its Lite
 edition (the same file), a fan remaster of the GOG and Steam releases of Resident Evil 3 (1999).
 
 Everything else in the mod archive is data (PNG images, `.r3mesh` / `.r3face` model files,
 JSON and text tables, one `.vag` sound) or plain-text scripts. The installer scripts and the
 DLL's config file are in `package/`, byte for byte as they are in the archive.
 
-| File in the 1.19 archives | Size | SHA-256 |
+| File in the 1.20 archives | Size | SHA-256 |
 |---|---|---|
-| `files\d3d9.dll` | 1,213,440 bytes | `27ba4ea155f0631e55003479f5cd521ad61a44eec2b9cffcc7be0cfc7c9e6fc8` |
+| `files\d3d9.dll` | 1,276,416 bytes | `fae282b1e4024f8c37ae1938f4502c4553a619ff354d618aa142449854502797` |
 
 ## What the DLL does
 
@@ -34,6 +34,10 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
   shader (`src/state_shader.h`). `render_width` / `render_height` in `pilot.ini` set the size the
   game renders at (2560x1920 by default, 1440x1080 in the Lite edition); the mask atlas scale
   follows the background size.
+- Since 1.20 a zombie can be drawn from separate head, upper body and lower body meshes listed in
+  `model-pack\kit.txt` (`src/model_integration.h`): the parts are picked per room visit so that
+  heads do not repeat within a room, and bullet wounds are placed on the part that was hit
+  (`src/model_wounds.h`).
 - It does not use the network, start processes or touch the registry. It writes only inside the
   game folder: `runtime.log`, `crash-dumps\*.dmp` after a crash, and a `captures\` folder that
   stays empty unless a QA capture is switched on in `pilot.ini`.
@@ -61,9 +65,10 @@ unit; it includes the other headers. `src\d3d9.def` exports `Direct3DCreate9`.
 ### Comparing with the released file
 
 These sources rebuilt with MSVC 19.51.36252 in the folder the release was built in give a
-file that differs from the released `d3d9.dll` only in the 4 bytes of the link timestamp.
-Built from a different folder path, the size stays 1,213,440 bytes, but the compiler lays the
-code out in a different order, so the bytes and the hash differ.
+file that differs from the released `d3d9.dll` only in the link timestamp (in the PE header
+and in the debug directory). Built from a different folder path, the size stays 1,276,416
+bytes, but the compiler lays the code out in a different order, so the bytes and the hash
+differ.
 
 ## Layout
 

@@ -60,6 +60,11 @@ static const void* glockCombatFor(const void* combat,int weapon); // glock18c.h:
 static void glockShotDone(int weapon,const uint8_t* actor,int lifeBefore);
 static int modelStateRestoreRequest=-1; // diagnostic A/B: 1 light per-slice state restore, 0 full state block
 static int modelGpuRequestCommand=-1,modelGpuPixelRequestCommand=-1;   // pilot.command gpu-on/off, gpu-pixel/vertex (taken at the next build)
+static bool modelDetachFix=true;   // QA (pilot.command detach-off / detach-on, debug_warp): torn-off enemy parts as in 1.19 for before/after
+static bool modelKitEnabled=true;  // QA (pilot.command kit-off / kit-on, debug_warp): model-pack/kit.txt parts drawn or the whole bodies
+// QA (03.11b, debug_warp): pilot.command wound-test-head / -upper / -lower: one shot from the camera eye at that kit part of the
+// kit zombie nearest to the eye (a queued hit like the player's, the same wound path); -1 = none
+static int modelWoundTestRegion=-1;
 static bool f8WasDown = false;
 static volatile LONG toggleRequested=0;
 static volatile LONG fps60ToggleRequested=0;   // F7: 60 fps HD models on/off (fps60_integration.h)
@@ -574,7 +579,9 @@ static void __cdecl inputPollHook(){
     else if(action=="staffroll"){chainProgram=11;log("INPUT %s",action.c_str());}
     // tapfire / tapfire-slow: aim held, fire pressed 1 frame of 2 / 2 frames of 6 (Glock MANUAL rate QA)
     else {tapOn=action=="tapfire"?1:action=="tapfire-slow"?2:0;tapOff=action=="tapfire"?1:4;tapTick=0;
-      directMapped=action=="aim"||tapOn?0x100:action=="fire"?0x140:action=="action"?0x80:action=="forward"?1:action=="backward"?4:action=="turn_left"?8:action=="turn_right"?2:0;
+      // aimdown / firedown (round models-2026-11-02): aim and fire with down held, at a zombie lying on the floor
+      // aimup / fireup (03.11b wounds QA): aim and fire with up held, the barrel raised to head height
+      directMapped=action=="aim"||tapOn?0x100:action=="fire"?0x140:action=="aimdown"?0x104:action=="firedown"?0x144:action=="aimup"?0x101:action=="fireup"?0x141:action=="action"?0x80:action=="forward"?1:action=="backward"?4:action=="turn_left"?8:action=="turn_right"?2:0;
       held=action=="confirm"?0x800:action=="left"?0x1000:action=="right"?0x4000:action=="up"?0x8000:action=="down"?0x2000:action=="cancel"?0x40:action=="skip"?0x10:0;remaining=duration>600?600:duration;first=true;log("INPUT %s raw=%x mapped=%x frames=%u",action.c_str(),held,directMapped,remaining);}}
   if(requestedMenu>=0&&normalMenu){*(uint8_t*)(gameBase+0x63f684)=(uint8_t)requestedMenu;*(uint8_t*)(gameBase+0x63f685)=(uint8_t)requestedMenu;held=0x800;remaining=3;first=true;log("INPUT menu choice=%d at verified title phase",requestedMenu);requestedMenu=-1;}
     // Diagnostic new-game route only: the unlocked costume menu maps cursor 7
@@ -728,6 +735,11 @@ static void diagnosticControl(){
   if((command=="pack-dxt"||command=="pack-cpu"||command=="pack-png")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
     InterlockedExchange(&packModeRequest,command=="pack-dxt"?1:command=="pack-cpu"?2:0);log("COMMAND %s queued",command.c_str());}
   if(command=="reload-models")modelReloadRequested=true;
+  // QA (round models-2026-11-02): torn-off enemy parts drawn as in 1.19 (detach-off: the crawler's strip) / as pieces
+  if((command=="detach-on"||command=="detach-off")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){modelDetachFix=command=="detach-on";log("COMMAND %s",command.c_str());}
+  if((command=="kit-on"||command=="kit-off")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){modelKitEnabled=command=="kit-on";log("COMMAND %s",command.c_str());}
+  if((command=="wound-test-head"||command=="wound-test-upper"||command=="wound-test-lower")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
+    modelWoundTestRegion=command=="wound-test-upper"?0:command=="wound-test-lower"?1:2;log("COMMAND %s queued",command.c_str());}
   if(command=="pause")setDiagnosticPause(true);
   if(command=="resume")setDiagnosticPause(false);
   if(command=="arm-dario-pause"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str()))diagnosticFreezeDario=true;

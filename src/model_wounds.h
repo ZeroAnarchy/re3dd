@@ -21,6 +21,8 @@ struct Wound{
     std::vector<std::uint32_t> triangles; // three corner indices per triangle
     std::vector<std::uint16_t> material;  // body material of each triangle (a hidden head hides its wounds)
     std::uint8_t texture=0;
+    // 03.11b (wounds on kit parts): the pack the corners belong to; empty = the actor's body (all wounds before 03.11b)
+    std::string mesh;
 };
 struct PendingHit{void* actor=nullptr;std::uint8_t weapon=0;re3model::Matrix3x4 hand;std::uint32_t serial=0;};
 static std::vector<PendingHit> pendingHits;
@@ -122,6 +124,56 @@ inline bool woundFromShot(const re3model::Mesh& mesh,const std::vector<re3model:
         if(c*c+s*s>1.e-4f)angle=std::atan2(s,c);
     }
     return makeWound(mesh,body,hidden,where,normal,radius,angle,texture,wound);
+}
+// 03.11b (user: "no bullet wound decals on the new models"): a zombie of the kit is its body (the regions it still shows)
+// plus up to three part packs with their own vertices, triangles and UVs. The shot goes into all of them as they are posed
+// now: the nearest surface on the barrel line wins, else the vertex closest to the line over all of them (same 400 unit
+// cone); the wound is a patch of THAT mesh's own triangles with decal coordinates from the hit, exactly as on a body.
+struct ShotTarget{const re3model::Mesh* mesh=nullptr;const std::vector<re3model::SkinnedVertex>* skinned=nullptr;const std::vector<std::uint8_t>* hidden=nullptr;};
+// nearestToRay with the best squared distance carried across meshes (start 400*400)
+inline bool nearestToRayBest(const re3model::Mesh& mesh,const std::vector<re3model::SkinnedVertex>& body,const std::vector<std::uint8_t>* hidden,Vec3 origin,Vec3 direction,float& best,Vec3& hit,Vec3& normal){
+    std::vector<std::uint8_t> shown(body.size(),0);
+    for(std::uint32_t m=0;m<mesh.materials.size();++m)if(visible(hidden,m)){const auto& material=mesh.materials[m];
+        for(std::uint32_t i=material.firstIndex;i<material.firstIndex+material.indexCount;++i)shown[mesh.indices[i]]=1;}
+    bool found=false;
+    for(std::size_t i=0;i<body.size();++i){if(!shown[i])continue;
+        const Vec3 d=body[i].position-origin;const float t=re3model::Dot(d,direction);if(t<=0)continue;
+        const Vec3 n=re3model::Normalize(body[i].normal);if(re3model::Dot(n,direction)>-0.1f)continue;
+        const Vec3 off=d-direction*t;const float distance=re3model::Dot(off,off);
+        if(distance<best){best=distance;hit=body[i].position;normal=n;found=true;}
+    }
+    return found;
+}
+// Returns the index of the target that got the wound, or -1. Same sizes, textures and angles as woundFromShot.
+inline int woundFromShotTargets(const ShotTarget* targets,std::size_t count,const re3model::Matrix3x4& hand,std::uint8_t weapon,std::uint32_t seed,Wound& wound,Vec3& where,bool& onLine){
+    const Vec3 origin{hand.m[3],hand.m[7],hand.m[11]},direction=re3model::Normalize({hand.m[1],hand.m[5],hand.m[9]});
+    int chosen=-1;float bestT=1.e30f;std::uint32_t bestTriangle=0;onLine=false;
+    for(std::size_t k=0;k<count;++k){const auto& target=targets[k];
+        if(!target.mesh||!target.skinned||target.skinned->size()!=target.mesh->vertices.size())continue;
+        float t=0;std::uint32_t triangle=0;
+        if(castRay(*target.mesh,*target.skinned,target.hidden,origin,direction,t,triangle)&&t<bestT){bestT=t;bestTriangle=triangle;chosen=int(k);onLine=true;}
+    }
+    Vec3 normal;
+    if(onLine){const auto& target=targets[chosen];const auto& mesh=*target.mesh;const auto& body=*target.skinned;
+        const Vec3 a=body[mesh.indices[bestTriangle*3]].position,b=body[mesh.indices[bestTriangle*3+1]].position,c=body[mesh.indices[bestTriangle*3+2]].position;
+        where=origin+direction*bestT;normal=re3model::Normalize(re3model::Cross(b-a,c-a));
+        if(re3model::Dot(normal,direction)>0)normal=normal*-1.f;
+    }else{float best=400.f*400.f;
+        for(std::size_t k=0;k<count;++k){const auto& target=targets[k];
+            if(!target.mesh||!target.skinned||target.skinned->size()!=target.mesh->vertices.size())continue;
+            if(nearestToRayBest(*target.mesh,*target.skinned,target.hidden,origin,direction,best,where,normal))chosen=int(k);}
+        if(chosen<0)return -1;}
+    const bool shotgun=weapon==4||weapon==0x10||weapon==0x13;
+    const float radius=shotgun?110.f:weapon==5?92.f:75.f;
+    const std::uint8_t texture=shotgun?3:std::uint8_t((std::min)(2.f,random(seed)*3.f));
+    float angle=random(seed)*6.2831853f;
+    if(texture==2){
+        const Vec3 tangent=re3model::Normalize(re3model::Cross(normal,std::abs(normal.y)<0.9f?Vec3{0,1,0}:Vec3{1,0,0})),bitangent=re3model::Cross(normal,tangent);
+        const Vec3 down{0,1,0};const float c=re3model::Dot(down,bitangent),s=-re3model::Dot(down,tangent);
+        if(c*c+s*s>1.e-4f)angle=std::atan2(s,c);
+    }
+    const auto& target=targets[chosen];
+    return makeWound(*target.mesh,*target.skinned,target.hidden,where,normal,radius,angle,texture,wound)?chosen:-1;
 }
 // GPU path: the multiplier of each bone; the vertex shader blends it by the skin weights (= damageTint up to rounding).
 inline void damageBoneTint(const std::uint32_t partColour[32],std::uint32_t damaged,float out[32][3]){

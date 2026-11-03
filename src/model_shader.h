@@ -557,7 +557,17 @@ public:
         if(SUCCEEDED(hr)&&FAILED(depthRestore))hr=depthRestore;if(SUCCEEDED(hr)&&FAILED(restored))hr=restored;
         return hr;
     }
-    HRESULT drawSlice(const GpuFrame& frame,std::size_t index,const DrawOptions& options={}){
+    // Round models-2026-11-03: whether a slice has AlphaBlend runs that the caller draws apart (blend=1 below, then blend=2
+    // after the opaque slices of the same native stretch, as the GPU path's second phase). Not for nativeSemiTransparent
+    // slices (props: their own two passes per run).
+    static bool sliceHasBlend(const GpuFrame& frame,std::size_t index,const DrawOptions& options){
+        if(options.nativeSemiTransparent||index>=frame.slices.size())return false;const auto& slice=frame.slices[index];
+        if(std::uint64_t(slice.firstRun)+slice.runCount>frame.runs.size())return false;
+        for(unsigned n=0;n<slice.runCount;++n){const auto m=frame.runs[slice.firstRun+n].materialIndex;if(m<frame.materials.size()&&(frame.materials[m].flags&AlphaBlend))return true;}
+        return false;
+    }
+    // blend: 0 every run in order (as before), 1 the runs without AlphaBlend only, 2 the AlphaBlend runs only.
+    HRESULT drawSlice(const GpuFrame& frame,std::size_t index,const DrawOptions& options={},unsigned blend=0){
         if(resetPending_)return D3DERR_DEVICELOST;
         if(frame.deviceGeneration!=deviceGeneration_)return S_FALSE;
         const bool cpu=!frame.buffer;
@@ -594,6 +604,7 @@ public:
         hr=setCommon();
         if(SUCCEEDED(hr)&&!cpu)hr=device_->SetStreamSource(0,frame.buffer,0,sizeof(DrawVertex));
         for(unsigned n=0;n<slice.runCount&&SUCCEEDED(hr);++n){const auto& run=frame.runs[slice.firstRun+n];const auto& material=frame.materials[run.materialIndex];
+            if(blend&&!options.nativeSemiTransparent&&(((material.flags&AlphaBlend)!=0)!=(blend==2)))continue;
             const DrawVertex* vertices=cpu?frame.cpuVertices.data()+run.firstVertex:nullptr;
             if(remap){for(unsigned v=0;v<run.vertexCount;++v)remapped[v]=RemapModelViewport(vertices[v],frame.viewport,currentViewport);vertices=remapped.data();}
             hr=device_->SetTexture(0,material.textures.albedo);
