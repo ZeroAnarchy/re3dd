@@ -11,6 +11,7 @@
 #include <vector>
 #include <algorithm>
 #include <utility>
+#include <unordered_map>
 #include "exe_map.h"
 
 namespace re3bridge {
@@ -203,6 +204,11 @@ struct State {
     std::array<Queue, 8> queues{};
     std::vector<std::unique_ptr<Frame>> frames;
     std::array<Patch, 19> patches{};
+    // blood round 2026-11-07 diagnostic (pilot.ini effect_trace=1): first copy of each semi-transparent native primitive kind
+    bool packetTrace = false; uint32_t packetLines = 0; std::unordered_map<uint64_t, uint32_t> packetSeen;
+    // fix round 2026-11-07 (blood): pilot.ini blood_packet_census=1 logs every semi-transparent textured primitive on
+    // the blood texture (tpage 1E / clut 7811|7891) and the first big ones of every other texture (BLOOD_PKT lines)
+    bool packetCensus = false; uint32_t censusLines = 0; uint64_t censusFiltered = 0; std::unordered_map<uint64_t, uint32_t> censusSeen;
 };
 inline State& Get() { static State state; return state; }
 struct ActiveHook {
@@ -505,6 +511,28 @@ inline void DrawActor(ActorFn original, bool figure, void* actor, void* parts, u
 inline void __cdecl ActorHook(void* actor, void* parts, uint32_t flags, const void* position) {
     DrawActor(Get().originalActor, false, actor, parts, flags, position);
 }
+inline void TracePacket(const void* packet) {
+    auto& s = Get();
+    if (!s.packetTrace || s.packetLines > 4000 || !Accessible(packet, 40)) return;
+    const uint8_t cmd = Read<uint8_t>(packet, 7);
+    if (!(cmd & 2) || cmd < 0x20 || cmd > 0x3f) return;
+    const bool textured = (cmd & 4) != 0, gouraud = (cmd & 0x10) != 0;
+    const uint32_t rgb0 = Read<uint32_t>(packet, 4) & 0xffffffu;
+    uint32_t rgb1 = 0, tpage = 0, clut = 0;
+    if (gouraud) rgb1 = Read<uint32_t>(packet, textured ? 16 : 12) & 0xffffffu;
+    if (textured) { clut = Read<uint16_t>(packet, 14); tpage = Read<uint16_t>(packet, gouraud ? 26 : 22); }
+    const uint64_t key = (uint64_t(cmd) << 56) | (uint64_t(rgb0) << 32) | (uint64_t(rgb1 & 0xff00ffu) << 8) ^ (uint64_t(tpage) << 16) ^ clut;
+    auto& seen = s.packetSeen[key];
+    if (++seen > 2) return;
+    ++s.packetLines;
+    char text[320];
+    std::snprintf(text, sizeof(text), "PACKET_NEW render=%u build=%u cmd=%02x rgb0=%06x rgb1=%06x tpage=%04x clut=%04x xy0=%d,%d xy1=%d,%d words=%08x %08x %08x %08x %08x %08x %08x %08x",
+        s.renderSerial, s.serial, cmd, rgb0, rgb1, tpage, clut, Read<int16_t>(packet, 8), Read<int16_t>(packet, 10),
+        Read<int16_t>(packet, textured ? (gouraud ? 20 : 16) : (gouraud ? 16 : 12)), Read<int16_t>(packet, textured ? (gouraud ? 22 : 18) : (gouraud ? 18 : 14)),
+        Read<uint32_t>(packet, 4), Read<uint32_t>(packet, 8), Read<uint32_t>(packet, 12), Read<uint32_t>(packet, 16), Read<uint32_t>(packet, 20), Read<uint32_t>(packet, 24), Read<uint32_t>(packet, 28), Read<uint32_t>(packet, 32));
+    Message(text);
+}
+inline void CensusPacket(const void* packet);
 inline int __fastcall CopyHook(void* renderer, void*, void* packet) {
     ActiveHook active;
     auto& s = Get();
@@ -530,6 +558,8 @@ inline int __fastcall CopyHook(void* renderer, void*, void* packet) {
         if (!batch->copied[index]) { batch->copied[index] = 1; ++frame->copied; }
         ++s.stats.packetsCopied; return result;
     }
+    if (s.packetTrace) { try { TracePacket(packet); } catch (...) {} }
+    if (s.packetCensus) { try { CensusPacket(packet); } catch (...) {} }
     return s.originalCopy(renderer, packet);
 }
 inline void __fastcall DrawHook(void* renderer, void*, void* packet) {
@@ -631,6 +661,91 @@ inline bool WritePatch(const Patch& patch, bool install) {
 // native-model-contract.json. These local instruction guards additionally catch
 // conflicting patches. expectedFrameHook is the parent's current frameHook;
 // nullptr requires the unmodified native frame handler.
+namespace detail {
+// blood round 2026-11-07 diagnostic: the native renderer's per-command copy calls (switch 41FA2A, jump table 41FBA4),
+// traced like CopyHook's GT3 (TracePacket). Installed only with packetTrace.
+inline void CensusPacket(const void* packet) {
+    auto& s = Get();
+    if (!s.packetCensus || s.censusLines > 6000 || !Accessible(packet, 52)) return;
+    const uint8_t cmd = Read<uint8_t>(packet, 7);
+    if (!(cmd & 2)) return;
+    int x0 = 32767, y0 = 32767, x1 = -32768, y1 = -32768; uint16_t clut = 0, tpage = 0xffff; uint8_t u = 0, v = 0;
+    if (cmd >= 0x20 && cmd <= 0x3f) {
+        if (!(cmd & 4)) return;
+        const bool gouraud = (cmd & 0x10) != 0; const unsigned n = (cmd & 8) ? 4u : 3u, stride = gouraud ? 12u : 8u;
+        for (unsigned k = 0; k < n; ++k) { const int x = Read<int16_t>(packet, 8 + k * stride), y = Read<int16_t>(packet, 10 + k * stride);
+            x0 = (std::min)(x0, x); y0 = (std::min)(y0, y); x1 = (std::max)(x1, x); y1 = (std::max)(y1, y); }
+        clut = Read<uint16_t>(packet, 14); tpage = Read<uint16_t>(packet, gouraud ? 26 : 22); u = Read<uint8_t>(packet, 12); v = Read<uint8_t>(packet, 13);
+    } else if (cmd >= 0x64 && cmd <= 0x7f && (cmd & 4)) {
+        x0 = Read<int16_t>(packet, 8); y0 = Read<int16_t>(packet, 10); u = Read<uint8_t>(packet, 12); v = Read<uint8_t>(packet, 13); clut = Read<uint16_t>(packet, 14);
+        const unsigned size = (cmd & 0x18) == 0x08 ? 1u : (cmd & 0x18) == 0x10 ? 8u : (cmd & 0x18) == 0x18 ? 16u : 0u;
+        const int w = size ? int(size) : Read<int16_t>(packet, 16), h = size ? int(size) : Read<int16_t>(packet, 18); x1 = x0 + w; y1 = y0 + h;
+    } else return;
+    const int w = x1 - x0, h = y1 - y0;
+    const bool bloodTexture = tpage == 0x1e || clut == 0x7811 || clut == 0x7891;
+    if (bloodTexture) { if (w < 1 && h < 1) return; }
+    else { if (w < 20 && h < 20) return;
+        const uint64_t key = (uint64_t(cmd) << 40) | (uint64_t(tpage) << 16) | clut; if (++s.censusSeen[key] > 3) return; }
+    ++s.censusLines;
+    char text[220]; std::snprintf(text, sizeof(text), "BLOOD_PKT render=%u at=%p cmd=%02x rgb=%06x tpage=%04x clut=%04x uv=%u,%u box=%d,%d %dx%d%s",
+        s.renderSerial, packet, cmd, Read<uint32_t>(packet, 4) & 0xffffffu, tpage, clut, u, v, x0, y0, w, h, bloodTexture ? " blood-texture" : "");
+    Message(text);
+}
+inline CopyFn traceOriginal[8] = {};
+// fix round 2026-11-07 (blood): a filter on the renderer's FT4 copy (call 41FAB1 -> 41FDE0, the native effect sprites).
+// A packet the filter rejects is copied with all four corners on the first: nothing is drawn, and the renderer's
+// texture-page state (41FDE0 keeps the packet's tpage at renderer+0x64) still follows the packet as before.
+using PacketFilter = bool (*)(const void* packet);
+inline PacketFilter ft4Filter = nullptr;
+inline CopyFn ft4Original = nullptr;
+inline uint64_t ft4Filtered = 0;
+inline int FilteredFt4(CopyFn original, void* renderer, void* packet) {
+    if (ft4Filter && Accessible(packet, 40)) {
+        bool reject = false; try { reject = ft4Filter(packet); } catch (...) { reject = false; }
+        if (reject) {
+            alignas(4) uint8_t local[40]; std::memcpy(local, packet, 40);
+            std::memcpy(local + 16, local + 8, 4); std::memcpy(local + 24, local + 8, 4); std::memcpy(local + 32, local + 8, 4);
+            ++ft4Filtered; return original(renderer, local);
+        }
+    }
+    return original(renderer, packet);
+}
+template<int N> int __fastcall TraceCopy(void* renderer, void*, void* packet) {
+    auto& s = Get();
+    if (s.packetTrace) { try { TracePacket(packet); } catch (...) {} }
+    if (N == 3) {
+        bool reject = false; if (ft4Filter && Accessible(packet, 40)) { try { reject = ft4Filter(packet); } catch (...) { reject = false; } }
+        if (s.packetCensus && !reject) { try { CensusPacket(packet); } catch (...) {} }
+        if (reject) ++s.censusFiltered;
+        return FilteredFt4(traceOriginal[N], renderer, packet);
+    }
+    if (s.packetCensus) { try { CensusPacket(packet); } catch (...) {} }
+    return traceOriginal[N](renderer, packet);
+}
+inline int __fastcall FilterCopyFt4(void* renderer, void*, void* packet) { return FilteredFt4(ft4Original, renderer, packet); }
+inline bool InstallFt4Filter(re3exe::Base gameBase, PacketFilter filter) {
+    if (traceOriginal[3]) { ft4Filter = filter; return true; }   // the trace hook of that call applies it
+    Patch patch;
+    if (!BuildCallPatch(patch, gameBase + 0x1fab1, gameBase + 0x1fde0, reinterpret_cast<void*>(&FilterCopyFt4))) return false;
+    ft4Original = reinterpret_cast<CopyFn>(gameBase + 0x1fde0); ft4Filter = filter;
+    if (!WritePatch(patch, true)) { ft4Filter = nullptr; return false; }
+    return true;
+}
+inline void InstallPacketTrace(re3exe::Base gameBase) {
+    struct Site {uintptr_t call, target;};
+    static const Site sites[8] = {{0x1fa8a,0x1fd00},{0x1fa97,0x1fd40},{0x1faa4,0x1fda0},{0x1fab1,0x1fde0},{0x1fabe,0x1fe30},{0x1fad8,0x1fed0},{0x1fae5,0x1ff10},{0x1fb24,0x20040}};
+    void* hooks[8] = {reinterpret_cast<void*>(&TraceCopy<0>),reinterpret_cast<void*>(&TraceCopy<1>),reinterpret_cast<void*>(&TraceCopy<2>),reinterpret_cast<void*>(&TraceCopy<3>),
+        reinterpret_cast<void*>(&TraceCopy<4>),reinterpret_cast<void*>(&TraceCopy<5>),reinterpret_cast<void*>(&TraceCopy<6>),reinterpret_cast<void*>(&TraceCopy<7>)};
+    unsigned done = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        Patch patch;
+        if (!BuildCallPatch(patch, gameBase + sites[i].call, gameBase + sites[i].target, hooks[i])) continue;
+        traceOriginal[i] = reinterpret_cast<CopyFn>(gameBase + sites[i].target);
+        if (WritePatch(patch, true)) ++done;
+    }
+    char text[96]; std::snprintf(text, sizeof(text), "PACKET_TRACE copy hooks=%u/8", done); Message(text);
+}
+} // detail
 inline bool Install(re3exe::Base gameBase, const Callbacks& callbacks, void* expectedFrameHook = nullptr) {
     auto& s = detail::Get(); if (s.installed) return false;
     if (!gameBase || !callbacks.beginBuild || !callbacks.prepareActor || !callbacks.drawJob ||
@@ -670,6 +785,7 @@ inline bool Install(re3exe::Base gameBase, const Callbacks& callbacks, void* exp
     }
     s.installed = true;
     detail::Message("Native3D: guarded build/copy/draw, chained frame, OT-clear and command-queue retirement hooks installed.");
+    if (s.packetTrace || s.packetCensus) detail::InstallPacketTrace(gameBase);
     return true;
 }
 inline bool Installed() { return detail::Get().installed; }

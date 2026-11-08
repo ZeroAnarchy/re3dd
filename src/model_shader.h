@@ -28,13 +28,15 @@ inline IDirect3DPixelShader9* CreateModelPixelShader(IDirect3DDevice9* device,HR
     static const char source[]=R"HLSL(
 sampler2D albedo : register(s0);
 sampler2D stpMap : register(s1);
-// x=coverage cutoff, y=-1 all/0 opaque-STP/1 semitransparent-STP, z=opacity.
+// x=coverage cutoff, y=-1 all/0 opaque-STP/1 semitransparent-STP/2 growth (s1 = reach map, tint.a = progress,
+// w = edge sharpness), z=opacity.
 float4 options : register(c0);
 float4 main(float4 tint : COLOR0, float2 uv : TEXCOORD0) : COLOR0 {
     float4 texel=tex2D(albedo,uv);
     float coverage=texel.a*tint.a;
+    if(options.y>1.5) coverage=texel.a*saturate((tint.a-tex2D(stpMap,uv).r)*options.w);
     clip(coverage-options.x);
-    if(options.y>=0) {
+    if(options.y>=0&&options.y<1.5) {
         float stp=tex2D(stpMap,uv).r;
         if(options.y>0.5) clip(stp-0.5);
         else clip(0.499-stp);
@@ -198,6 +200,8 @@ class ModelRenderer {
             if(abr==0)constants[2]=0.5f;
             else {destination=D3DBLEND_ONE;if(abr==2)operation=D3DBLENDOP_REVSUBTRACT;else if(abr==3)constants[2]=0.25f;}
         }
+        // blood round 2026-11-07: a reach map in s1 (drawSlice binds the stp texture there)
+        if(selector<0&&(material.flags&GrowthMask)&&material.textures.stp){constants[1]=2;constants[3]=56;}
         HRESULT hr=device_->SetPixelShaderConstantF(0,constants,1);if(FAILED(hr))return hr;
         const std::pair<D3DRENDERSTATETYPE,DWORD> states[]={
             {D3DRS_ZENABLE,useDepth?D3DZB_TRUE:D3DZB_FALSE},{D3DRS_ZWRITEENABLE,useDepth&&!blended},
@@ -444,6 +448,24 @@ public:
     }
     // The in-between palette: positions and normals of a linear skin blend like the skinned vertices themselves; dual
     // quaternions blend in their hemisphere and the shader normalizes the mix.
+    // Crystals round 2026-11-07: the GEM shaders for material m of d when it is a Gem material with a linear skin (drawGpu
+    // reaches it in the blended phase only, Gem implies AlphaBlend); sets the eye (VS c17), the draw's light (PS c2..c12) and
+    // the gem.txt values (PS c14, c15, c17, c18; c16 per pass). false = draw it as before.
+    bool gemWarned_=false;
+    bool beginGem(const re3gpu::Draw& d,std::size_t m,bool lit){
+        if(!(d.mesh->materialFlags[m]&Gem)||d.skin!=re3gpu::Skin::Linear||d.mesh->materialGem.size()<(m+1)*kGemParams)return false;
+        IDirect3DVertexShader9* vertex=nullptr;IDirect3DPixelShader9* pixel=nullptr;
+        if(!gpuShaders_.gem(device_,vertex,pixel)){
+            if(!gemWarned_){gemWarned_=true;char text[700];std::snprintf(text,sizeof(text),"MODEL_GEM_SHADER_FAILED %.600s; Gem materials draw as plain AlphaBlend\n",gpuShaders_.lastError().c_str());log(text);}
+            return false;}
+        if(FAILED(device_->SetVertexShader(vertex))||FAILED(device_->SetPixelShader(pixel)))return false;
+        const float eye[4]={d.eye[0],d.eye[1],d.eye[2],0};device_->SetVertexShaderConstantF(17,eye,1);
+        device_->SetPixelShaderConstantF(2,&d.light.rows[0][0],10);
+        float profile[4];std::memcpy(profile,d.light.profile1,16);profile[2]=lit?1.f:0.f;device_->SetPixelShaderConstantF(12,profile,1);
+        const float* g=&d.mesh->materialGem[m*kGemParams];
+        device_->SetPixelShaderConstantF(14,g,2);device_->SetPixelShaderConstantF(17,g+12,2);
+        return true;
+    }
     static void blendPalette(const re3gpu::Draw& d,float weight,float* out){
         const auto& to=*d.palette;const auto& from=*d.previous;const std::size_t count=to.size();
         if(d.skin==re3gpu::Skin::Affine){
@@ -477,7 +499,7 @@ public:
             re3gpu::Skin currentSkin=re3gpu::Skin(255);IDirect3DVertexBuffer9* stream0=nullptr,*stream1=nullptr;IDirect3DIndexBuffer9* currentIndices=nullptr;
             for(std::size_t e=0;e<count&&SUCCEEDED(hr);++e){const auto& entry=entries[e];const auto& d=*entry.draw;
                 if(!d.ready()||(phase&&!d.mesh->hasBlend))continue;anyBlend=anyBlend||d.mesh->hasBlend;++stats.entries;
-                const std::uint64_t depthKey=passKey?passKey:d.epoch;
+                const std::uint64_t depthKey=(passKey?passKey:d.epoch)^(d.ownDepth?0x8000000000000000ull:0ull);   // fix 2026-11-08: Draw::ownDepth
                 if(renderedEpoch_!=depthKey){renderedEpoch_=depthKey;depthCleared_=false;++depthResets;}
                 if(useDepth&&!depthCleared_)depthCleared_=SUCCEEDED(device_->Clear(0,nullptr,D3DCLEAR_ZBUFFER,0,1,0));
                 if(d.skin!=currentSkin){currentSkin=d.skin;auto* shader=gpuShaders_.vertex(device_,d.skin,gpuPixelLight);if(!shader){hr=E_NOINTERFACE;break;}
@@ -496,6 +518,8 @@ public:
                 // pixels of the flushed buckets; the ends of the model's own range stay open (its depth range is a bound)
                 const float range[4]={entry.low>d.bucketLow||d.nearClosed?float(entry.low)*d.bucketDepth:-wide,entry.high<d.bucketHigh?float(entry.high+1)*d.bucketDepth:wide,0,0};
                 device_->SetPixelShaderConstantF(1,range,1);
+                // fix 2026-11-08 (wall split): the side of a masked wall this draw keeps (Draw::wallPlane / wallSide)
+                {const float side[4]={d.wallSide,d.wallSide!=0?0.f:1.f,0,0};device_->SetVertexShaderConstantF(18,d.wallPlane,1);device_->SetPixelShaderConstantF(13,side,1);}
                 // this build's moving vertices: into the ring once, whatever the number of flushes and passes
                 const bool hasDynamic=!d.dynamic.empty(),isWorld=d.skin==re3gpu::Skin::World,isDecal=d.skin==re3gpu::Skin::Decal;
                 auto& mutableDraw=const_cast<re3gpu::Draw&>(d);
@@ -541,10 +565,16 @@ public:
                     else if(stream0!=gpuRing_){stream0=gpuRing_;hr=device_->SetStreamSource(0,gpuRing_,0,sizeof(re3gpu::GpuVertex));}};
                 for(std::size_t m=0;m<ranges.size()&&SUCCEEDED(hr);++m){const auto& range2=ranges[m];
                     if((m<64&&((d.hiddenMaterials>>m)&1u))||(!range2.staticIndices&&!range2.dynamicIndices)||!material(m))continue;
-                    if(range2.staticIndices){bindStatic();
-                        if(SUCCEEDED(hr))drawChunks(range2.firstChunk,range2.staticChunks,range2.firstStatic,range2.staticIndices,isWorld?INT(d.ringVertex):0,d.mesh->vertexCount);}
-                    if(range2.dynamicIndices&&SUCCEEDED(hr)){bindDynamic();
-                        if(SUCCEEDED(hr))drawChunks(range2.firstChunk+range2.staticChunks,range2.dynamicChunks,range2.firstDynamic,range2.dynamicIndices,poseDynamic?0:INT(d.ringVertex),UINT(d.dynamic.size()));}
+                    // crystals round 2026-11-07: a Gem material (blended phase, linear skin) takes the GEM shaders, far facets first
+                    const bool gem=beginGem(d,m,lit);
+                    for(unsigned side=0;side<(gem?2u:1u)&&SUCCEEDED(hr);++side){
+                        if(gem){const float* g=&d.mesh->materialGem[m*kGemParams];const float pass[4]={side?1.f:-1.f,g[9],g[10],g[11]};device_->SetPixelShaderConstantF(16,pass,1);}
+                        if(range2.staticIndices){bindStatic();
+                            if(SUCCEEDED(hr))drawChunks(range2.firstChunk,range2.staticChunks,range2.firstStatic,range2.staticIndices,isWorld?INT(d.ringVertex):0,d.mesh->vertexCount);}
+                        if(range2.dynamicIndices&&SUCCEEDED(hr)){bindDynamic();
+                            if(SUCCEEDED(hr))drawChunks(range2.firstChunk+range2.staticChunks,range2.dynamicChunks,range2.firstDynamic,range2.dynamicIndices,poseDynamic?0:INT(d.ringVertex),UINT(d.dynamic.size()));}
+                    }
+                    if(gem){auto* shader=gpuShaders_.vertex(device_,currentSkin,gpuPixelLight);if(shader)device_->SetVertexShader(shader);device_->SetPixelShader(pixelShader);}
                 }
             }
             device_->SetStreamSource(1,nullptr,0,0);

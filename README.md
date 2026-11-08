@@ -1,16 +1,16 @@
 # Resident Evil 3DD Mod: source of d3d9.dll
 
 This repository holds the source code of `files\d3d9.dll`, the only compiled file in
-[Resident Evil 3DD Mod](https://www.nexusmods.com/residentevil3nemesis/mods/136) 1.20 and its Lite
+[Resident Evil 3DD Mod](https://www.nexusmods.com/residentevil3nemesis/mods/136) 1.21 and its Lite
 edition (the same file), a fan remaster of the GOG and Steam releases of Resident Evil 3 (1999).
 
 Everything else in the mod archive is data (PNG images, `.r3mesh` / `.r3face` model files,
-JSON and text tables, one `.vag` sound) or plain-text scripts. The installer scripts and the
+JSON and text tables, one `.vag` sound, WAV hit sounds) or plain-text scripts. The installer scripts and the
 DLL's config file are in `package/`, byte for byte as they are in the archive.
 
-| File in the 1.20 archives | Size | SHA-256 |
+| File in the 1.21 release | Size | SHA-256 |
 |---|---|---|
-| `files\d3d9.dll` | 1,276,416 bytes | `fae282b1e4024f8c37ae1938f4502c4553a619ff354d618aa142449854502797` |
+| `files\d3d9.dll` | 1,571,840 bytes | `0a324cc0b556b73f1118c3bf5b981f97d324b24c5d7cf4fb4b1984eaf28cc824` |
 
 ## What the DLL does
 
@@ -38,6 +38,13 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
   `model-pack\kit.txt` (`src/model_integration.h`): the parts are picked per room visit so that
   heads do not repeat within a room, and bullet wounds are placed on the part that was hit
   (`src/model_wounds.h`).
+- Since 1.21 the DLL draws HD blood (`src/blood_fx.h`: pools under the dead in place of the
+  native shadow stain, hit sprays, exit wounds), plays bullet hit sounds through DirectSound
+  (`src/sfx_hits.h`, `model-pack\hit-sounds\hits.txt`), draws the game's own fire, muzzle flash
+  and Nemesis gas sprites from sharper redrawn texture pages (`src/fx_fire.h`, `src/fx_muzzle.h`,
+  `src/fx_nemesis_cloud.h`), and opens the game's PC settings window with F5
+  (`src/options_menu.h`). Each has its own switch in `pilot.ini` (`blood_fx`, `hit_sounds`,
+  `fire_fx`, `muzzle_fx`, `nemesis_cloud_fx`, `options_key`).
 - It does not use the network, start processes or touch the registry. It writes only inside the
   game folder: `runtime.log`, `crash-dumps\*.dmp` after a crash, and a `captures\` folder that
   stays empty unless a QA capture is switched on in `pilot.ini`.
@@ -66,7 +73,7 @@ unit; it includes the other headers. `src\d3d9.def` exports `Direct3DCreate9`.
 
 These sources rebuilt with MSVC 19.51.36252 in the folder the release was built in give a
 file that differs from the released `d3d9.dll` only in the link timestamp (in the PE header
-and in the debug directory). Built from a different folder path, the size stays 1,276,416
+and in the debug directory). Built from a different folder path, the size stays 1,571,840
 bytes, but the compiler lays the code out in a different order, so the bytes and the hash
 differ.
 

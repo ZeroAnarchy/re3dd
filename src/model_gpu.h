@@ -71,6 +71,7 @@ struct Mesh {
     std::vector<BoneBounds> bounds;
     std::vector<std::uint8_t> triangleBone;     // dominant bone of every source triangle
     std::vector<std::uint32_t> materialFlags;std::vector<float> materialColour;   // 4 per material, RGBA 0..1
+    std::vector<float> materialGem;   // kGemParams per material (Gem materials, crystals round 2026-11-07)
     bool hasBlend=false;std::size_t bytes=0;
     Mesh()=default;Mesh(const Mesh&)=delete;Mesh& operator=(const Mesh&)=delete;
     ~Mesh(){SafeRelease(vertices);SafeRelease(pose);SafeRelease(dynamicPose);}
@@ -190,7 +191,8 @@ inline std::shared_ptr<Mesh> BuildMesh(IDirect3DDevice9* device,const re3model::
     gpu->base=BuildIndices(device,source,*gpu,nullptr,~0u,&hr);if(!gpu->base)return {};gpu->bytes+=source.indices.size()*4;
     gpu->materialFlags.reserve(source.materials.size());gpu->materialColour.reserve(source.materials.size()*4);
     for(const auto& m:source.materials){gpu->materialFlags.push_back(m.flags);gpu->hasBlend=gpu->hasBlend||(m.flags&re3model::AlphaBlend)!=0;
-        for(unsigned k=0;k<4;++k)gpu->materialColour.push_back(float((m.baseColorRGBA>>(k*8))&255u)/255.f);}
+        for(unsigned k=0;k<4;++k)gpu->materialColour.push_back(float((m.baseColorRGBA>>(k*8))&255u)/255.f);
+        gpu->materialGem.insert(gpu->materialGem.end(),m.gem,m.gem+kGemParams);}
     hr=S_OK;return gpu;
 }
 
@@ -221,6 +223,12 @@ struct Draw {
     float rect[4]={-1.e9f,-1.e9f,1.e9f,1.e9f};   // screen pixels this draw can touch
     LightConstants light;bool lit=false;
     std::uint64_t epoch=0;std::uint16_t bucketHigh=0,bucketLow=0;bool nearClosed=false;float bucketDepth=32.f;
+    // fix 2026-11-08 (wall split): a wall plane in camera space (dot(xyz,camera)+w, positive = the room side) and the side
+    // this draw keeps: +1 the room side, -1 beyond the wall, 0 everything (model_integration.h kWallSplit)
+    float wallPlane[4]={0,0,0,1},wallSide=0;
+    // fix 2026-11-08: a draw hidden behind wall masks (bone split) gets its own model depth: its depth never rejects the
+    // room-side draws (Nemesis' legs swing in front of his arms while both hang through the R20F04 window)
+    bool ownDepth=false;
     std::string name;
     std::vector<GpuVertex> dynamic;   // Linear/Affine: the deformed vertices of this build
     std::vector<WorldVertex> world;   // World: placed vertices of this build (overlay)
@@ -342,6 +350,7 @@ float4 misc:register(c1);         // x near plane, y World/in-between weight, zw
 float4 cameraRows[3]:register(c2);
 float4 colourTint:register(c16);  // material colour x draw tint
 float4 eyeWorld:register(c17);
+float4 wallPlane:register(c18);   // fix 2026-11-08: camera-space wall plane (Draw::wallPlane)
 float4 palette[216]:register(c24);
 struct Input {
     float3 position:POSITION;float3 normal:NORMAL;float2 uv:TEXCOORD0;float4 colour:COLOR0;
@@ -354,9 +363,12 @@ struct Input {
     float4 bones2:BLENDINDICES1;float4 weights2:BLENDWEIGHT1;float3 offset:TEXCOORD1;float2 side:TEXCOORD2;
 #endif
 };
-struct Output {float4 position:POSITION;float4 colour:COLOR0;float2 uv:TEXCOORD0;float2 depthOcclusion:TEXCOORD1;
-#ifdef PIXEL_LIGHT
+struct Output {float4 position:POSITION;float4 colour:COLOR0;float2 uv:TEXCOORD0;float3 depthOcclusion:TEXCOORD1;
+#if defined(PIXEL_LIGHT)||defined(GEM)
     float3 normal:TEXCOORD2;
+#endif
+#ifdef GEM
+    float3 toEye:TEXCOORD3;
 #endif
 };
 #if defined(SKIN_LINEAR)
@@ -411,15 +423,18 @@ Output main(Input input){
     float4 h=float4(world,1);
     float3 camera=float3(dot(cameraRows[0],h),dot(cameraRows[1],h),dot(cameraRows[2],h));
     output.position=float4(projection.x*camera.x+projection.y*camera.z,projection.z*camera.y+projection.w*camera.z,camera.z-misc.x,camera.z);
-    output.uv=input.uv;output.depthOcclusion=float2(camera.z,input.colour.r);
+    output.uv=input.uv;output.depthOcclusion=float3(camera.z,input.colour.r,dot(wallPlane.xyz,camera)+wallPlane.w);
     float4 colour=colourTint;
 #ifndef SKIN_DECAL
     colour.rgb*=tint;   // damage red belongs to the body, not to its wound decals
 #endif
-#ifdef PIXEL_LIGHT
+#if defined(PIXEL_LIGHT)||defined(GEM)
     output.normal=normal;
 #else
     if(lightData[10].z>0)colour.rgb*=Shade(normal,input.colour.r);
+#endif
+#ifdef GEM
+    output.toEye=eyeWorld.xyz-world;   // world and eye are both relative to the draw's origin (the rounded eye)
 #endif
     output.colour=colour;
     return output;
@@ -428,12 +443,57 @@ Output main(Input input){
 sampler2D albedo:register(s0);
 float4 options:register(c0);   // x coverage cutoff, z opacity
 float4 range:register(c1);     // x,y camera depth of the flushed buckets
-float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float2 depthOcclusion:TEXCOORD1
+#ifdef GEM
+// Crystals round 2026-11-07: a translucent faceted gem (Gem materials, drawn in the AlphaBlend phase in two passes: the far
+// facets, seen through the gem, then the near ones). gem.txt values (model_integration.h loadGemMaterials):
+float4 gemA:register(c14);   // opacity, glow, specular, shininess
+float4 gemB:register(c15);   // rim colour rgb, rim
+float4 gemC:register(c16);   // pass (-1 far facets, +1 near facets), inner, gain, saturation
+float4 gemD:register(c17);   // inner opacity, fresnel power, inner specular, facets
+float4 gemE:register(c18);   // sheen (reflection of a facet facing the eye), environment floor, glint, glint height
+float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float2 depthOcclusion:TEXCOORD1,float3 normal:TEXCOORD2,float3 toEye:TEXCOORD3):COLOR0{
+    clip(depthOcclusion.x-range.x);clip(range.y-depthOcclusion.x);
+    float3 v=normalize(toEye),n=normalize(normal);
+    float facing=dot(n,v);
+    clip(facing*gemC.x);                      // this pass's side only (far facets face away from the eye)
+    float far=facing<0?1:0;
+    float3 s=facing<0?-n:n;                   // a far facet is seen from inside the gem
+    float4 texel=tex2D(albedo,uv);
+    float coverage=texel.a*tint.a;
+    clip(coverage-options.x);
+    float3 base=texel.rgb*tint.rgb;
+    float grey=dot(base,float3(0.299,0.587,0.114));
+    base=max(0,lerp(grey,base,1+gemC.w))*gemC.z;
+    float3 light=lightData[10].z>0?Shade(s,1):float3(1,1,1);
+    float fresnel=pow(1-saturate(abs(facing)),gemD.y);
+    float3 spec=0;
+    [unroll] for(int i=0;i<3;++i){
+        float3 l=lightData[i].xyz;float strength=length(l);
+        if(strength>1e-4){float3 h=normalize(l/strength+v);
+            spec+=pow(saturate(dot(s,h)),gemA.w)*strength*float3(lightData[3][i],lightData[4][i],lightData[5][i]);}
+    }
+    spec*=gemA.z*lerp(1,gemD.z,far);
+    // glint: a light just above the eye, so the table of a stone turned to the camera flashes as a cut gem does
+    float3 g=normalize(v+lightData[8].xyz*gemE.w);
+    spec+=gemB.rgb*gemE.z*(1-far)*pow(saturate(dot(s,normalize(g+v))),gemA.w*0.5);
+    // cut-stone look: a bright sky / dark floor environment in the reflection, and a tone that changes from facet to facet
+    float3 r=reflect(-v,s);
+    float env=gemE.y+(1-gemE.y)*pow(saturate((dot(r,lightData[8].xyz)-0.05)/0.6),1.5);
+    float tone=1+gemD.w*sin(7*dot(s,float3(0.8,0.3,0.5)))*sin(5*dot(s,float3(-0.2,0.9,0.4)));
+    float3 colour=base*(light+gemA.y)*tone*lerp(1,gemC.y,far)+gemB.rgb*gemB.w*(gemE.x+(1-gemE.x)*fresnel)*env*(1-far)+spec;
+    float alpha=lerp(lerp(gemA.x,gemD.x,far),1,fresnel*(1-far));
+    alpha=saturate(max(alpha,dot(spec,float3(0.333,0.333,0.334))));
+    return float4(colour,alpha*coverage*options.z);
+}
+#else
+float4 wallSide:register(c13);   // fix 2026-11-08: x side kept (+1 room, -1 beyond the wall, 0 all), y 1 when off
+float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOORD1
 #ifdef PIXEL_LIGHT
     ,float3 normal:TEXCOORD2
 #endif
     ):COLOR0{
     clip(depthOcclusion.x-range.x);clip(range.y-depthOcclusion.x);
+    clip(depthOcclusion.z*wallSide.x+wallSide.y);
     float4 texel=tex2D(albedo,uv);
     float coverage=texel.a*tint.a;
     clip(coverage-options.x);
@@ -444,10 +504,12 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float2 depthOcclusion:TEXCOOR
     return float4(texel.rgb*colour,coverage*options.z);
 }
 #endif
+#endif
 )HLSL";}
 
 class Shaders {
     IDirect3DVertexShader9* vertex_[5][2]{};IDirect3DPixelShader9* pixel_[2]{};
+    IDirect3DVertexShader9* gemVertex_=nullptr;IDirect3DPixelShader9* gemPixel_=nullptr;bool gemFailed_=false;   // crystals round 2026-11-07
     IDirect3DVertexDeclaration9* skin_=nullptr,*pose_=nullptr,*world_=nullptr;
     using Compile=HRESULT(WINAPI*)(LPCVOID,SIZE_T,LPCSTR,const D3D_SHADER_MACRO*,ID3DInclude*,LPCSTR,LPCSTR,UINT,UINT,ID3DBlob**,ID3DBlob**);
     HMODULE library_=nullptr;Compile compile_=nullptr;
@@ -468,7 +530,8 @@ class Shaders {
 public:
     const std::string& lastError()const{return lastError_;}
     ~Shaders(){release();if(library_)FreeLibrary(library_);}
-    void release(){for(auto& row:vertex_)for(auto& v:row)SafeRelease(v);for(auto& p:pixel_)SafeRelease(p);SafeRelease(skin_);SafeRelease(pose_);SafeRelease(world_);}
+    void release(){for(auto& row:vertex_)for(auto& v:row)SafeRelease(v);for(auto& p:pixel_)SafeRelease(p);SafeRelease(skin_);SafeRelease(pose_);SafeRelease(world_);
+        SafeRelease(gemVertex_);SafeRelease(gemPixel_);gemFailed_=false;}
     HRESULT declarations(IDirect3DDevice9* d){
         if(skin_)return S_OK;
         const D3DVERTEXELEMENT9 skin[]={{0,0,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_POSITION,0},{0,12,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_NORMAL,0},{0,24,D3DDECLTYPE_FLOAT2,0,D3DDECLUSAGE_TEXCOORD,0},
@@ -496,6 +559,21 @@ public:
         if(SUCCEEDED(build(macros,"ps_3_0",&code)))d->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&slot);
         if(code)code->Release();return slot;
     }
+    // Crystals round 2026-11-07: the GEM pair (linear skin only). False after a failed build: Gem materials then draw as plain
+    // AlphaBlend materials (failed() reports it once); the rest of the GPU path is not affected.
+    bool gem(IDirect3DDevice9* d,IDirect3DVertexShader9*& vertex,IDirect3DPixelShader9*& pixel){
+        if(!gemVertex_&&!gemFailed_){
+            std::vector<D3D_SHADER_MACRO> macros{{"VERTEX_SHADER","1"},{"LIGHT_REGISTER","c5"},{"SKIN_LINEAR","1"},{"GEM","1"},{nullptr,nullptr}};ID3DBlob* code=nullptr;
+            if(SUCCEEDED(build(macros,"vs_3_0",&code)))d->CreateVertexShader(static_cast<const DWORD*>(code->GetBufferPointer()),&gemVertex_);
+            if(code){code->Release();code=nullptr;}
+            std::vector<D3D_SHADER_MACRO> pixelMacros{{"LIGHT_REGISTER","c2"},{"GEM","1"},{nullptr,nullptr}};
+            if(gemVertex_&&SUCCEEDED(build(pixelMacros,"ps_3_0",&code)))d->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&gemPixel_);
+            if(code)code->Release();
+            if(!gemVertex_||!gemPixel_){SafeRelease(gemVertex_);SafeRelease(gemPixel_);gemFailed_=true;}
+        }
+        vertex=gemVertex_;pixel=gemPixel_;return gemVertex_&&gemPixel_;
+    }
+    bool gemFailed()const{return gemFailed_;}
 };
 // True when this device runs the path in hardware. The GOG wrapper creates a mixed device (flags 0x82), so nothing here
 // needs another device: the draws clear SetSoftwareVertexProcessing.

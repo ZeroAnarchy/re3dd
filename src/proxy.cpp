@@ -65,13 +65,21 @@ static bool modelKitEnabled=true;  // QA (pilot.command kit-off / kit-on, debug_
 // QA (03.11b, debug_warp): pilot.command wound-test-head / -upper / -lower: one shot from the camera eye at that kit part of the
 // kit zombie nearest to the eye (a queued hit like the player's, the same wound path); -1 = none
 static int modelWoundTestRegion=-1;
+static volatile LONG bloodTestRequest=0;   // blood round 2026-11-07: pilot.command blood-test (blood_fx.h)
+static volatile LONG corpseTestRequest=0;  // fix round 2026-11-07: pilot.command blood-corpse-test (blood_fx.h -> corpseShotTest)
+static volatile LONG muzzleTestRequest=0;  // fx 2026-11-08 muzzle: pilot.command muzzle-test / muzzle-capture / muzzle-mid (fx_muzzle.h)
+static volatile LONG enemyLifeRequest=0;   // fix 2026-11-08 (QA): pilot.command enemy-life-1 (blood_fx.h -> enemyLifeOne)
+static volatile LONG nemesisCloudTestRequest=0;   // fx 2026-11-08 nemesis-cloud: pilot.command nemesis-cloud-test (fx_nemesis_cloud.h)
+static volatile LONG fireTestRequest=0;    // fx 2026-11-08 fire: pilot.command fire-test (fx_fire.h)
 static bool f8WasDown = false;
 static volatile LONG toggleRequested=0;
 static volatile LONG fps60ToggleRequested=0;   // F7: 60 fps HD models on/off (fps60_integration.h)
 static unsigned fps60CaptureSequence=0;        // diagnostic capture-fps60: real frame, in-between frame, real frame
 static WNDPROC originalWndProc=nullptr;
 static void logWindowEvent(HWND,UINT,WPARAM,LPARAM);
+#include "options_menu.h" // fx 2026-11-08 options
 static LRESULT CALLBACK pilotWndProc(HWND w,UINT msg,WPARAM wp,LPARAM lp){logWindowEvent(w,msg,wp,lp);if(msg==WM_KEYDOWN&&wp==VK_F8){if(!(lp&(1l<<30)))InterlockedIncrement(&toggleRequested);return 0;}
+  if(msg==WM_KEYDOWN&&re3options::OnKeyDown(w,wp,lp))return 0; // fx 2026-11-08 options
   if(msg==WM_KEYDOWN&&wp==VK_F7){if(!(lp&(1l<<30)))InterlockedIncrement(&fps60ToggleRequested);return 0;}return CallWindowProcA(originalWndProc,w,msg,wp,lp);}
 static void pollToggle(){if(InterlockedExchange(&toggleRequested,0)&1){desiredEnabled=!desiredEnabled;logFile && (fprintf(logFile,"TOGGLE %s\n",desiredEnabled?"remastered":"original"),fflush(logFile));}enabled=desiredEnabled;}
 static size_t dumps = 0;
@@ -440,7 +448,11 @@ static void gpuTraceFrame(){
   gpuTraceText.clear();gpuTraceSign.clear();gpuTraceDraws=0;
 }
 // pilot.ini gpu_trace_frames=a,b,...: every gather, flush, quad and device draw of those frames, in order
-static std::vector<unsigned> gpuTraceFrames;static bool gpuTraceNow(){return !gpuTraceFrames.empty()&&std::find(gpuTraceFrames.begin(),gpuTraceFrames.end(),frame)!=gpuTraceFrames.end();}
+// fix 2026-11-07 (nemesis-po, diagnostic): pilot.ini gpu_trace_scene=<Rxxxyy> traces every gpu_trace_every-th frame of that
+// scene, at most gpu_trace_max frames (sceneTraceNow, defined after currentScene)
+static bool sceneTraceNow();
+static std::string gpuTraceScene;static unsigned gpuTraceEvery=15,gpuTraceMax=40,gpuTraceTaken=0,gpuTraceTakenFrame=~0u;
+static std::vector<unsigned> gpuTraceFrames;static bool gpuTraceNow(){return (!gpuTraceFrames.empty()&&std::find(gpuTraceFrames.begin(),gpuTraceFrames.end(),frame)!=gpuTraceFrames.end())||sceneTraceNow();}
 static void gpuTraceDetail(IDirect3DDevice9* d,const char* kind,D3DPRIMITIVETYPE type,UINT count,const void* data,UINT stride){
   if(!gpuTraceNow())return;DWORD z=0,alpha=0,src=0,dst=0,fvf=0;d->GetRenderState(D3DRS_ZENABLE,&z);d->GetRenderState(D3DRS_ALPHABLENDENABLE,&alpha);d->GetRenderState(D3DRS_SRCBLEND,&src);d->GetRenderState(D3DRS_DESTBLEND,&dst);d->GetFVF(&fvf);
   IDirect3DBaseTexture9* texture=nullptr;d->GetTexture(0,&texture);if(texture)texture->Release();
@@ -534,6 +546,9 @@ static void hookDevice(IDirect3DDevice9* d){
   o.hooked[42]=(void*)endSceneHook;o.hooked[81]=(void*)drawPrimitive;o.hooked[82]=(void*)drawIndexed;o.hooked[83]=(void*)drawUP;o.hooked[84]=(void*)drawIndexedUP;
   o.hooked[34]=(void*)stretchRectHook;o.hooked[35]=(void*)colorFillHook;o.hooked[37]=(void*)setRenderTargetHook;o.hooked[43]=(void*)clearHook;o.hooked[47]=(void*)setViewportHook;
   gpuTraceOn=GetPrivateProfileIntA("pilot","gpu_device_trace",0,(root+"\\pilot.ini").c_str())!=0;
+  {char scene[32]{};GetPrivateProfileStringA("pilot","gpu_trace_scene","",scene,sizeof(scene),(root+"\\pilot.ini").c_str());gpuTraceScene=scene;
+   gpuTraceEvery=(std::max)(1u,(unsigned)GetPrivateProfileIntA("pilot","gpu_trace_every",15,(root+"\\pilot.ini").c_str()));
+   gpuTraceMax=(unsigned)GetPrivateProfileIntA("pilot","gpu_trace_max",40,(root+"\\pilot.ini").c_str());}
   {char list[256]{};GetPrivateProfileStringA("pilot","gpu_trace_frames","",list,sizeof(list),(root+"\\pilot.ini").c_str());gpuTraceFrames.clear();for(char* p=list;*p;){char* end=nullptr;const unsigned long n=strtoul(p,&end,10);if(end==p)break;gpuTraceFrames.push_back(unsigned(n));p=*end?end+1:end;}}if(gpuTraceOn){o.hooked[57]=(void*)setRenderStateTrace;o.hooked[75]=(void*)setScissorTrace;}
   deviceHooks.clear();for(unsigned i=0;i<119;++i)if(o.hooked[i]!=o.original[i])deviceHooks.push_back({i,o.hooked[i]});
   devices.erase(d);devices.emplace(d,o);
@@ -663,6 +678,11 @@ static bool readSceneMatrix(const std::string& path,float* matrix){
   return true;
 }
 static std::string currentScene;
+static bool sceneTraceNow(){
+  if(gpuTraceScene.empty()||currentScene!=gpuTraceScene||frame%gpuTraceEvery)return false;
+  if(gpuTraceTakenFrame!=frame){if(gpuTraceTaken>=gpuTraceMax)return false;gpuTraceTakenFrame=frame;++gpuTraceTaken;}
+  return true;
+}
 static bool nativeFrameRemastered=false;
 static unsigned maskDraws=0;
 static unsigned maskSeenTotal=0,maskTableTotal=0,maskDrawnTotal=0;   // fps60 cut probe: mask sprites seen / found in the room table / drawn HD
@@ -692,6 +712,7 @@ static void fps60AfterRealFrame();
 static void __fastcall frameHook(void* renderer,void*){
   bool latched;if(re3bridge::GetRenderMode(latched))enabled=latched;else pollToggle();
   fps60OnRealFrame();
+  {static re3options::Runtime<void(*)(const char*,...)> options;options.Tick(gameBase,re3exe::gRunning==re3exe::Exe::Main,root+"\\pilot.ini",log);} // fx 2026-11-08 options
   uiFrameSerial++;diagnosticControl();uiDraws=0;nativeFrameRemastered=false;maskDraws=0;
   static bool previousMode=true;static unsigned transitionFrames=0;
   if(previousMode!=enabled){previousMode=enabled;transitionFrames=12;}
@@ -711,6 +732,7 @@ static void __fastcall frameHook(void* renderer,void*){
   if(captureRequested){captureRequested=false;captureFrame();}nativeFrameRemastered=false;
   fps60AfterRealFrame();
 }
+#include "sfx_hits.h"   // fx 2026-11-08 hit-sound
 #include "diagnostic_room_control.h"
 static void diagnosticControl(){
   static unsigned next=0;if(uiFrameSerial<next)return;next=uiFrameSerial+15;
@@ -737,6 +759,14 @@ static void diagnosticControl(){
   if(command=="reload-models")modelReloadRequested=true;
   // QA (round models-2026-11-02): torn-off enemy parts drawn as in 1.19 (detach-off: the crawler's strip) / as pieces
   if((command=="detach-on"||command=="detach-off")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){modelDetachFix=command=="detach-on";log("COMMAND %s",command.c_str());}
+  if(command=="blood-corpse-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&corpseTestRequest,1);log("COMMAND %s",command.c_str());}
+  if(command=="enemy-life-1"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&enemyLifeRequest,1);log("COMMAND %s",command.c_str());}
+  if(command=="blood-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&bloodTestRequest,1);log("COMMAND %s",command.c_str());}
+  if(command=="options-open"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){re3options::RequestFromCommand();log("COMMAND %s",command.c_str());} // fx 2026-11-08 options
+  if(command=="hit-sound-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){sfxhits::requestTest();log("COMMAND %s",command.c_str());}   // fx 2026-11-08 hit-sound
+  if(command=="nemesis-cloud-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&nemesisCloudTestRequest,1);log("COMMAND %s",command.c_str());}   // fx 2026-11-08 nemesis-cloud
+  if(command=="fire-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&fireTestRequest,1);log("COMMAND %s",command.c_str());}   // fx 2026-11-08 fire
+  if((command=="muzzle-test"||command=="muzzle-capture"||command=="muzzle-mid")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&muzzleTestRequest,command=="muzzle-test"?1:command=="muzzle-capture"?2:3);log("COMMAND %s",command.c_str());} // fx 2026-11-08 muzzle
   if((command=="kit-on"||command=="kit-off")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){modelKitEnabled=command=="kit-on";log("COMMAND %s",command.c_str());}
   if((command=="wound-test-head"||command=="wound-test-upper"||command=="wound-test-lower")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
     modelWoundTestRegion=command=="wound-test-upper"?0:command=="wound-test-lower"?1:2;log("COMMAND %s queued",command.c_str());}
@@ -968,6 +998,7 @@ static bool drawUiVertices(IDirect3DTexture9* tex,const UiVertex* v,unsigned cou
   d->SetTextureStageState(0,D3DTSS_ALPHAOP,D3DTOP_MODULATE);d->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);d->SetTextureStageState(0,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
   d->SetTextureStageState(1,D3DTSS_COLOROP,D3DTOP_DISABLE);d->SetTextureStageState(1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
   d->SetSamplerState(0,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);d->SetSamplerState(0,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);d->SetSamplerState(0,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);d->SetSamplerState(0,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);d->SetSamplerState(0,D3DSAMP_MIPFILTER,D3DTEXF_NONE);
+  if(tex&&tex->GetLevelCount()>1)d->SetSamplerState(0,D3DSAMP_MIPFILTER,D3DTEXF_LINEAR); // fx5 2026-11-08 fire: mip-mapped textures (HD fire pages) filtered between levels
   HRESULT hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,DWORD,IDirect3DBaseTexture9*)>(devices.at(d),65)(d,0,tex);
   if(SUCCEEDED(hr))hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,const void*,UINT)>(devices.at(d),83)(d,count==4?D3DPT_TRIANGLESTRIP:D3DPT_TRIANGLELIST,count==4?2:1,v,sizeof(UiVertex));
   if(ownScene)d->EndScene();state.restore(d);return SUCCEEDED(hr);
@@ -982,6 +1013,9 @@ static void uiDiagnoseMiss(unsigned tpage,unsigned clut,float minU,float minV,fl
   log("UI_UNMATCHED %s primitive=%s tpage=%x clut=%x command=%02x paletteFNV=%016llx paletteKnown=%u/%u",probe.assetId.c_str(),uiPrimitiveName(kind),tpage,clut,command,probe.palette.complete?probe.palette.hash:0ull,known,probe.palette.entries);
 }
 #include "ui_probe_integration.h"
+namespace re3extra{namespace muzzle{static bool flashBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);}} // fx2 2026-11-08 muzzle (fx_muzzle.h)
+namespace re3extra{namespace nemesis_cloud{static bool armBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);}} // fx5 2026-11-08 nemesis-cloud (fx_nemesis_cloud.h)
+namespace re3extra{namespace fire{static bool pageBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);}} // fx5 2026-11-08 fire (fx_fire.h)
 static bool drawUiPacket(void* renderer,const uint8_t* p,unsigned tpage,UiPrimitive kind){
   if(!enabled||!uiReady||!gameDevice||!gogWrapper)return false;
   const uint8_t command=p[7];const unsigned count=kind==UiFlatTriangle?3:4;
@@ -998,6 +1032,9 @@ static bool drawUiPacket(void* renderer,const uint8_t* p,unsigned tpage,UiPrimit
   static const bool probeItems=GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())!=0;
   if(probeItems)diagnosticUiProbe(tpage,clut,minU,minV,maxU,maxV);
   re3ui::Binding binding;bool resolved=uiRegistry.resolve(tpage,clut,binding,minU,minV,maxU,maxV);
+  if(re3extra::muzzle::flashBinding(p,tpage,clut,minU,minV,maxU,maxV,binding))resolved=true; // fx2 2026-11-08 muzzle: the native gun-flash page at 8x
+  if(re3extra::nemesis_cloud::armBinding(p,tpage,clut,minU,minV,maxU,maxV,binding))resolved=true; // fx5 2026-11-08 nemesis-cloud: Nemesis' palette 2/4 sprites at 8x
+  if(re3extra::fire::pageBinding(p,tpage,clut,minU,minV,maxU,maxV,binding))resolved=true; // fx5 2026-11-08 fire: the native fire banks' pages in HD
   // A flipped polygon (radar bracket FT4 at 45EF47: v 191..222 over a TIM at v 192) names one edge texel the GPU never
   // samples. Retry only failed polygons with the sampled texel range so such mirrors resolve; resolved draws are unchanged.
   if(!resolved&&kind!=UiSprite){float cu[4],cv[4],meanU=0,meanV=0;for(unsigned i=0;i<count;i++){meanU+=us[i]/count;meanV+=vs[i]/count;}
@@ -1204,7 +1241,14 @@ static void installGameHooks(){
     if(match){for(int i=0;i<4;i++){DWORD prot;VirtualProtect(dd+offsets[i],4,PAGE_EXECUTE_READWRITE,&prot);*(uint32_t*)(dd+offsets[i])=i%2?renderHeight:renderWidth;VirtualProtect(dd+offsets[i],4,prot,&unused);}FlushInstructionCache(GetCurrentProcess(),dd,0x23000);log("GOG synthetic display mode 1024x768 -> %ux%u patched in memory",renderWidth,renderHeight);}
     else log("GOG synthetic mode patch skipped: signature mismatch");
   }
+  re3extra::effectTrace=GetPrivateProfileIntA("pilot","effect_trace",0,(root+"\\pilot.ini").c_str())!=0;if(re3extra::effectTrace){log("EFFECT_TRACE on");re3bridge::detail::Get().packetTrace=true;}
+  if(GetPrivateProfileIntA("pilot","blood_packet_census",0,(root+"\\pilot.ini").c_str())){log("BLOOD_PACKET_CENSUS on");re3bridge::detail::Get().packetCensus=true;}
+  re3extra::blood::enabled=GetPrivateProfileIntA("pilot","blood_fx",1,(root+"\\pilot.ini").c_str())!=0;
+  re3extra::blood::debugPoolBucket=(int)GetPrivateProfileIntA("pilot","blood_debug_pool_bucket",-1,(root+"\\pilot.ini").c_str());
+  re3extra::blood::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","blood_debug_slow",1,(root+"\\pilot.ini").c_str())));
+  re3extra::nemesis_cloud::enabled=GetPrivateProfileIntA("pilot","nemesis_cloud_fx",1,(root+"\\pilot.ini").c_str())!=0;re3extra::nemesis_cloud::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","nemesis_cloud_debug_slow",1,(root+"\\pilot.ini").c_str())));   // fx 2026-11-08 nemesis-cloud
   installModels();installPropModels();installExtraModels();installMerceSelect();installTitleCostume();installFps60();glock::install();
+  sfxhits::install();   // fx 2026-11-08 hit-sound
   {auto slot=reinterpret_cast<void**>(gameBase+0x10aa78+0x30);
     if(*slot==reinterpret_cast<void*>(gameBase+0xf080)){originalMovie=reinterpret_cast<MovieFn>(*slot);DWORD prot;VirtualProtect(slot,4,PAGE_READWRITE,&prot);*slot=reinterpret_cast<void*>(movieHook);VirtualProtect(slot,4,prot,&unused);log("MOVIE_HOOK installed (renderer +30 = 40F080), trim below %zu MB free",(kMovieNeed>>20)+256);}
     else log("MOVIE_HOOK skipped: renderer vtable +30 signature mismatch");}

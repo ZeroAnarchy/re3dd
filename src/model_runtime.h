@@ -159,10 +159,18 @@ struct DiskMaterial {
     std::uint32_t flags,baseColorRGBA,reserved0,reserved1;
 };
 static_assert(sizeof(Header)==64&&sizeof(Vertex)==48&&sizeof(Matrix3x4)==48&&sizeof(DiskMaterial)==40,"R3MESH1 layout mismatch");
-enum MaterialFlags : std::uint32_t { TwoSided=1, AlphaCutout=2, AlphaBlend=4, Unlit=8 };
+// GrowthMask (blood round 2026-11-07, runtime only: packs keep flags <= 15): the stp texture is a reach map (r = when the
+// spreading front reaches the texel); the vertex alpha is the progress instead of an opacity (model_shader.h).
+// Gem (crystals round 2026-11-07, runtime only, set from the pack's gem.txt with AlphaBlend): the GPU path draws the material
+// as a translucent faceted crystal (model_gpu.h GEM shaders: far facets first, then near ones; native light + self-lit share,
+// specular of the native lights, fresnel rim). The CPU path draws it as a plain AlphaBlend material.
+enum MaterialFlags : std::uint32_t { TwoSided=1, AlphaCutout=2, AlphaBlend=4, Unlit=8, GrowthMask=16, Gem=32 };
+// gem.txt values of a Gem material, in the order of the GEM pixel shader constants c14..c18 (model_gpu.h).
+constexpr unsigned kGemParams=20;
 struct Material {
     std::uint32_t firstIndex=0,indexCount=0,flags=0,baseColorRGBA=0xffffffffu;
     std::string albedoPath,stpPath;
+    float gem[kGemParams]{};
 };
 struct Mesh {
     std::vector<Vertex> vertices;

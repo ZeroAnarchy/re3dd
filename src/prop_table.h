@@ -1,6 +1,6 @@
 #pragma once
 // v14 prop table model-pack/props.txt, written by runtime/install-props-v14.py (format: PROPS-V14.ru.txt):
-//   obj  <Rxxx|*> <object|*> <part> <asset|-> <V/T/Q:fnv64> [xf=12 floats] [depth=triangle|chest]
+//   obj  <Rxxx|*> <object|*> <part> <asset|-> <V/T/Q:fnv64> [xf=12 floats] [depth=triangle|chest] [ambient=gain]
 //   door <DO2 hex> <mesh record> <asset|-> <V/T/Q:fnv64> [xf=12 floats]
 // Identity = counts of the native 24-byte mesh record (u16 vertices +8, u16 triangles +14, u16 quads +16) and FNV-1a
 // 64 over the int16 x,y,z of its 8-byte vertices; the DLL repeats it on the live mesh before every replacement, so a
@@ -21,6 +21,7 @@ struct Identity {
 enum class Depth:std::uint8_t{Triangle,Chest};
 struct Rule {
     std::string asset;Identity identity;re3model::Matrix3x4 transform;bool transformed=false;Depth depth=Depth::Triangle;unsigned line=0;
+    float ambient=1.f;  // props-bright 2026-11-07: opt-in 'ambient=<0.25..8>' multiplies the native ambient (GTE BK) for this row only
     bool hide()const{return asset=="-";}
 };
 // room = stage word A61FA6 << 8 | room word A61FA8 (R10C = 0x000C, R50B = 0x040B)
@@ -102,6 +103,7 @@ inline void ParseTable(std::istream& in,Table& out){
             const std::string key=option.substr(0,equal),value=option.substr(equal+1);
             if(key=="xf"){ok=ParseTransform(value,rule.transform);rule.transformed=true;}
             else if(key=="depth"&&kind=="obj"){if(value=="chest")rule.depth=Depth::Chest;else ok=value=="triangle";}
+            else if(key=="ambient"&&kind=="obj"){char* end=nullptr;const float v=std::strtof(value.c_str(),&end);ok=end&&!*end&&std::isfinite(v)&&v>=.25f&&v<=8.f;if(ok)rule.ambient=v;}
             else ok=false;
         }
         // the chest proxy orders by the exact native lid vertices: it cannot follow a native-to-native transform

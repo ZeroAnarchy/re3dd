@@ -17,6 +17,8 @@ static BillboardBuild originalBillboard=nullptr;
 static AllocateEffect originalAllocate=nullptr;
 static EffectLoop originalEffectLoop=nullptr;
 static bool installed=false,doorFrameAllowed=false;
+static bool effectTrace=false;      // blood round 2026-11-07: pilot.ini effect_trace=1 (traceEffects)
+static unsigned effectTraceLines=0;
 static int doorLatched=-1; // DO2 id of the running door loop, latched at its first build; -1 = native door
 static unsigned doorCaptureTick=0;
 
@@ -416,9 +418,19 @@ inline bool prepareCasing(void* packetPointer,void* effectPointer,int groupSize,
     }
     return true;
 }
+namespace blood{inline void collapseNativeSpray(void* packets,const void* effect,int count);}
+namespace fire{inline void billboard(void* packets,void* effect,int count,std::uint32_t* orderingTable,int command);}   // fx 2026-11-08 fire
+namespace muzzle{static void collapseNative(void* packets,const void* effect,int count);} // fx 2026-11-08 muzzle
 inline void __cdecl billboardHook(void* packets,void* effect,int groupSize,int count,int projectionH,std::uint32_t* orderingTable,int command,int groupStart){
     std::lock_guard<std::recursive_mutex> guard(mutex);
     originalBillboard(packets,effect,groupSize,count,projectionH,orderingTable,command,groupStart);
+    if(effectTrace&&effectTraceLines<6000&&accessible(effect,0xd4)&&accessible(packets,40)){const auto key=read<std::uint16_t>(effect,0x28);static std::unordered_map<std::uint32_t,unsigned> seen;
+        const auto* p=static_cast<const std::uint8_t*>(packets);const std::uint32_t id=key|(std::uint32_t(command&0xff)<<16)|(std::uint32_t(count&0xff)<<24);
+        if(++seen[id]<=2){++effectTraceLines;log("EFFECT_BILLBOARD key=%04x group=%d count=%d command=%02x H=%d start=%d pkt=%02x%02x%02x%02x %02x%02x%02x%02x uv=%u,%u clut=%04x tpage=%04x",key,groupSize,count,command,projectionH,groupStart,
+            p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[12],p[13],read<std::uint16_t>(p,14),read<std::uint16_t>(p,22));}}
+    try{blood::collapseNativeSpray(packets,effect,count);}catch(...){}
+    try{ensureFrameBuild();fire::billboard(packets,effect,count,orderingTable,command);}catch(...){}   // fx 2026-11-08 fire
+    try{muzzle::collapseNative(packets,effect,count);}catch(...){} // fx 2026-11-08 muzzle
     try{ensureFrameBuild();prepareCasing(packets,effect,groupSize,count,projectionH,orderingTable,command,groupStart);}
     catch(...){log("MODEL_EXTRA casing-prepare-exception; original emission already preserved");}
 }
@@ -536,10 +548,56 @@ inline void updateCases(){
     for(auto& rest:restingCases)if(rest.centre.y<rest.restY){rest.fall+=9.f;rest.centre.y=(std::min)(rest.restY,rest.centre.y+rest.fall);++restingVersion;}
     drawRestingCases();
 }
+// ---------------------------------------------------------------- effect trace (blood round 2026-11-07, pilot.ini effect_trace=1)
+// Every native effect of the pool (96 x 0xD4 at A46720) as it appears and ends, with its key, flags, template and the
+// first bytes; every enemy of the list whose life or routine bytes change. Diagnostic only: reads, never writes.
+struct TracedEffect{bool live=false;std::uint32_t born=0;std::uint16_t key=0;};
+static TracedEffect tracedEffects[96];
+static std::unordered_map<std::uint16_t,unsigned> tracedKeys;
+struct TracedEnemy{std::int16_t life=0;std::uint32_t routine=0;};
+static std::unordered_map<std::uintptr_t,TracedEnemy> tracedEnemies;
+inline void traceEffects(){
+    if(!effectTrace||effectTraceLines>6000)return;
+    const auto serial=re3bridge::BuildSerial();
+    const auto start=gameBase+0x646720;
+    for(unsigned slot=0;slot<96;++slot){
+        const auto* e=reinterpret_cast<const std::uint8_t*>(start+slot*0xd4);if(!accessible(e,0xd4))continue;
+        const auto flags=read<std::uint16_t>(e,0x24);const bool live=(flags&0xa000u)==0xa000u;auto& t=tracedEffects[slot];
+        const auto key=read<std::uint16_t>(e,0x28);
+        if(live&&(!t.live||t.key!=key)){
+            t.live=true;t.born=serial;t.key=key;const unsigned seen=++tracedKeys[key];++effectTraceLines;
+            log("EFFECT_NEW slot=%u serial=%u key=%04x class=%02x flags=%04x b23=%02x tpl=%08x pos=%d,%d,%d floor=%d clut=%04x tpage=%04x b0=%02x%02x%02x%02x seen=%u",
+                slot,serial,key,read<std::uint8_t>(e,0),flags,read<std::uint8_t>(e,0x23),read<std::uint32_t>(e,0xcc),read<std::int32_t>(e,0x48),read<std::int32_t>(e,0x4c),read<std::int32_t>(e,0x50),
+                read<std::int32_t>(e,0x54),read<std::uint16_t>(e,0x44),read<std::uint16_t>(e,0x46),read<std::uint8_t>(e,0xb0),read<std::uint8_t>(e,0xb1),read<std::uint8_t>(e,0xb2),read<std::uint8_t>(e,0xb3),seen);
+            if(seen<=3){char hex[0xd4*2+1];for(unsigned i=0;i<0xd4;++i)std::snprintf(hex+i*2,3,"%02x",e[i]);log("EFFECT_BYTES key=%04x %s",key,hex);
+                const auto tpl=read<const std::uint8_t*>(e,0xcc);if(accessible(tpl,0x40)){char th[0x40*2+1];for(unsigned i=0;i<0x40;++i)std::snprintf(th+i*2,3,"%02x",tpl[i]);log("EFFECT_TEMPLATE key=%04x %s",key,th);}}
+        }else if(!live&&t.live){t.live=false;++effectTraceLines;log("EFFECT_END slot=%u serial=%u key=%04x frames=%u",slot,serial,t.key,serial-t.born);}
+    }
+    const auto end=read<std::uintptr_t>(reinterpret_cast<void*>(gameBase+0x65ce6c));
+    for(std::uintptr_t at=gameBase+0x65cdcc;at<end&&at<gameBase+0x65cdcc+40*4;at+=4){
+        auto* actor=read<std::uint8_t*>(reinterpret_cast<void*>(at));if(!accessible(actor,0x134))continue;
+        const auto life=read<std::int16_t>(actor,0xcc);const auto routine=read<std::uint32_t>(actor,4);
+        auto& t=tracedEnemies[reinterpret_cast<std::uintptr_t>(actor)];
+        if(t.life!=life||t.routine!=routine){++effectTraceLines;
+            log("ENEMY_STATE serial=%u actor=%p model=%02x b8a=%02x life=%d->%d routine=%08x->%08x pos=%d,%d,%d",serial,actor,read<std::uint8_t>(actor,0x4a),read<std::uint8_t>(actor,0x8a),
+                t.life,life,t.routine,routine,read<std::int32_t>(actor,0x34),read<std::int32_t>(actor,0x38),read<std::int32_t>(actor,0x3c));
+            t.life=life;t.routine=routine;}
+    }
+}
+namespace nemesis_cloud{inline bool owns(const void* effect);inline void onShadow(void* shadow);}   // fx 2026-11-08 nemesis-cloud
+#include "blood_fx.h"
+#include "fx_nemesis_cloud.h"   // fx 2026-11-08 nemesis-cloud
+#include "fx_fire.h"   // fx 2026-11-08 fire
+#include "fx_muzzle.h" // fx 2026-11-08 muzzle
 inline void __cdecl effectLoopHook(){
     originalEffectLoop();
     std::lock_guard<std::recursive_mutex> guard(mutex);
+    try{traceEffects();}catch(...){log("EFFECT_TRACE exception");}
     try{updateCases();}catch(...){log("MODEL_EXTRA resting-case-exception; native effects unaffected");}
+    try{blood::update();}catch(...){once("blood-update-exception","HD blood skipped this frame");}
+    try{nemesis_cloud::update();}catch(...){once("nemesis-cloud-update-exception","HD Nemesis cloud skipped this frame");}   // fx 2026-11-08 nemesis-cloud
+    try{fire::update();}catch(...){once("fire-update-exception","HD fire skipped this frame");}   // fx 2026-11-08 fire
+    try{muzzle::update();}catch(...){once("muzzle-update-exception","HD muzzle FX skipped this frame");} // fx 2026-11-08 muzzle
 }
 
 } // namespace re3extra
@@ -564,6 +622,8 @@ static void installExtraModels(){
     originalEffectLoop=reinterpret_cast<EffectLoop>(gameBase+0x58130);
     unsigned done=0;for(;done<6;++done)if(!re3bridge::detail::WritePatch(patches[done],true))break;
     if(done!=6){while(done)re3bridge::detail::WritePatch(patches[--done],false);log("MODEL_EXTRA_INSTALL_FAILED native calls restored");return;}
-    installed=true;log("MODEL_EXTRA_INSTALL_OK doors: any DO2 from props.txt (%zu door keys) + CORE02 cases (pistol/nickel/rifle/shell/blue shell/magnum/gatling, resting max %zu); original simulation retained",
+    muzzle::install(); // fx 2026-11-08 muzzle (before the blood install line: its hooks only need the effect hooks above)
+    installed=true;blood::install();nemesis_cloud::install();/* fx 2026-11-08 nemesis-cloud */log("MODEL_EXTRA_INSTALL_OK doors: any DO2 from props.txt (%zu door keys) + CORE02 cases (pistol/nickel/rifle/shell/blue shell/magnum/gatling, resting max %zu); original simulation retained",
         re3prop::table.doors.size(),kMaxResting);
+    fire::install();   // fx 2026-11-08 fire
 }

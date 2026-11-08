@@ -210,12 +210,24 @@ static bool preparePart(void* object, void* part, uint32_t attributes, const re3
     re3model::NativeLighting lighting;
     if (!re3model::CaptureNativeLighting(lighting, reinterpret_cast<void*>(gameBase + 0x11c358),
             context.gte.data(), context.gte.size(), detail::Read<uint32_t>(part, 0x68))) return false;
+    // props-bright 2026-11-07: opt-in per row ('ambient=g'): the native ambient (GTE BK, +44) x g for this part only. In game
+    // (R10D intro leaves, R218 hose card) the HD part lit by the captured native light is 0.3-0.4 of the native brightness
+    // where only the ambient reaches it (BK 1024 = 0.25 in this formula) while the native part renders about 1.0 x its
+    // texel; parts that face a light match (R100 key). Every row without the option keeps the native light exactly.
+    if (rule->ambient != 1.f)
+        for (auto& a : lighting.ambient) a = std::int32_t((std::max)(-2147483000.0, (std::min)(2147483000.0, double(a) * rule->ambient)));
     projection.shade = re3model::ShadeNativeNccs;
     projection.shadeContext = &lighting; // PrepareFrame bakes colors synchronously.
     // Mesh vertices are fitted to native part-local coordinates (of native_ref; xf carries them onto this variant);
     // the original part matrix supplies all motion (lid hinge, statue arm, gears), with no second animation clock.
     const auto native = re3model::FromNativeMatrix(*world);
     const auto bone = rule->transformed ? re3model::Multiply(native, rule->transform) : native;
+    // crystals round 2026-11-07 (debug_warp only): the part matrix once, for authoring xf rows (scale about a resting point)
+    if (tracing && noteOnce(std::string("matrix:") + where)) {
+        const float* m = native.m;
+        log("MODEL_PROP_MATRIX %s asset=%s native=%.5f,%.5f,%.5f,%.2f,%.5f,%.5f,%.5f,%.2f,%.5f,%.5f,%.5f,%.2f", where, rule->asset.c_str(),
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+    }
     // Opaque props take the GPU path: the static mesh and one bone. The chest (its proxy maps triangles to buckets one by
     // one) and semi-transparent parts (STP passes) stay on the cached CPU geometry below.
     if (!semiTransparent && rule->depth != Depth::Chest) {
@@ -227,8 +239,8 @@ static bool preparePart(void* object, void* part, uint32_t attributes, const re3
             try {
                 noteUse(rule->asset);
                 if (noteOnce(std::string("ok:") + where + rule->asset))
-                    log("MODEL_PROP %s asset=%s identity=%s depth=triangle xf=%u attributes=%x semi=0 abr=0 jobs=%zu triangles=%zu OT=%p gpu", where, rule->asset.c_str(), identityText(identity).c_str(),
-                        rule->transformed ? 1u : 0u, attributes, gpuPlan.jobs.size(), asset->mesh.indices.size() / 3, orderingTable);
+                    log("MODEL_PROP %s asset=%s identity=%s depth=triangle xf=%u ambient=%.2f attributes=%x semi=0 abr=0 jobs=%zu triangles=%zu OT=%p gpu", where, rule->asset.c_str(), identityText(identity).c_str(),
+                        rule->transformed ? 1u : 0u, double(rule->ambient), attributes, gpuPlan.jobs.size(), asset->mesh.indices.size() / 3, orderingTable);
             } catch (...) {}
             return true;
         }
