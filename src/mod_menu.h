@@ -198,6 +198,7 @@ inline void LoadOptions(bool startup) {
     optValue[O_Scheme] = key("control_scheme", 0) ? (key("modern_stick_run", 0) ? 2 : 1) : 0;
     optValue[O_HitSounds] = key("hit_sounds", 1) ? (std::max)(0, (std::min)(200, key("hit_sound_volume", 100))) : 0;
     optValue[O_BloodBright] = (std::max)(40, (std::min)(160, optValue[O_BloodBright]));
+    optValue[O_BloodClear] = (std::max)(0, (std::min)(80, optValue[O_BloodClear]));   // release 1.50: blood_pool_transparency
     optValue[O_VoicePack] = voicePackIndex + 1;   // voice packs 2026-11-11: pilot.ini voice_pack=<folder> -> 0 original / pack number
     // the modules' own startup defaults where the released pilot.ini relies on them
     if (startup) for (int i = 0; i < O_Count; ++i) optRunning[i] = optValue[i];
@@ -223,6 +224,7 @@ inline Str OptBlocked(int id) {
     case O_Shadows: case O_FlashLight: case O_FireLight: case O_Leather: return needModels != S_Count ? needModels : optValue[O_GpuModels] ? S_Count : S_NeedsGpu;
     case O_ShadowEdges: case O_ShadowMasks: return needModels != S_Count ? needModels : !optValue[O_GpuModels] ? S_NeedsGpu : optValue[O_Shadows] ? S_Count : S_NeedsShadows;   // fix 2026-11-11d
     case O_BloodBright: return needModels != S_Count ? needModels : (optValue[O_Blood] || optValue[O_Wounds]) ? S_Count : S_NeedsBlood;   // fx 2026-11-11e: it sets the wounds too
+    case O_BloodClear: return needModels != S_Count ? needModels : optValue[O_Blood] ? S_Count : S_NeedsBlood;   // release 1.50: the HD pools and floor stains only
     case O_MovieFit: return optValue[O_PlayerMovies] ? S_Count : S_NeedsOwnMovies;
     case O_VoicePack: return voicePacks.empty() ? S_NoVoicePacks : S_Count;   // voice packs 2026-11-11: nothing in 3DD-Voice
     default: return S_Count;
@@ -230,7 +232,7 @@ inline Str OptBlocked(int id) {
 }
 inline OptStatus OptState(int id) {
     switch (id) {
-    case O_Enabled: case O_Language: case O_Effects: case O_BloodBright: return OptLive;
+    case O_Enabled: case O_Language: case O_Effects: case O_BloodBright: case O_BloodClear: return OptLive;
     case O_VoicePack: return voiceHooksReady && voiceDubReady ? OptLive : OptUnavailable;   // voice packs 2026-11-11: from the next clip load
     case O_Shadows: case O_FlashLight: case O_FireLight: case O_ShadowEdges: case O_ShadowMasks: case O_Leather: case O_Slime: return modelGpuEnabled ? OptLive : OptUnavailable;   // lighting round 2026-11-10 (GPU path of the HD models)   // r7 fx pages: nothing to install, always live
     case O_Fps60: return modelActive ? OptLive : OptUnavailable;
@@ -273,6 +275,7 @@ inline void OptSet(int id, int v) {
     case O_HitSounds: if (live) { sfxhits::config.enabled = v != 0; if (v) sfxhits::config.volumePct = (std::max)(0, (std::min)(200, v)); applied = true; } break;   // fix 2026-11-11: off / volume in one row
     case O_Wounds: if (live) { modelWoundsEnabled = v != 0; applied = true; } break;
     case O_BloodBright: re3extra::blood::poolBrightness = re3wound::bloodBrightness = float((std::max)(40, (std::min)(160, v))) / 100.f; applied = true; break;   // fx 2026-11-11e: wounds too
+    case O_BloodClear: re3extra::blood::poolOpacity = 1.f - float((std::max)(0, (std::min)(80, v))) / 100.f; applied = true; break;   // release 1.50
     case O_Fire: if (optRunning[id] == 1 && v <= 1) { re3extra::fire::fireMode = unsigned(v); applied = true; } break;
     case O_Scheme: if (onSetControlScheme && onSetModernStickRun) { onSetControlScheme(v ? 1 : 0); if (v) onSetModernStickRun(v == 2 ? 1 : 0); applied = true; } break;   // fix 2026-11-11: one row
     case O_GlockKneel: if (onSetGlockKneelBudget) { onSetGlockKneelBudget(v); applied = true; } break;

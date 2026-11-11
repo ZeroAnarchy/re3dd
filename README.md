@@ -10,7 +10,7 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
 
 | File in the 1.50 release | Size | SHA-256 |
 |---|---|---|
-| `files\d3d9.dll` | 2,246,656 bytes | `2cc902216046c9d750d374738ea278f81f61d0a4e7b8194d20181d8afc7624f1` |
+| `files\d3d9.dll` | 2,248,192 bytes | `4bce15c142a445608097b986891b4063c4966c5266614e3c046030cafe7e72ca` |
 
 ## What the DLL does
 
@@ -69,11 +69,12 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
   (`leather.txt`, pixel shader `LEATHER` in `src/model_gpu.h`) and door handles a metal one
   (`metal.txt`); the purple slime at Nemesis' hand is drawn as a translucent volumetric liquid
   (`src/fx_slime_sim.h` turns the game's own slime sprites into round cones, the `SlimeSource`
-  pixel shader in `src/model_gpu.h` sphere-traces them, `src/fx_nemesis_cloud.h` drives it); fire
-  lights the room and the HD models near it (`src/fx_fire.h`, `src/model_integration.h`); background
-  masks in front of a shadow hide it and a floor drawn as a mask keeps it (`src/model_integration.h`).
-  Switches in `pilot.ini`: `leather_fx`, `nemesis_slime`, `nemesis_slime_brightness`, `fire_light`,
-  `shadow_over_masks`.
+  pixel shader in `src/model_gpu.h` sphere-traces them, `src/fx_nemesis_cloud.h` drives it; off by
+  default); fire lights the room and the HD models near it (`src/fx_fire.h`, `src/model_integration.h`);
+  background masks in front of a shadow hide it and a floor drawn as a mask keeps it
+  (`src/model_integration.h`); the HD blood pools are partly see-through (`src/blood_fx.h`, the opacity
+  of the growth shader in `src/model_shader.h`). Switches in `pilot.ini`: `leather_fx`, `nemesis_slime`,
+  `nemesis_slime_brightness`, `fire_light`, `shadow_over_masks`, `blood_pool_transparency`.
 - It does not use the network, start processes or touch the registry. It writes only inside the
   game folder: `runtime.log`, `crash-dumps\*.dmp` after a crash, a `captures\` folder that
   stays empty unless a QA capture is switched on in `pilot.ini`, and `pilot.ini` / `bio3.ini`
@@ -103,7 +104,7 @@ unit; it includes the other headers. `src\d3d9.def` exports `Direct3DCreate9`.
 
 These sources rebuilt with MSVC 19.51.36252 in the folder the release was built in give a
 file that differs from the released `d3d9.dll` only in the link timestamp (in the PE header
-and in the debug directory). Built from a different folder path, the size stays 2,246,656
+and in the debug directory). Built from a different folder path, the size stays 2,248,192
 bytes, but the compiler lays the code out in a different order, so the bytes and the hash
 differ.
 

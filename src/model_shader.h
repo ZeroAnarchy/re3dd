@@ -201,7 +201,7 @@ class ModelRenderer {
             else {destination=D3DBLEND_ONE;if(abr==2)operation=D3DBLENDOP_REVSUBTRACT;else if(abr==3)constants[2]=0.25f;}
         }
         // blood round 2026-11-07: a reach map in s1 (drawSlice binds the stp texture there)
-        if(selector<0&&(material.flags&GrowthMask)&&material.textures.stp){constants[1]=2;constants[3]=56;}
+        if(selector<0&&(material.flags&GrowthMask)&&material.textures.stp){constants[1]=2;constants[3]=56;constants[2]=growthOpacity;}   // release 1.50: + the pools' opacity
         HRESULT hr=device_->SetPixelShaderConstantF(0,constants,1);if(FAILED(hr))return hr;
         const std::pair<D3DRENDERSTATETYPE,DWORD> states[]={
             {D3DRS_ZENABLE,useDepth?D3DZB_TRUE:D3DZB_FALSE},{D3DRS_ZWRITEENABLE,useDepth&&!blended},
@@ -266,6 +266,7 @@ public:
     // fps60 (2026-10-27): while nonzero, every slice drawn shares this depth epoch (one depth clear for the whole
     // in-between pass, whatever build its frames were uploaded for)
     std::uint64_t passKey=0;
+    float growthOpacity=1.f;   // release 1.50: opacity of GrowthMask materials (the HD blood pools; blood_fx.h poolOpacity, pilot.ini blood_pool_transparency)
     bool leatherOn=true;   // fx 2026-11-11e: Leather materials (pilot.ini leather_fx / F5)
     // false: the previous full D3DSBT_ALL state block per slice (A/B measurement)
     bool lightStateRestore=true;

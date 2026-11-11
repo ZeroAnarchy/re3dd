@@ -24,6 +24,7 @@ constexpr unsigned kPools=4,kSplatMaterial=4,kConeMaterial=5,kPuffMaterial=6,kDr
 constexpr std::size_t kMaxSplats=160,kMaxDrops=220,kMaxBursts=40,kMaxPools=24;
 static bool enabled=true;            // pilot.ini blood_fx
 static unsigned debugSlow=1;         // pilot.ini blood_debug_slow (QA captures): sprays and droplets N times slower
+static float poolOpacity=0.8f;        // release 1.50: 1 - pilot.ini blood_pool_transparency (0..80 %, default 20) / F5 menu: the HD pools (model_shader.h growthOpacity) and the floor stains
 static float poolBrightness=1.f;      // fix 2026-11-11: pilot.ini blood_pool_brightness 40..160 % / F5 menu (red pools and floor stains; fx 2026-11-11e: the sprays and drops of hits too, the wound decals through re3wound::bloodBrightness)
 static int debugPoolBucket=-1;       // pilot.ini blood_debug_pool_bucket (QA): pools in this one OT bucket
 static const std::uint8_t debugShadowKey[4]{};
@@ -333,7 +334,7 @@ inline void drawBlood(){
         const float c=std::cos(sp.angle),s=std::sin(sp.angle),half=sp.size*0.5f;const Vec3 ax{c,0,s},az{-s,0,c};
         Vec3 corner[4];float uv[8];const float tx[4]={0,1,1,0},ty[4]={0,0,1,1};
         for(unsigned k=0;k<4;++k){corner[k]=sp.pos+ax*((tx[k]-0.5f)*2*half)+az*((ty[k]-0.5f)*2*half);uv[k*2]=cell[0]+(cell[2]-cell[0])*tx[k];uv[k*2+1]=cell[1]+(cell[3]-cell[1])*ty[k];}
-        quad(item,corner,uv,withAlpha(poolTint(sp.colour),0.97f));
+        quad(item,corner,uv,withAlpha(poolTint(sp.colour),0.97f*poolOpacity));
         // fix 2026-11-11: sorted by its far edge (was the centre + 60): whatever stands on the far half is drawn after it
         {const auto cz=re3model::TransformPoint(cam,sp.pos);const float reach=half*(std::fabs(cam.m[8]*ax.x+cam.m[10]*ax.z)+std::fabs(cam.m[8]*az.x+cam.m[10]*az.z));
             item.bucket=int((std::max)(1.f,cz.z+(std::max)(60.f,reach+40.f)))>>5;}
@@ -382,6 +383,7 @@ inline void drawBlood(){
             piece.vertices.assign(geometry.vertices.begin()+run.firstVertex,geometry.vertices.begin()+run.firstVertex+run.vertexCount);pieces.push_back(std::move(piece));}
     }
     if(pieces.empty())return;
+    modelRenderer.growthOpacity=poolOpacity;   // release 1.50: only the HD pools are GrowthMask materials
     std::stable_sort(pieces.begin(),pieces.end(),[](const Piece& a,const Piece& b){return a.table!=b.table?a.table<b.table:a.bucket>b.bucket;});
     for(std::size_t i=0;i<pieces.size();){
         std::uint32_t* table=pieces[i].table;re3model::FrameGeometry merged;

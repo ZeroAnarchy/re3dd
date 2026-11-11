@@ -1408,6 +1408,7 @@ static void installGameHooks(){
   if(GetPrivateProfileIntA("pilot","blood_packet_census",0,(root+"\\pilot.ini").c_str())){log("BLOOD_PACKET_CENSUS on");re3bridge::detail::Get().packetCensus=true;}
   re3extra::blood::enabled=GetPrivateProfileIntA("pilot","blood_fx",1,(root+"\\pilot.ini").c_str())!=0;
   re3extra::blood::poolBrightness=re3wound::bloodBrightness=float((std::max)(40,(std::min)(160,(int)GetPrivateProfileIntA("pilot","blood_pool_brightness",100,(root+"\\pilot.ini").c_str()))))/100.f;   // fix 2026-11-11
+  re3extra::blood::poolOpacity=1.f-float((std::max)(0,(std::min)(80,(int)GetPrivateProfileIntA("pilot","blood_pool_transparency",20,(root+"\\pilot.ini").c_str()))))/100.f;   // release 1.50
   re3extra::blood::debugPoolBucket=(int)GetPrivateProfileIntA("pilot","blood_debug_pool_bucket",-1,(root+"\\pilot.ini").c_str());
   re3extra::blood::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","blood_debug_slow",1,(root+"\\pilot.ini").c_str())));
   re3extra::nemesis_cloud::enabled=GetPrivateProfileIntA("pilot","nemesis_cloud_fx",1,(root+"\\pilot.ini").c_str())!=0;re3extra::nemesis_cloud::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","nemesis_cloud_debug_slow",1,(root+"\\pilot.ini").c_str())));   // fx 2026-11-08 nemesis-cloud

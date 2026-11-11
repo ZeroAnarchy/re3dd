@@ -180,7 +180,7 @@ inline void emit(Kind kind,const Vec3& at,const Vec3& from,std::uint32_t light,s
 // arm puffs: pilot.ini nemesis_cloud_arm_purple_density (percent, default 45) scales their opacity, they are 0.8x smaller, and
 // puffs born in the same tick closer than 220 units merge (was 60), so the hand gets separate wisps instead of one thick fog
 // fx5: 0 = the native arm sprites with the 8x texture (armBinding), 1 = the HD gas puffs on them (rounds 2-4)
-// fx 2026-11-11e: 2 = the volumetric slime (the default; pilot.ini nemesis_slime=0 or the F5 row: 0)
+// fx 2026-11-11e: 2 = the volumetric slime (pilot.ini nemesis_slime=1 or the F5 row; off by default since release 1.50: heavy on integrated graphics)
 inline int armMode();
 inline int purpleDensity(){
     static int value=-1;
@@ -207,7 +207,7 @@ inline void emitArm(Kind native,const Vec3& at,std::uint32_t light,std::uintptr_
 }
 // ---------------------------------------------------------------- fx 2026-11-11e: volumetric slime at the living Nemesis' hand
 // User 11.11: "redo the bubbling purple slime out of his right fist after all, it looks too much like a flat picture - work on it
-// properly so it looks cool and volumetric". Mode 2 of the arm effect (the default; pilot.ini nemesis_slime=0 or the F5 row give
+// properly so it looks cool and volumetric". Mode 2 of the arm effect (off by default since release 1.50; pilot.ini nemesis_slime=0 or the F5 row give
 // mode 0, the native sprites at 8x; nemesis_cloud_arm=1 the old gas): every sprite of the living Nemesis' own set (keys 0C00 /
 // 1700 / 0500 / 0D00, palettes 2 and 4) keeps running in the game as before - same birth, flight and life - but is hidden at
 // the renderer copy and drives a piece of one slime body instead (fx_slime_sim.h: bubbles on a core that rides the hand, drops
@@ -320,7 +320,7 @@ inline void slimeUpdate(){
 }
 inline int armMode(){
     if(armModeSetting<0){const std::string ini=root+"\\pilot.ini";
-        armModeSetting=GetPrivateProfileIntA("pilot","nemesis_cloud_arm",0,ini.c_str())==1?1:GetPrivateProfileIntA("pilot","nemesis_slime",1,ini.c_str())!=0?2:0;
+        armModeSetting=GetPrivateProfileIntA("pilot","nemesis_cloud_arm",0,ini.c_str())==1?1:GetPrivateProfileIntA("pilot","nemesis_slime",0,ini.c_str())!=0?2:0;   // release 1.50: off by default (user 11.11, laptop with integrated graphics)
         slimeLiftOn=GetPrivateProfileIntA("pilot","nemesis_slime_lift",1,ini.c_str())!=0;
         slimeBrightness=float((std::max)(30,(std::min)(200,int(GetPrivateProfileIntA("pilot","nemesis_slime_brightness",100,ini.c_str())))))/100.f;
         log("NEMESIS_CLOUD_ARM_MODE %d (%s) slime_brightness=%d%%",armModeSetting,armModeSetting==2?"volumetric slime on the living Nemesis' sprites":armModeSetting?"HD gas on the living Nemesis' sprites":"native sprites, 8x texture native-arm-p5/p9",int(slimeBrightness*100.f+0.5f));}
