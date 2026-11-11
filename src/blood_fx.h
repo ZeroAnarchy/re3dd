@@ -24,7 +24,7 @@ constexpr unsigned kPools=4,kSplatMaterial=4,kConeMaterial=5,kPuffMaterial=6,kDr
 constexpr std::size_t kMaxSplats=160,kMaxDrops=220,kMaxBursts=40,kMaxPools=24;
 static bool enabled=true;            // pilot.ini blood_fx
 static unsigned debugSlow=1;         // pilot.ini blood_debug_slow (QA captures): sprays and droplets N times slower
-static float poolBrightness=1.f;      // fix 2026-11-11: pilot.ini blood_pool_brightness 40..160 % / F5 menu (red pools and floor stains)
+static float poolBrightness=1.f;      // fix 2026-11-11: pilot.ini blood_pool_brightness 40..160 % / F5 menu (red pools and floor stains; fx 2026-11-11e: the sprays and drops of hits too, the wound decals through re3wound::bloodBrightness)
 static int debugPoolBucket=-1;       // pilot.ini blood_debug_pool_bucket (QA): pools in this one OT bucket
 static const std::uint8_t debugShadowKey[4]{};
 static bool shadowHooked=false;
@@ -288,6 +288,8 @@ inline std::uint32_t scaled(std::uint32_t argb,float k){std::uint32_t out=argb&0
 // pools and floor splats: 0.7 of the native light on the floor, at least 0x5c (07.11 v1: at least 0x90 on a lifted red
 // texture read as bright cherry red — "too bright", user QA 07.11)
 inline std::uint32_t poolTint(std::uint32_t argb){return lifted(scaled(argb,0.7f*poolBrightness),unsigned(92.f*poolBrightness+.5f));}   // fix 2026-11-11: x the user's brightness
+// fx 2026-11-11e: sprays and flying drops - the light lifted as before, then x the user's brightness
+inline std::uint32_t sprayTint(std::uint32_t argb,unsigned low){return scaled(lifted(argb,low),poolBrightness);}
 inline std::uint32_t withAlpha(std::uint32_t argb,float alpha){return (argb&0xffffffu)|(std::uint32_t((std::min)(1.f,(std::max)(0.f,alpha))*255.f+.5f)<<24);}
 inline void gridCell(unsigned index,unsigned cols,unsigned rows,float out[4]){const unsigned c=index%cols,r=index/cols;
     // half a texel of the 2048/1024 sheets in so neighbours never bleed under bilinear filtering
@@ -342,8 +344,8 @@ inline void drawBlood(){
         if(b.material==kConeMaterial){bool valid=false;const float angle=screenAngle(right,down,b.dir,valid);
             // the spray's length on screen shrinks when it points along the view
             const float along=valid?(std::max)(0.35f,std::sqrt(1.f-std::pow(re3model::Dot(forward,b.dir),2.f))):0.35f;
-            sprite(item,right,down,b.pos,b.size*along,b.size,valid?angle:b.roll,config.coneAnchor[0],config.coneAnchor[1],cell,withAlpha(lifted(b.colour,0xb0),1.f));}
-        else sprite(item,right,down,b.pos,b.size,b.size,b.roll,0.5f,0.5f,cell,withAlpha(lifted(b.colour,0xb0),1.f));
+            sprite(item,right,down,b.pos,b.size*along,b.size,valid?angle:b.roll,config.coneAnchor[0],config.coneAnchor[1],cell,withAlpha(sprayTint(b.colour,0xb0),1.f));}
+        else sprite(item,right,down,b.pos,b.size,b.size,b.roll,0.5f,0.5f,cell,withAlpha(sprayTint(b.colour,0xb0),1.f));
         // in front of the wound it came out of: drawn after the body's buckets there
         const auto camera=re3model::TransformPoint(cam,b.pos);item.bucket=int((std::max)(1.f,camera.z-260.f))>>5;
         items.push_back(std::move(item));
@@ -353,7 +355,7 @@ inline void drawBlood(){
         bool valid=false;const float moving=screenAngle(right,down,re3model::Normalize(d.vel),valid);
         const float elong=config.dropElong[d.cell];const float angle=elong>1.4f&&valid?moving-config.dropAngle[d.cell]:0.f;
         const float size=d.size*1.5f;
-        sprite(item,right,down,d.pos,size,size,angle,0.5f,0.5f,cell,withAlpha(lifted(d.colour,0xc0),1.f));
+        sprite(item,right,down,d.pos,size,size,angle,0.5f,0.5f,cell,withAlpha(sprayTint(d.colour,0xc0),1.f));
         const auto camera=re3model::TransformPoint(cam,d.pos);item.bucket=int((std::max)(1.f,camera.z-60.f))>>5;
         items.push_back(std::move(item));
     }
@@ -413,7 +415,7 @@ inline void update(){
     packReady=bool(pack());
     for(const auto& s:re3wound::shotBlood)noteHit(s.entry);
     if(InterlockedExchange(&corpseTestRequest,0))corpseShotTest();
-    if(InterlockedExchange(&enemyLifeRequest,0))enemyLifeOne();
+    if(const LONG wanted=InterlockedExchange(&enemyLifeRequest,0))enemyLifeOne(int(wanted));
     if(InterlockedExchange(&bloodTestRequest,0)){
         const auto* player=reinterpret_cast<const std::uint8_t*>(gameBase+0x65cbf4);
         const Vec3 at{float(read<std::int32_t>(player,0x34)),float(read<std::int32_t>(player,0x38)),float(read<std::int32_t>(player,0x3c))};

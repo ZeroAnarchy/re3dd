@@ -138,6 +138,17 @@ inline bool prepareDoor(void* objectPointer,void* packets,void* temporary,bool& 
     // +4C already includes the camera (and the parent chain +78 of multi-part doors); xf maps a native_ref-fitted
     // asset onto this DO2's own mesh record.
     auto cameraMatrix=re3model::FromNativeMatrix(read<re3bridge::Matrix32>(object,0x4c));
+    // door round 2026-11-11: door-fit.txt moves the HD part by d in its native parent frame. +4C = parent . [R | T] with
+    // the part's own local MATRIX at +20 (R from the angles +6C, T at +34), so M . [I | R^T d] = parent . [R | T + d]:
+    // the part keeps turning about its own, moved axis.
+    {const auto local=read<re3bridge::Matrix32>(object,0x20);
+     if(const auto* fit=re3prop::MatchDoorFit(re3prop::doorFits,std::uint32_t(doorLatched),index,local.translation,local.rotation[0])){
+        float d[3];re3prop::DoorFitOffset(*fit,local.translation,d);const auto r=re3model::FromNativeMatrix(local);
+        re3model::Matrix3x4 shift;for(unsigned c=0;c<3;++c)shift.m[c*4+3]=r.m[c]*d[0]+r.m[4+c]*d[1]+r.m[8+c]*d[2];
+        cameraMatrix=re3model::Multiply(cameraMatrix,shift);
+        if(modelObserved.size()<6000&&modelObserved.insert(std::string("door-fit:")+part+":"+std::to_string(fit->line)).second)
+            log("MODEL_DOOR_FIT %s line=%u T=%d,%d,%d m00=%d d=%.1f,%.1f,%.1f",part,fit->line,local.translation[0],local.translation[1],local.translation[2],int(local.rotation[0]),d[0],d[1],d[2]);
+     }}
     if(rule->transformed)cameraMatrix=re3model::Multiply(cameraMatrix,rule->transform);
     re3model::FrameGeometry geometry;std::string error;
     // GPU path: the static mesh with the door's camera matrix as its one bone, in camera space like the CPU path

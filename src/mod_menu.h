@@ -218,9 +218,11 @@ inline Str OptBlocked(int id) {
     case O_WidePeek: return optValue[O_Widescreen] ? S_Count : S_NeedsWide;
     case O_Models: case O_Effects: case O_HitSounds: return hd ? S_Count : S_NeedsHd;
     case O_Fps60: case O_Motion: case O_Face: case O_Blood: case O_Fire: case O_Muzzle: case O_Cloud: case O_GpuModels: return needModels;
+    case O_Slime: return needModels != S_Count ? needModels : optValue[O_GpuModels] ? S_Count : S_NeedsGpu;   // fx 2026-11-11e
     case O_Wounds: return needModels != S_Count ? needModels : models == 2 ? S_Count : S_NeedsEnemies;
-    case O_Shadows: case O_FlashLight: return needModels != S_Count ? needModels : optValue[O_GpuModels] ? S_Count : S_NeedsGpu;
-    case O_BloodBright: return needModels != S_Count ? needModels : optValue[O_Blood] ? S_Count : S_NeedsBlood;
+    case O_Shadows: case O_FlashLight: case O_FireLight: case O_Leather: return needModels != S_Count ? needModels : optValue[O_GpuModels] ? S_Count : S_NeedsGpu;
+    case O_ShadowEdges: case O_ShadowMasks: return needModels != S_Count ? needModels : !optValue[O_GpuModels] ? S_NeedsGpu : optValue[O_Shadows] ? S_Count : S_NeedsShadows;   // fix 2026-11-11d
+    case O_BloodBright: return needModels != S_Count ? needModels : (optValue[O_Blood] || optValue[O_Wounds]) ? S_Count : S_NeedsBlood;   // fx 2026-11-11e: it sets the wounds too
     case O_MovieFit: return optValue[O_PlayerMovies] ? S_Count : S_NeedsOwnMovies;
     case O_VoicePack: return voicePacks.empty() ? S_NoVoicePacks : S_Count;   // voice packs 2026-11-11: nothing in 3DD-Voice
     default: return S_Count;
@@ -230,11 +232,11 @@ inline OptStatus OptState(int id) {
     switch (id) {
     case O_Enabled: case O_Language: case O_Effects: case O_BloodBright: return OptLive;
     case O_VoicePack: return voiceHooksReady && voiceDubReady ? OptLive : OptUnavailable;   // voice packs 2026-11-11: from the next clip load
-    case O_Shadows: case O_FlashLight: return modelGpuEnabled ? OptLive : OptUnavailable;   // lighting round 2026-11-10 (GPU path of the HD models)   // r7 fx pages: nothing to install, always live
+    case O_Shadows: case O_FlashLight: case O_FireLight: case O_ShadowEdges: case O_ShadowMasks: case O_Leather: case O_Slime: return modelGpuEnabled ? OptLive : OptUnavailable;   // lighting round 2026-11-10 (GPU path of the HD models)   // r7 fx pages: nothing to install, always live
     case O_Fps60: return modelActive ? OptLive : OptUnavailable;
     case O_Motion: case O_Wounds: return modelActive ? OptLive : OptRestart;   // fix 2026-11-11: wounds are a live switch (the shot hooks are always there)
     case O_Blood: case O_Muzzle: case O_Cloud: case O_HitSounds: return optRunning[id] ? OptLive : OptRestart;
-    case O_Fire: return optRunning[id] == 1 && optValue[id] <= 1 ? OptLive : OptRestart;
+    case O_Fire: return optRunning[id] == 1 ? OptLive : OptRestart;   // fx 2026-11-11f: Original / HD only (fire_fx=2 is clamped to 1 at load)
     case O_PlayerMovies: return onSetPlayerMovies ? OptLive : OptRestart;   // live = from the next movie (none plays while open)
     case O_MovieFit: return OptLive;   // player_movies.h reads pilot.ini movie_fit at every movie open (merge 2026-11-09)
     case O_Scheme: return onSetControlScheme && onSetModernStickRun ? OptLive : OptRestart;
@@ -262,10 +264,15 @@ inline void OptSet(int id, int v) {
     case O_Cloud: if (live) { re3extra::nemesis_cloud::enabled = v != 0; applied = true; } break;
     case O_Effects: re3extra::fxpages::enabled = v != 0; applied = true; break;
     case O_Shadows: lightShadowMode = (std::max)(0, (std::min)(2, v)); applied = true; break;   // lighting round 2026-11-10
-    case O_FlashLight: lightFlashOn = v != 0; applied = true; break;   // r7 fx pages (fx_pages.h)
+    case O_FlashLight: lightFlashOn = v != 0; applied = true; break;
+    case O_FireLight: lightFireOn = v != 0; applied = true; break;   // fx 2026-11-11f
+    case O_Leather: modelRenderer.leatherOn = v != 0; applied = true; break;   // fx 2026-11-11e
+    case O_Slime: re3extra::nemesis_cloud::armModeSetting = v ? 2 : 0; applied = true; break;   // fx 2026-11-11e (nemesis_cloud_arm=1, the old gas, only from pilot.ini at start)
+    case O_ShadowEdges: lightShadowEdges = (std::max)(0, (std::min)(2, v)); applied = true; break;   // fix 2026-11-11d
+    case O_ShadowMasks: lightMaskShadowOn = v != 0; applied = true; break;   // fix 2026-11-11d   // r7 fx pages (fx_pages.h)
     case O_HitSounds: if (live) { sfxhits::config.enabled = v != 0; if (v) sfxhits::config.volumePct = (std::max)(0, (std::min)(200, v)); applied = true; } break;   // fix 2026-11-11: off / volume in one row
     case O_Wounds: if (live) { modelWoundsEnabled = v != 0; applied = true; } break;
-    case O_BloodBright: re3extra::blood::poolBrightness = float((std::max)(40, (std::min)(160, v))) / 100.f; applied = true; break;
+    case O_BloodBright: re3extra::blood::poolBrightness = re3wound::bloodBrightness = float((std::max)(40, (std::min)(160, v))) / 100.f; applied = true; break;   // fx 2026-11-11e: wounds too
     case O_Fire: if (optRunning[id] == 1 && v <= 1) { re3extra::fire::fireMode = unsigned(v); applied = true; } break;
     case O_Scheme: if (onSetControlScheme && onSetModernStickRun) { onSetControlScheme(v ? 1 : 0); if (v) onSetModernStickRun(v == 2 ? 1 : 0); applied = true; } break;   // fix 2026-11-11: one row
     case O_GlockKneel: if (onSetGlockKneelBudget) { onSetGlockKneelBudget(v); applied = true; } break;

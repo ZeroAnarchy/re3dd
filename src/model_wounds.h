@@ -13,6 +13,9 @@
 // native average so the blood reads on HD textures.
 namespace re3wound {
 using re3model::Vec3;
+// fx 2026-11-11e: the user's blood brightness (pilot.ini blood_pool_brightness 40..160 % / F5 "Brightness of blood"): the wound
+// decals are drawn this much brighter / darker (blood_fx.h does the same with the pools, stains, sprays and drops)
+static float bloodBrightness=1.f;
 // A wound is a patch of the HD body's own triangles around the hit with decal texture coordinates fixed at the hit:
 // the body's skinning carries it and nothing is projected again later.
 struct Wound{

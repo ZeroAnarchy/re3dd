@@ -39,11 +39,12 @@
 // row 0 quads 0-9, room 20-28 and 0C, matched by header clut/tpage + palette row and checked against the bank's quad
 // rects and their layout hash) gets model-pack/fx-fire/pages/<page>.png (mip-mapped: the sprites are drawn from 0.3x to
 // 5x their texel size). Item twinkle 0905 (core 05 row 1) and the core 05 stars (quads 10+) stay native.
-// fire_fx=2 = the round-2 HD clips below (billboard()), fire_fx=0 = native.
+// fire_fx=0 = native. fx 2026-11-11f: fire_fx=2 (the round-2 HD clips below, billboard()) is removed - it reads as 1; the
+// native fire effects of either mode get light round them (namespace light below).
 namespace fire {
 using re3model::Vec3;
-static bool enabled=true;              // round-2 HD clips active (pilot.ini fire_fx=2; fx5: no longer the default)
-static unsigned fireMode=1;            // fx5 2026-11-08 fire: pilot.ini fire_fx 0 native, 1 HD pages of the native frames (default), 2 round-2 clips
+static bool enabled=false;             // round-2 HD clips: fx 2026-11-11f never on (the variant is removed; the code below it stays unreachable)
+static unsigned fireMode=1;            // fx5 2026-11-08 fire: pilot.ini fire_fx 0 native, 1 HD pages of the native frames (default; fx 2026-11-11f: 2 reads as 1)
 static unsigned debugSlow=1;           // pilot.ini fire_debug_slow (QA): HD flame motion N times slower
 static unsigned burstCount=0,burstEvery=6;   // pilot.ini fire_debug_burst=N (QA): every fire-test also takes N frame captures, one per fire_debug_burst_every ticks
 static std::string testSteps="fxl";    // pilot.ini fire_test_steps: what each fire-test does in turn (b = captures only, f = fireball+smoke, x = explosion 0C, l = flame 0024)
@@ -380,9 +381,142 @@ inline void buildFlame(std::vector<Quad>& quads,FlameState& f,const Footprint& f
         sprite(quads,kSparks,s.cell,false,s.pos,s.size*3.f,s.size*3.f,0.5f,0.5f,roll,scaledArgb(0xffffffffu,shade,fade));}
 }
 
+// ---------------------------------------------------------------- fx 2026-11-11f: the light of fire
+// User 11.11.2026: "can the fire in the game have volume effects like our muzzle flashes?" (lighting round 2026-11-10: halo
+// sprites round the flash, a point light on the HD models, a light on the floor). The fire sprites themselves stay as they
+// are (the native effects on their HD pages, or native with fire_fx=0); every fire effect the game draws in a build is noted
+// at its packet (billboard(): the native screen quad and its ordering-table slot) and gets
+//  - a halo: two soft additive light sprites round it (wide and dim, small and warm) as one job in the ordering table at
+//    the packet's own slot, so masks and nearer models cover it as they cover the flame; sized by the sprite, flickering
+//    per flame; flames that stand side by side share the light instead of adding up (each one's halo is divided by how
+//    many overlap it);
+//  - light on the HD models and on the floor: the sources of a build are gathered into a few clusters (model_integration.h
+//    lightFires); a draw takes the strongest of the muzzle flash and these at its actor's place (lightAttach), the floor
+//    under a cluster gets the pool renderLighting draws for a flash. Flames flicker; fireballs and explosions follow their
+//    frames (bright at birth, gone before the smoke).
+// Fire = room banks 20..28 (flames), 0C (explosions), core 03 palette 3 (fireballs), core 05 palette 0 quads 0-9 (burning
+// bodies); never a subtracted sprite (smoke) and never the item twinkle. pilot.ini fire_light=0|1 (F5 row "Light of fire"),
+// fire_light_gain (percent). F8 (original) and fire_light=0: nothing. The halo needs HD mode only; the light on the models
+// and the floor needs the GPU path of the models (as the flash light).
+namespace light {
+struct Tuning{
+    float haloWide=2.2f,haloCore=1.1f,haloWideBurst=1.7f;   // half sizes of the two halo sprites, in half sides of the native sprite (wide: flame / fireball)
+    float haloGain=0.38f,haloBurst=0.60f;               // halo intensity of a flame / of a fireball or explosion at its birth
+    // the two sprites' colours at intensity 1: little green and blue, so flames at full red keep their orange under the halo
+    float wide[3]={0.40f,0.20f,0.07f},core[3]={0.26f,0.11f,0.03f};
+    float crowd=0.85f;                                  // a flame overlapped by n others: its halo / n^crowd
+    float merge=1500.f;                                 // sources nearer than this are one light (world units; a character is ~3000 tall)
+    float flamePower=0.70f,flameHalf=2.0f;              // light of a cluster of flames: flamePower x E / (E + flameHalf), E = their sizes in 1000 units
+    float burstPower=1.30f,burstHalf=0.6f,burstReach=4.f;   // the same for fireballs / explosions; in the reach they count burstReach times
+    float flameColour[3]={1.f,0.60f,0.26f},burstColour[3]={1.f,0.76f,0.46f};
+    float radius=2600.f,radiusGrow=1000.f,radiusMax=8000.f;   // reach of a light: radius + radiusGrow x sqrt(E)
+    float pool=0.55f;                                   // the share of a light that goes into the floor pool
+    float burstFade=1.3f;                               // a fireball's light over its frames: (1 - progress)^burstFade
+    unsigned clusters=8;
+};
+static Tuning tuning;
+// x, y, half: the sprite on the target (pixels, without the viewport's corner); centre / base / size: in the world
+struct Source{std::uint32_t* table=nullptr;unsigned bucket=0;float x=0,y=0,half=0;Vec3 centre{},base{};float size=0,level=1,flicker=1;bool burst=false;};
+static std::vector<Source> sources;static std::uint32_t sourcesSerial=~0u;
+static std::uint64_t haloJobs=0,haloQuads=0,sourcesSeen=0,lightsMade=0;static double statMs=0;static unsigned statFrames=0,sourceLines=0,clusterLines=0;
+// billboard(): a native effect has just been drawn as one FT4
+inline void note(std::uint8_t* packet,const std::uint8_t* effect,std::uint32_t* orderingTable){
+    if(!lightFireOn||!inPool(effect))return;
+    const auto key=read<std::uint16_t>(effect,0x28);const std::uint8_t bankId=std::uint8_t(key&0xff);
+    if(!(bankId>=0x20&&bankId<=0x28)&&bankId!=0x0c&&bankId!=0x03&&bankId!=0x05)return;
+    const unsigned palette=read<std::uint8_t>(effect,0xb3)&15u,abr=(read<std::uint16_t>(effect,0x46)>>5)&3u;
+    if(abr==2||(bankId==3&&palette!=3))return;   // subtracted = smoke; core 03: the fire palette only
+    unsigned bucket=0;if(!headBucket(packet,orderingTable,bucket))return;
+    if(read<std::uint16_t>(packet,14)!=read<std::uint16_t>(effect,0x44))return;   // the effect's own texture
+    Bank bank;if(!cachedBank(bankId,bank))return;
+    const int q=quadOf(bank,packet);
+    if(!config.loaded)loadConfig();
+    if(bankId==5&&(q<0||unsigned(q)>=config.bank05Quads||!(config.bank05Palettes&(1u<<palette))))return;   // item twinkle, stars
+    if(!snapCamera())return;
+    const auto serial=re3bridge::BuildSerial();if(sourcesSerial!=serial){sourcesSerial=serial;sources.clear();}
+    if(sources.size()>=96)return;
+    const auto address=reinterpret_cast<std::uintptr_t>(effect);
+    const auto generationAt=effectGeneration.find(address);const std::uint64_t generation=generationAt==effectGeneration.end()?0:generationAt->second;
+    Footprint fp;if(!footprint(packet,effect,fp,&smoothOf(address,generation)))return;
+    const auto& pr=camera.base;
+    const auto c=re3model::TransformPoint(pr.camera,fp.centre);if(c.z<64.f)return;
+    Source s;s.table=orderingTable;s.bucket=bucket;s.centre=fp.centre;s.base=fp.base;s.size=(std::max)(fp.w,fp.h);
+    s.x=(c.x*pr.h/c.z+pr.offsetX)*pr.scaleX+pr.pixelOffsetX;s.y=(c.y*pr.h/c.z+pr.offsetY)*pr.scaleY+pr.pixelOffsetY;
+    s.half=0.5f*(std::max)(fp.w*pr.scaleX,fp.h*pr.scaleY)*pr.h/c.z;
+    // the native packet colour (808080 = 1) keeps the native fades; a quarter-added billow (abr 3) is that much dimmer
+    s.level=(std::min)(1.f,float((std::max)((std::max)(packet[4],packet[5]),packet[6]))/128.f)*(abr==3?0.45f:1.f);
+    s.burst=bankId==0x0c||bankId==0x03;
+    if(s.burst){const float progress=q<0||bank.quads<2?0.5f:float(q)/float(bank.quads-1);s.level*=std::pow((std::max)(0.f,1.f-progress),tuning.burstFade);}
+    else{   // three slow waves, each flame in its own step
+        const std::uint32_t seed=hashU(std::uint32_t(address)*2654435761u^std::uint32_t(generation)*40503u);const float t=float(tick);
+        s.flicker=1.f+0.16f*std::sin(0.45f*t+float(seed&1023u)*0.00614f)+0.10f*std::sin(1.05f*t+float((seed>>10)&1023u)*0.00614f)+0.06f*std::sin(1.9f*t+float((seed>>20)&1023u)*0.00614f);}
+    sources.push_back(s);++sourcesSeen;
+    if(sourceLines<10){++sourceLines;log("FIRE_LIGHT_SOURCE key=%04x palette=%u abr=%u quad=%d/%u bucket=%u target=%.0f,%.0f half=%.0f world=%.0f,%.0f,%.0f base_y=%.0f size=%.0f level=%.2f %s",
+        key,palette,abr,q,bank.quads,bucket,s.x,s.y,s.half,s.centre.x,s.centre.y,s.centre.z,s.base.y,s.size,s.level,s.burst?"fireball":"flame");}
+}
+// update(): the effect loop of this build is through: the halo jobs into the ordering tables, the clusters to the lighting
+inline void commit(){
+    const auto serial=re3bridge::BuildSerial();
+    if(sourcesSerial!=serial)sources.clear();
+    if(!lightFireOn||!active()){sources.clear();lightFires.clear();return;}
+    if(sources.empty()){lightFires.clear();lightFiresSerial=serial;return;}
+    LARGE_INTEGER started,ended,frequency;QueryPerformanceCounter(&started);
+    const Tuning& t=tuning;const float gain=lightFireGain;
+    // ---- halos: one job per ordering-table slot
+    struct Slot{std::uint32_t* table;unsigned bucket;std::shared_ptr<std::vector<re3gpu::GlowQuad>> quads;};
+    std::vector<Slot> slots;
+    for(const auto& s:sources){
+        float crowd=0;   // itself (1) and what overlaps it
+        for(const auto& o:sources){const float dx=o.x-s.x,dy=o.y-s.y,reach=(o.half+s.half)*t.haloWide;crowd+=(std::max)(0.f,1.f-std::sqrt(dx*dx+dy*dy)/(std::max)(1.f,reach));}
+        const float e=(s.burst?t.haloBurst:t.haloGain)*s.level*s.flicker*gain/std::pow((std::max)(1.f,crowd),t.crowd);
+        if(e<0.004f||s.half<1.f)continue;
+        Slot* slot=nullptr;for(auto& k:slots)if(k.table==s.table&&k.bucket==s.bucket){slot=&k;break;}
+        if(!slot){slots.push_back({s.table,s.bucket,std::make_shared<std::vector<re3gpu::GlowQuad>>()});slot=&slots.back();}
+        slot->quads->push_back({s.x,s.y,(s.burst?t.haloWideBurst:t.haloWide)*s.half,{t.wide[0]*e,t.wide[1]*e,t.wide[2]*e}});
+        slot->quads->push_back({s.x,s.y,t.haloCore*s.half,{t.core[0]*e,t.core[1]*e,t.core[2]*e}});
+    }
+    for(auto& k:slots){
+        if(!writablePage(k.table,1024*4))continue;
+        auto job=std::make_shared<ModelJob>();job->glow=k.quads;job->glowGain=1.f;job->glowFresh=false;job->name="fire-glow";
+        std::vector<re3bridge::BucketJob> jobs;jobs.push_back({std::uint16_t((std::min)(1023u,(std::max)(1u,k.bucket))),reinterpret_cast<std::uintptr_t>(job.get()),job});
+        if(re3bridge::EnqueueBatch(k.table,1024,jobs)){++haloJobs;haloQuads+=k.quads->size();}else once("fire-glow-enqueue","fire light sprites skipped for one ordering table");
+    }
+    // ---- lights: the largest sources first, each joins the cluster it stands in or starts one
+    struct Cluster{Vec3 pos{},base{};float flame=0,burst=0,weight=0,flicker=0;unsigned count=0;};
+    std::vector<Cluster> clusters;std::vector<std::size_t> order(sources.size());for(std::size_t i=0;i<order.size();++i)order[i]=i;
+    std::sort(order.begin(),order.end(),[&](std::size_t a,std::size_t b){return sources[a].size*sources[a].level>sources[b].size*sources[b].level;});
+    for(const std::size_t i:order){const Source& s=sources[i];const float e=s.size/1000.f*s.level;if(!(e>0.001f))continue;
+        Cluster* into=nullptr,*nearest=nullptr;float best=t.merge*t.merge,nearestD=1.e30f;
+        for(auto& c:clusters){const Vec3 d=c.pos*(1.f/c.weight)-s.centre;const float dd=re3model::Dot(d,d);if(dd<best){best=dd;into=&c;}if(dd<nearestD){nearestD=dd;nearest=&c;}}
+        if(!into){if(clusters.size()<t.clusters){clusters.push_back({});into=&clusters.back();}else into=nearest;}
+        if(!into)continue;
+        into->pos=into->pos+s.centre*e;into->base=into->base+s.base*e;into->weight+=e;into->flicker+=s.flicker*e;(s.burst?into->burst:into->flame)+=e;++into->count;}
+    const auto* player=reinterpret_cast<const std::uint8_t*>(gameBase+0x65cbf4);
+    const bool playerKnown=accessible(player,0x40);const float playerY=playerKnown?float(read<std::int32_t>(player,0x38)):0.f;
+    lightFires.clear();
+    for(const auto& c:clusters){if(!(c.weight>0))continue;const float inv=1.f/c.weight;
+        const float flame=t.flamePower*c.flame/(c.flame+t.flameHalf)*(c.flicker*inv),burst=t.burstPower*c.burst/(c.burst+t.burstHalf);
+        LightFire l;l.position=c.pos*inv;l.radius=(std::min)(t.radiusMax,t.radius+t.radiusGrow*std::sqrt(c.flame+t.burstReach*c.burst));l.pool=t.pool;
+        for(unsigned k=0;k<3;++k)l.colour[k]=(flame*t.flameColour[k]+burst*t.burstColour[k])*gain;
+        if(l.colour[0]<0.01f)continue;
+        // the floor it lights: under the sprite, or the player's floor when the fire hangs within a storey above it
+        l.floorY=(c.base*inv).y;if(playerKnown&&playerY-l.floorY>-300.f&&playerY-l.floorY<2500.f)l.floorY=playerY;
+        lightFires.push_back(l);++lightsMade;
+        if(clusterLines<8){++clusterLines;log("FIRE_LIGHT_CLUSTER sources=%u at=%.0f,%.0f,%.0f floor_y=%.0f radius=%.0f colour=%.2f,%.2f,%.2f flame_e=%.2f burst_e=%.2f (player y=%.0f)",c.count,l.position.x,l.position.y,l.position.z,l.floorY,l.radius,
+            l.colour[0],l.colour[1],l.colour[2],c.flame,c.burst,playerY);}}
+    lightFiresSerial=serial;
+    QueryPerformanceCounter(&ended);QueryPerformanceFrequency(&frequency);statMs+=double(ended.QuadPart-started.QuadPart)*1000.0/double(frequency.QuadPart);
+    if(++statFrames>=600){log("FIRE_LIGHT_STATS frames=600 cpu_ms_per_frame=%.4f sources_per_frame=%.1f halo_jobs_per_frame=%.1f halo_quads_per_frame=%.1f lights_per_frame=%.2f model_draws_lit=%llu gain=%.2f light_sprite_jobs_drawn=%llu (with the in-between frames and muzzle flashes) ms_per_job=%.4f",statMs/600.0,double(sourcesSeen)/600.0,
+        double(haloJobs)/600.0,double(haloQuads)/600.0,double(lightsMade)/600.0,(unsigned long long)lightFireDraws,gain,(unsigned long long)lightGlowJobs,lightGlowJobs?lightGlowJobMs/double(lightGlowJobs):0.0);
+        statMs=0;statFrames=0;sourcesSeen=haloJobs=haloQuads=lightsMade=0;lightFireDraws=0;lightGlowJobs=0;lightGlowJobMs=0;}
+}
+} // namespace light
+
 // ---------------------------------------------------------------- the billboard hook (one line in re3extra::billboardHook)
 inline void billboard(void* packets,void* effectPointer,int count,std::uint32_t* orderingTable,int command){
-    if(!enabled||count!=1||(command&0xfc)!=0x2c||!active())return;
+    if(count!=1||(command&0xfc)!=0x2c||!active())return;
+    try{light::note(static_cast<std::uint8_t*>(packets),static_cast<const std::uint8_t*>(effectPointer),orderingTable);}catch(...){}   // fx 2026-11-11f: the light of fire
+    if(!enabled)return;   // fx 2026-11-11f: never set any more (the round-2 HD clips below are out of the menu and of pilot.ini)
     // perf (v5): no VirtualQuery per sprite (Accessible) for pointers the native emitter itself just used: the effect
     // must be a slot of the pool, the packet/OT are checked once per build (otChecked)
     const auto* effect=static_cast<const std::uint8_t*>(effectPointer);if(!inPool(effect))return;
@@ -580,6 +714,7 @@ inline void update(){
         if(fireRoom!=~0u&&pages::pageQuadsRoom)log("FIRE_PAGES room=%x quads=%llu (native fire drawn from the HD pages)",fireRoom,(unsigned long long)pages::pageQuadsRoom);   // fx5
         pages::pageQuadsRoom=0;
         fireRoom=room;flames.clear();smooths.clear();
+        light::sources.clear();light::sourceLines=0;light::clusterLines=0;   // fx 2026-11-11f (the lights themselves: lightBeginBuild)
     }
     ++tick;
     if(++spentFrames>=600){if(replaced)log("FIRE_PERF frames=600 cpu_ms_per_frame=%.3f replaced=%llu refused=%llu",spentMs/600.0,(unsigned long long)replaced,(unsigned long long)refused);spentMs=0;spentFrames=0;}
@@ -587,21 +722,25 @@ inline void update(){
     const bool test=InterlockedExchange(&fireTestRequest,0)!=0;   // proxy.cpp: pilot.command fire-test (debug_warp=1)
     // the test spawns the native effects with fire_fx=0 too (the native "before" captures of the same plan)
     if(test)try{spawnTest();}catch(...){log("FIRE_TEST exception");}
+    try{light::commit();}catch(...){once("fire-light-exception","the light of fire skipped a frame");}   // fx 2026-11-11f
+    if((tick&31)==0)for(auto it=smooths.begin();it!=smooths.end();){if(tick-it->second.seen>60)it=smooths.erase(it);else ++it;}
     if(!enabled)return;
     // flames not drawn for a second (effect gone, slot reused) are forgotten
     if((tick&31)==0)for(auto it=flames.begin();it!=flames.end();){if(tick-it->second.lastTick>60)it=flames.erase(it);else ++it;}
-    if((tick&31)==0)for(auto it=smooths.begin();it!=smooths.end();){if(tick-it->second.seen>60)it=smooths.erase(it);else ++it;}
 }
 inline void install(){
     const std::string ini=root+"\\pilot.ini";
     // fx5 2026-11-08 fire: 0 native, 1 HD pages of the native frames (default), 2 round-2 HD clips
-    fireMode=(std::min)(2u,unsigned(GetPrivateProfileIntA("pilot","fire_fx",1,ini.c_str())));enabled=fireMode==2;
+    // fx 2026-11-11f (user 11.11: "the third fire variant, HD clips, has to go altogether, it did not work out; leave only the
+    // plain HD"): fire_fx=2 reads as 1 and nothing sets `enabled` any more - billboard()'s clip path and its pack files
+    // (model-pack/fx-fire sheets, fire.txt sheet rows) are dead
+    const unsigned fireSetting=unsigned(GetPrivateProfileIntA("pilot","fire_fx",1,ini.c_str()));fireMode=fireSetting?1u:0u;enabled=false;
+    if(fireSetting>1)log("FIRE_FX pilot.ini fire_fx=%u read as 1 (the HD clips variant is removed)",fireSetting);
     debugSlow=(std::max)(1u,(std::min)(16u,unsigned(GetPrivateProfileIntA("pilot","fire_debug_slow",1,ini.c_str()))));
     burstCount=(std::min)(200u,unsigned(GetPrivateProfileIntA("pilot","fire_debug_burst",0,ini.c_str())));
     burstEvery=(std::max)(1u,(std::min)(60u,unsigned(GetPrivateProfileIntA("pilot","fire_debug_burst_every",6,ini.c_str()))));
     {char steps[32]{};GetPrivateProfileStringA("pilot","fire_test_steps","fxl",steps,sizeof(steps),ini.c_str());testSteps=steps;}
     if(fireMode==0){log("FIRE_FX disabled by pilot.ini fire_fx=0 (native fire)");return;}
-    if(fireMode==1){log("FIRE_FX_INSTALL_OK round 5 (fire_fx=1): native fire effects, HD texture pages of their native frames (%u pages: room banks 20-28/0C, core 03 rows 3/1/0, core 05 row 0 quads 0-9)",unsigned(sizeof(pages::kPages)/sizeof(pages::kPages[0])));return;}
-    log("FIRE_FX_INSTALL_OK round 2 (fire_fx=2): continuous flame loops + glow; flames (room banks 20-28, core bank 05), billows (core bank 03: fireballs palette 3, smoke palettes 0/1), explosions (bank 0C) replaced at their packets");
+    log("FIRE_FX_INSTALL_OK round 5 (fire_fx=1): native fire effects, HD texture pages of their native frames (%u pages: room banks 20-28/0C, core 03 rows 3/1/0, core 05 row 0 quads 0-9)",unsigned(sizeof(pages::kPages)/sizeof(pages::kPages[0])));
 }
 } // namespace fire

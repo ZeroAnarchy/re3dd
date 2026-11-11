@@ -59,7 +59,10 @@ static void glockDiagnostic();
 static const void* glockCombatFor(const void* combat,int weapon); // glock18c.h: AUTO hit table for the enemy shot test
 static void glockShotDone(int weapon,const uint8_t* actor,int lifeBefore);
 static int modelStateRestoreRequest=-1; // diagnostic A/B: 1 light per-slice state restore, 0 full state block
+static int lightFireRequest=-1;   // fx 2026-11-11f: pilot.command light-fire-0|1 (taken at the next build)
 static int lightShadowRequest=-1,lightFlashRequest=-1;   // pilot.command light-shadows-0|1|2, light-flash-0|1 (lighting round 2026-11-10, taken at the next build)
+static int lightShadowEdges=0;   // fix 2026-11-11d3: always 0 (the F5 row is hidden, pilot.ini not read); fix 2026-11-11d: pilot.ini shadow_edges (F5 row; pilot.command light-edges-0|1|2): 0 endless floor, 1 cut at the floor edge, 2 + the cut part on walls
+static bool lightMaskShadowOn=true;   // fix 2026-11-11c: floor shadow over masks behind a caster (pilot.ini shadow_over_masks, pilot.command light-mask-0|1)
 static int modelGpuRequestCommand=-1,modelGpuPixelRequestCommand=-1;   // pilot.command gpu-on/off, gpu-pixel/vertex (taken at the next build)
 static bool modelDetachFix=true;   // QA (pilot.command detach-off / detach-on, debug_warp): torn-off enemy parts as in 1.19 for before/after
 static bool modelKitEnabled=true;  // QA (pilot.command kit-off / kit-on, debug_warp): model-pack/kit.txt parts drawn or the whole bodies
@@ -122,6 +125,7 @@ static void gpuTraceNote(const char* text);
 static void keepDeviceHooks();
 static void gpuFlushRect(float left,float top,float right,float bottom);
 static void lightAfterBackground(void* renderer);   // model_integration.h, lighting round 2026-11-10: shadows right after the room background
+static void lightShadowOverMask(float left,float top,float right,float bottom,IDirect3DTexture9* cover,float u0,float v0,float u1,float v1,int maskDepth);   // model_integration.h, fix 2026-11-11c: the floor shadow over a mask behind a caster
 static size_t gpuPendingCount();
 static void beforeModelDeviceReset();
 static void afterModelDeviceReset(HRESULT);
@@ -767,6 +771,8 @@ static void diagnosticControl(){
     // QA (fix 2026-10-31): load one model-pack asset at the next build without its actor (texture loads under debug_va_squeeze_mb)
     if(command=="model-load"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){std::string asset;in>>asset;
       if(!asset.empty()&&asset.size()<=64&&asset.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-")==std::string::npos)modelLoadRequest=asset;}
+    // fix 2026-11-11d (shadow QA, debug_warp only): "at x y z yaw floor" -> diagnostic_actor_control.h (R100/R101 placement)
+    if(command=="at"){std::string rest;std::getline(in,rest);const auto first=rest.find_first_not_of(' ');nativeDiagnosticRequest="at "+(first==std::string::npos?std::string():rest.substr(first));}
     in.close();DeleteFileA(path.c_str());}
   if(command=="original"){desiredEnabled=false;log("COMMAND original queued");}
   if(command=="remastered"){desiredEnabled=true;log("COMMAND remastered queued");}
@@ -775,6 +781,9 @@ static void diagnosticControl(){
   if(command=="gpu-on"||command=="gpu-off"){modelGpuRequestCommand=command=="gpu-on";log("COMMAND %s queued",command.c_str());}
   if(command.size()==15&&command.compare(0,14,"light-shadows-")==0&&command[14]>='0'&&command[14]<='2'){lightShadowRequest=command[14]-'0';log("COMMAND %s queued",command.c_str());}
   if(command=="light-flash-0"||command=="light-flash-1"){lightFlashRequest=command[12]-'0';log("COMMAND %s queued",command.c_str());}
+  if(command=="light-fire-0"||command=="light-fire-1"){lightFireRequest=command[11]-'0';log("COMMAND %s queued",command.c_str());}   // fx 2026-11-11f
+  if(command=="light-mask-0"||command=="light-mask-1"){lightMaskShadowOn=command[11]=='1';log("COMMAND %s applied",command.c_str());}   // fix 2026-11-11c
+  if(command=="light-edges-0"||command=="light-edges-1"||command=="light-edges-2"){lightShadowEdges=command[12]-'0';log("COMMAND %s applied",command.c_str());}   // fix 2026-11-11d
   if(command=="gpu-pixel"||command=="gpu-vertex"){modelGpuPixelRequestCommand=command=="gpu-pixel";log("COMMAND %s queued",command.c_str());}
   // QA (dxt round 2026-11-02): scenes again from .r3tx on the GPU / decoded on the CPU / from the PNGs (backgroundHook applies it)
   if((command=="pack-dxt"||command=="pack-cpu"||command=="pack-png")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
@@ -783,7 +792,9 @@ static void diagnosticControl(){
   // QA (round models-2026-11-02): torn-off enemy parts drawn as in 1.19 (detach-off: the crawler's strip) / as pieces
   if((command=="detach-on"||command=="detach-off")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){modelDetachFix=command=="detach-on";log("COMMAND %s",command.c_str());}
   if(command=="blood-corpse-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&corpseTestRequest,1);log("COMMAND %s",command.c_str());}
-  if(command=="enemy-life-1"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&enemyLifeRequest,1);log("COMMAND %s",command.c_str());}
+  // fx 2026-11-11f: enemy-life-<n> (Nemesis' first fall comes when his life crosses 300, not when it ends)
+  if(command.rfind("enemy-life-",0)==0&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){const int value=atoi(command.c_str()+11);
+    InterlockedExchange(&enemyLifeRequest,value>0&&value<30000?value:1);log("COMMAND %s",command.c_str());}
   if(command=="blood-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&bloodTestRequest,1);log("COMMAND %s",command.c_str());}
   if(command=="options-open"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){re3options::RequestFromCommand();log("COMMAND %s",command.c_str());} // fx 2026-11-08 options
   if(command=="menu-open"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){re3menu::RequestOpen("command");log("COMMAND %s",command.c_str());} // controls round 2026-11-09 menu (QA)
@@ -1163,13 +1174,19 @@ static void __fastcall spriteHook(void* renderer,void*,void* packet,unsigned tpa
   auto maskBase=*(uintptr_t*)(gameBase+0x64baa8);auto rdt=*(uint8_t**)(gameBase+0x65c898);
   // Dispatch receives a copied packet. Compare its immutable payload with the
   // actual current room's two original24-byte packets per tile, ignoring links.
-  bool nativeMask=false;if(nativeFrameRemastered&&rdt&&maskBase&&tpage==0x95&&*(uint16_t*)(p+14)==0x7800){for(unsigned i=0;i<(unsigned)rdt[0]*2;i++)if(memcmp(p+4,(void*)(maskBase+i*24+8),16)==0){nativeMask=true;break;}}
+  // fix 2026-11-11c: maskIndex = the tile (two packets per tile, 431430/4314B0); its ordering-table slot is the u16 array at
+  // A4BAA4 (4315F0 links the tile into main OT slot z, or z>=0x400: zone OT z>>10, slot z&0x3FF)
+  int maskIndex=-1;
+  bool nativeMask=false;if(nativeFrameRemastered&&rdt&&maskBase&&tpage==0x95&&*(uint16_t*)(p+14)==0x7800){for(unsigned i=0;i<(unsigned)rdt[0]*2;i++)if(memcmp(p+4,(void*)(maskBase+i*24+8),16)==0){nativeMask=true;maskIndex=int(i/2);break;}}
   if(nativeFrameRemastered&&tpage==0x95&&*(uint16_t*)(p+14)==0x7800){++maskSeenTotal;if(nativeMask)++maskTableTotal;}
   if(nativeFrameRemastered&&nativeMask&&tpage==0x95&&*(uint16_t*)(p+14)==0x7800){
     auto scene=getScene(currentScene);if(scene){flushGame(renderer);D3DVIEWPORT9 vp;gameDevice->GetViewport(&vp);
       float sx=vp.Width/320.f,sy=vp.Height/240.f;float x=*(int16_t*)(p+8),y=*(int16_t*)(p+10),w=*(int16_t*)(p+16),h=*(int16_t*)(p+18);
       const float k=scene->maskScale,u=p[12]*k,v=p[13]*k;
-      if(drawQuad(scene->mask,x*sx,y*sy,(x+w)*sx,(y+h)*sy,u/scene->atlasWidth,v/scene->atlasHeight,(u+w*k)/scene->atlasWidth,(v+h*k)/scene->atlasHeight,true,nullptr,nullptr,nullptr,nullptr,nullptr,scene->maskAlpha!=nullptr,scene->maskAlpha)){maskDraws++;maskDrawnTotal++;return;}
+      if(drawQuad(scene->mask,x*sx,y*sy,(x+w)*sx,(y+h)*sy,u/scene->atlasWidth,v/scene->atlasHeight,(u+w*k)/scene->atlasWidth,(v+h*k)/scene->atlasHeight,true,nullptr,nullptr,nullptr,nullptr,nullptr,scene->maskAlpha!=nullptr,scene->maskAlpha)){maskDraws++;maskDrawnTotal++;
+        // fix 2026-11-11c: a tile behind an HD actor gets the floor shadow again (the mask repaints the background without it)
+        int maskDepth=-1;if(auto depths=*(const uint16_t**)(gameBase+0x64baa4);depths&&maskIndex>=0&&maskIndex<int(rdt[0]))maskDepth=depths[maskIndex];
+        lightShadowOverMask(x*sx,y*sy,(x+w)*sx,(y+h)*sy,scene->maskAlpha?scene->maskAlpha:scene->mask,u/scene->atlasWidth,v/scene->atlasHeight,(u+w*k)/scene->atlasWidth,(v+h*k)/scene->atlasHeight,maskDepth);return;}
     }
   }if(drawUiItemGrid(renderer,p,tpage)||drawUiPacket(renderer,p,tpage,UiSprite))return;originalSprite(renderer,packet,tpage);
 }
@@ -1390,7 +1407,7 @@ static void installGameHooks(){
   re3extra::effectTrace=GetPrivateProfileIntA("pilot","effect_trace",0,(root+"\\pilot.ini").c_str())!=0;if(re3extra::effectTrace){log("EFFECT_TRACE on");re3bridge::detail::Get().packetTrace=true;}
   if(GetPrivateProfileIntA("pilot","blood_packet_census",0,(root+"\\pilot.ini").c_str())){log("BLOOD_PACKET_CENSUS on");re3bridge::detail::Get().packetCensus=true;}
   re3extra::blood::enabled=GetPrivateProfileIntA("pilot","blood_fx",1,(root+"\\pilot.ini").c_str())!=0;
-  re3extra::blood::poolBrightness=float((std::max)(40,(std::min)(160,(int)GetPrivateProfileIntA("pilot","blood_pool_brightness",100,(root+"\\pilot.ini").c_str()))))/100.f;   // fix 2026-11-11
+  re3extra::blood::poolBrightness=re3wound::bloodBrightness=float((std::max)(40,(std::min)(160,(int)GetPrivateProfileIntA("pilot","blood_pool_brightness",100,(root+"\\pilot.ini").c_str()))))/100.f;   // fix 2026-11-11
   re3extra::blood::debugPoolBucket=(int)GetPrivateProfileIntA("pilot","blood_debug_pool_bucket",-1,(root+"\\pilot.ini").c_str());
   re3extra::blood::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","blood_debug_slow",1,(root+"\\pilot.ini").c_str())));
   re3extra::nemesis_cloud::enabled=GetPrivateProfileIntA("pilot","nemesis_cloud_fx",1,(root+"\\pilot.ini").c_str())!=0;re3extra::nemesis_cloud::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","nemesis_cloud_debug_slow",1,(root+"\\pilot.ini").c_str())));   // fx 2026-11-08 nemesis-cloud

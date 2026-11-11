@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <exception>
 #include <limits>
 #include <string>
@@ -164,13 +165,25 @@ static_assert(sizeof(Header)==64&&sizeof(Vertex)==48&&sizeof(Matrix3x4)==48&&siz
 // Gem (crystals round 2026-11-07, runtime only, set from the pack's gem.txt with AlphaBlend): the GPU path draws the material
 // as a translucent faceted crystal (model_gpu.h GEM shaders: far facets first, then near ones; native light + self-lit share,
 // specular of the native lights, fresnel rim). The CPU path draws it as a plain AlphaBlend material.
-enum MaterialFlags : std::uint32_t { TwoSided=1, AlphaCutout=2, AlphaBlend=4, Unlit=8, GrowthMask=16, Gem=32 };
+// Metal (door round 2026-11-11, runtime only, set from the pack's metal.txt): the GPU path draws the material with the
+// METAL shaders (model_gpu.h: a small diffuse share, Blinn-Phong highlights of the native lights tinted by the albedo, a
+// sky/floor environment reflection that follows the scene's light level, Schlick fresnel). The CPU path draws it plain.
+// Leather (fx 2026-11-11e, runtime only, set from the pack's leather.txt): the GPU path draws the material with the
+// LEATHER shaders (model_gpu.h: the usual lit material, and where the albedo is dark and colourless a bumped normal, two
+// highlight lobes of the native lights and a fresnel reflection). The CPU path draws it plain.
+enum MaterialFlags : std::uint32_t { TwoSided=1, AlphaCutout=2, AlphaBlend=4, Unlit=8, GrowthMask=16, Gem=32, Metal=64, Leather=128 };
 // gem.txt values of a Gem material, in the order of the GEM pixel shader constants c14..c18 (model_gpu.h).
 constexpr unsigned kGemParams=20;
+// metal.txt values of a Metal material, in the order of the METAL pixel shader constants c14..c17 (model_gpu.h).
+constexpr unsigned kMetalParams=16;
+// leather.txt values of a Leather material, in the order of the LEATHER pixel shader constants c21..c26 (model_gpu.h).
+constexpr unsigned kLeatherParams=24;
 struct Material {
     std::uint32_t firstIndex=0,indexCount=0,flags=0,baseColorRGBA=0xffffffffu;
     std::string albedoPath,stpPath;
     float gem[kGemParams]{};
+    float metal[kMetalParams]{};
+    float leather[kLeatherParams]{};
 };
 struct Mesh {
     std::vector<Vertex> vertices;
@@ -217,6 +230,63 @@ inline std::size_t CanonicalSkinVertex(const Mesh& mesh,std::size_t index){
     return representative<index&&SameCanonicalVertex(mesh.vertices[index],mesh.vertices[representative])?representative:index;
 }
 
+// metal.txt of a pack (door round 2026-11-11; keys and ranges: model_integration.h loadMetalMaterials). false = no file.
+inline bool LoadMetalParams(const std::string& path,float (&p)[kMetalParams],std::vector<unsigned>& only){
+    std::ifstream text(path);if(!text)return false;
+    const float defaults[kMetalParams]={0.55f,1.4f,40.f,0.6f, 1.f,0.97f,0.92f,0.6f, 0.10f,0.09f,0.08f,0.9f, 1.f,1.f,0.05f,0.6f};
+    std::memcpy(p,defaults,sizeof(defaults));only.clear();std::string line;
+    while(std::getline(text,line)){
+        const auto hash=line.find('#');if(hash!=std::string::npos)line.resize(hash);
+        std::istringstream f(line);std::string key;if(!(f>>key))continue;float a=0,b=0,c=0;
+        auto set=[&](unsigned i,float lo,float hi){if(f>>a)p[i]=(std::min)(hi,(std::max)(lo,a));};
+        auto rgb=[&](unsigned i){if(f>>a>>b>>c){p[i]=(std::min)(4.f,(std::max)(0.f,a));p[i+1]=(std::min)(4.f,(std::max)(0.f,b));p[i+2]=(std::min)(4.f,(std::max)(0.f,c));}};
+        if(key=="diffuse")set(0,0,2);else if(key=="specular")set(1,0,8);else if(key=="shininess")set(2,1,512);else if(key=="reflect")set(3,0,4);
+        else if(key=="sky")rgb(4);else if(key=="fresnel")set(7,0,1);else if(key=="floor")rgb(8);else if(key=="tint")set(11,0,1);
+        else if(key=="gain")set(12,0,4);else if(key=="follow")set(13,0,1);else if(key=="horizon")set(14,-1,1);else if(key=="softness")set(15,0.05f,2);
+        else if(key=="materials"){unsigned m=0;while(f>>m)only.push_back(m);}
+    }
+    return true;
+}
+// Marks the materials (all, or `only`) Metal with these values; Gem / blended / growth materials stay as they are.
+inline unsigned ApplyMetal(Mesh& mesh,const float (&p)[kMetalParams],const std::vector<unsigned>& only){
+    unsigned count=0;
+    for(std::size_t m=0;m<mesh.materials.size();++m){
+        if(!only.empty()&&std::find(only.begin(),only.end(),unsigned(m))==only.end())continue;
+        auto& material=mesh.materials[m];if(material.flags&(Gem|AlphaBlend|GrowthMask))continue;
+        material.flags|=Metal;std::memcpy(material.metal,p,sizeof(p));++count;
+    }
+    return count;
+}
+// leather.txt of a pack (fx 2026-11-11e; keys: model_integration.h loadLeatherMaterials). false = no file.
+inline bool LoadLeatherParams(const std::string& path,float (&p)[kLeatherParams],std::vector<unsigned>& only){
+    std::ifstream text(path);if(!text)return false;
+    const float defaults[kLeatherParams]={0.8f,1.6f,22.f,0.35f, 110.f,0.05f,0.9f,0.85f, 14.f,0.9f,1.f/(14.f*9.f),0.25f, 0.05f,0.11f,0.36f,0.50f, 0.62f,0.66f,0.74f,2.2f, 0.06f,0.055f,0.05f,0.05f};
+    std::memcpy(p,defaults,sizeof(defaults));only.clear();std::string line;
+    while(std::getline(text,line)){
+        const auto hash=line.find('#');if(hash!=std::string::npos)line.resize(hash);
+        std::istringstream f(line);std::string key;if(!(f>>key))continue;float a=0,b=0,c=0;
+        auto set=[&](unsigned i,float lo,float hi){if(f>>a)p[i]=(std::min)(hi,(std::max)(lo,a));};
+        auto pair=[&](unsigned i){if(f>>a>>b){p[i]=(std::min)(1.f,(std::max)(0.f,a));p[i+1]=(std::min)(1.5f,(std::max)(p[i]+0.005f,b));}};
+        auto rgb=[&](unsigned i){if(f>>a>>b>>c){p[i]=(std::min)(4.f,(std::max)(0.f,a));p[i+1]=(std::min)(4.f,(std::max)(0.f,b));p[i+2]=(std::min)(4.f,(std::max)(0.f,c));}};
+        if(key=="diffuse")set(0,0,2);else if(key=="specular")set(1,0,16);else if(key=="gloss")set(2,1,512);else if(key=="coat")set(3,0,1);
+        else if(key=="coat_gloss")set(4,1,1024);else if(key=="fresnel")set(5,0,1);else if(key=="rim")set(6,0,8);else if(key=="follow")set(7,0,1);
+        else if(key=="folds")set(8,0,200);else if(key=="grain")set(9,0,20);else if(key=="grain_size"){if(f>>a)p[10]=1.f/(14.f*(std::min)(200.f,(std::max)(0.5f,a)));}else if(key=="grain_gloss")set(11,0,0.9f);
+        else if(key=="mask_chroma")pair(12);else if(key=="mask_luma")pair(14);
+        else if(key=="sky")rgb(16);else if(key=="buckle")set(19,0,16);else if(key=="floor")rgb(20);else if(key=="fill")set(23,0,2);
+        else if(key=="materials"){unsigned m=0;while(f>>m)only.push_back(m);}
+    }
+    return true;
+}
+// Marks the materials (all, or `only`) Leather with these values; Gem / Metal / blended / growth materials stay as they are.
+inline unsigned ApplyLeather(Mesh& mesh,const float (&p)[kLeatherParams],const std::vector<unsigned>& only){
+    unsigned count=0;
+    for(std::size_t m=0;m<mesh.materials.size();++m){
+        if(!only.empty()&&std::find(only.begin(),only.end(),unsigned(m))==only.end())continue;
+        auto& material=mesh.materials[m];if(material.flags&(Gem|Metal|AlphaBlend|GrowthMask|Unlit))continue;
+        material.flags|=Leather;std::memcpy(material.leather,p,sizeof(p));++count;
+    }
+    return count;
+}
 inline bool ValidRelativePath(const std::string& path){
     if(path.empty()||path.size()>4096||path[0]=='/'||path[0]=='\\'||path.find(':')!=std::string::npos)return false;
     std::string component;

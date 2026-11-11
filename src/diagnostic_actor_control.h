@@ -56,6 +56,10 @@ static void diagnosticActorControl(){
     }else if(command=="at-door"){
         if(room==0){x=-20002;z=-20665;yaw=0;}
         else{x=-20410;y=-7200;z=-11275;yaw=0x800;floor=4;}
+    }else if(command.rfind("at ",0)==0){   // fix 2026-11-11d (shadow QA): "at x y z yaw floor", R100/R101 as the rows above
+        int yawIn=0,floorIn=0;
+        if(sscanf_s(command.c_str()+3,"%d %d %d %d %d",&x,&y,&z,&yawIn,&floorIn)!=5||floorIn<0||floorIn>15||x<-32768||x>32767||y<-32768||y>32767||z<-32768||z>32767){log("DIAGNOSTIC_POSITION rejected '%s'",command.c_str());return;}
+        yaw=int16_t(yawIn&0xfff);floor=uint8_t(floorIn);
     }else return;
     Write<int16_t>(player,0x6c,0);Write<int16_t>(player,0x6e,yaw);Write<int16_t>(player,0x70,0);
     const int xyz[3]={x,y,z};for(unsigned i=0;i<3;i++){Write<int32_t>(player,0x34+i*4,xyz[i]);Write<int16_t>(player,0x40+i*2,int16_t(xyz[i]));}

@@ -3,6 +3,7 @@
 #include "model_hand_ik.h"
 #include "model_wounds.h"
 #include "model_fps60.h"
+#include "fx_slime_sim.h"   // fx 2026-11-11e: the slime simulation (pure; model_gpu.h is in by now)
 #include <map>
 #include <tuple>
 
@@ -56,6 +57,7 @@ struct ModelJob {
     std::string captureTag;
     // lighting round 2026-11-10: light sprites of a muzzle flash (drawLightJob); fresh = the flash is born in this build
     std::shared_ptr<std::vector<re3gpu::GlowQuad>> glow;float glowGain=1.f;bool glowFresh=false;
+    std::shared_ptr<re3gpu::SlimeBatch> slime;   // fx 2026-11-11e: a slime body (drawSlimeJob)
 };
 static re3model::ModelRenderer modelRenderer;
 // fps60 (model_fps60.h): F7 / pilot.ini fps60; recording happens in the actor prepare (fps60Actor), the in-between pass
@@ -409,6 +411,7 @@ struct ActorRuntime{
     uint32_t damageColour[32]{};std::vector<uint32_t> kitTint[3];const void* kitTintAsset[3]{};uint32_t kitTintParts[3]{};
     // blood round 2026-11-07: the actor's native light on a surface facing the camera (sprays) and facing up (its pool)
     uint32_t bloodLightView=0xff808080u,bloodLightUp=0xff808080u;
+    re3model::NativeLighting nativeLight;bool nativeLightKnown=false;   // fx 2026-11-11e: the whole native light of its last build (the slime at Nemesis' hand)
 };
 static std::unordered_map<void*,ActorRuntime> actorRuntime;
 static ActorRuntime& actorState(void* actor,uint8_t modelId,const std::string& asset,uint32_t serial){
@@ -798,6 +801,42 @@ static void loadGemMaterials(ModelAsset& asset,const std::string& directory){
     log("MODEL_GEM %s materials=%zu opacity=%.2f glow=%.2f specular=%.2f shininess=%.0f rim=%.2f inner=%.2f/%.2f gain=%.2f saturation=%.2f fresnel=%.1f facets=%.2f sheen=%.2f glint=%.2f/%.2f",asset.id.c_str(),
         asset.mesh.materials.size(),p[0],p[1],p[2],p[3],p[7],p[9],p[12],p[10],p[11],p[13],p[15],p[16],p[18],p[19]);
 }
+// metal.txt (door round 2026-11-11): 'key value...' lines; the pack's materials (all, or the 'materials' list) become Metal
+// materials (model_runtime.h Metal, model_gpu.h METAL shaders, GPU path only). Packs without the file are unchanged.
+// Order = pixel shader constants c14..c17:
+//   c14 diffuse (share of the albedo lit by the native light), specular (highlights of the native lights), shininess,
+//       reflect (sky/floor environment reflection)
+//   c15 sky r g b (environment above, x the scene light level), fresnel (extra reflection at grazing angles, Schlick)
+//   c16 floor r g b (environment below), tint (1 = highlights and reflection take the albedo colour, 0 = white)
+//   c17 gain (albedo x), follow (how much the environment follows the scene light: 1 dark rooms give dark metal),
+//       horizon (height of the sky/floor change, -1..1), softness (width of that change)
+static void loadMetalMaterials(ModelAsset& asset,const std::string& directory){
+    float p[re3model::kMetalParams];std::vector<unsigned> only;
+    if(!re3model::LoadMetalParams(directory+"metal.txt",p,only))return;
+    const unsigned count=re3model::ApplyMetal(asset.mesh,p,only);
+    log("MODEL_METAL %s materials=%u/%zu diffuse=%.2f specular=%.2f shininess=%.0f reflect=%.2f fresnel=%.2f tint=%.2f gain=%.2f follow=%.2f",asset.id.c_str(),
+        count,asset.mesh.materials.size(),p[0],p[1],p[2],p[3],p[7],p[11],p[12],p[13]);
+}
+// leather.txt (fx 2026-11-11e): 'key value...' lines; the pack's materials (all, or the 'materials' list) become Leather
+// materials (model_runtime.h Leather, model_gpu.h LEATHER shaders, GPU path only). Packs without the file are unchanged.
+// Order = pixel shader constants c21..c26:
+//   c21 diffuse (x the albedo where it is leather), specular (highlights of the native lights), gloss (exponent of the wide
+//       sheen), coat (share of the tight highlight)
+//   c22 coat_gloss (its exponent), fresnel (reflection of a surface facing the eye, Schlick f0), rim (sky/floor reflection
+//       toward grazing angles), follow (how much that reflection follows the scene light: 1 dark rooms give dark leather)
+//   c23 folds (height of the folds painted into the albedo, world units per unit of brightness), grain (height of the
+//       grain, world units), grain_size (one grain cell, world units), grain_gloss (gloss change from groove to cell)
+//   c24 mask_chroma lo hi (albedo colourfulness: leather below lo, none above hi), mask_luma lo hi (albedo brightness:
+//       leather below lo, none above hi; colourless and brighter than hi = a buckle)
+//   c25 sky r g b (environment above), buckle (highlights of the metal bits, x)
+//   c26 floor r g b (environment below), fill (sheen of a surface facing the eye, x the scene light)
+static void loadLeatherMaterials(ModelAsset& asset,const std::string& directory){
+    float p[re3model::kLeatherParams];std::vector<unsigned> only;
+    if(!re3model::LoadLeatherParams(directory+"leather.txt",p,only))return;
+    const unsigned count=re3model::ApplyLeather(asset.mesh,p,only);
+    log("MODEL_LEATHER %s materials=%u/%zu diffuse=%.2f specular=%.2f gloss=%.0f coat=%.2f/%.0f fresnel=%.3f rim=%.2f follow=%.2f folds=%.1f grain=%.2f mask=%.2f-%.2f/%.2f-%.2f buckle=%.1f fill=%.2f",asset.id.c_str(),
+        count,asset.mesh.materials.size(),p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[12],p[13],p[14],p[15],p[19],p[23]);
+}
 static std::shared_ptr<ModelAsset> getModel(const std::string& id){
     static IDirect3DDevice9* assetDevice=nullptr;if(assetDevice!=gameDevice){modelAssets.clear();modelObserved.clear();modelFatal=false;assetDevice=gameDevice;}
     auto found=modelAssets.find(id);
@@ -811,6 +850,8 @@ static std::shared_ptr<ModelAsset> getModel(const std::string& id){
     {std::string note;auto& light=re3model::AssetLightingStore()[id];light=re3model::LoadAssetLighting(root+"/"+relative,asset->mesh,note);asset->bytes+=light.occlusion.size();
         if(!note.empty())log("%s %s",note.c_str(),id.c_str());}
     loadGemMaterials(*asset,root+"/"+relative);
+    loadMetalMaterials(*asset,root+"/"+relative);   // door round 2026-11-11
+    loadLeatherMaterials(*asset,root+"/"+relative);   // fx 2026-11-11e
     {std::ifstream wrap(root+"/"+relative+"wrap.r3wrap",std::ios::binary);
         if(wrap){
             static_assert(sizeof(ModelAsset::WrapEntry)==44,"R3WRAP1 entry layout");
@@ -1177,7 +1218,19 @@ static re3gpu::Stats gpuStats;
 // flash_light_gain (percent, 100). Needs the GPU path (gpu_models=1); the CPU path draws as before.
 // Log: MODEL_LIGHTING ... (targets, shader failures), LIGHT_FX_STATS per 300 builds, LIGHT_ACTOR once per actor and room.
 static int lightShadowMode=2;
+// fix 2026-11-11d: lightShadowEdges (pilot.ini shadow_edges) is defined in proxy.cpp next to lightMaskShadowOn
 static bool lightFlashOn=true;
+// fx 2026-11-11f (user 11.11: "can the fire have volume effects like our muzzle flashes?"): the fire sources of the last effect
+// loop as lights (fx_fire.h light::commit: a few clusters of flames / fireballs, this tick's flicker already in the colour).
+// A draw takes ONE point light (model_gpu.h flashData): the strongest of the muzzle flash and these at its actor's place.
+// pilot.ini fire_light=0|1 (F5 row "Light of fire"), fire_light_gain (percent, 100); pilot.command light-fire-0|1.
+static bool lightFireOn=true;static float lightFireGain=1.f;
+struct LightFire{re3model::Vec3 position{};float radius=0,colour[3]{},floorY=0,pool=0;};   // colour x power; pool = the share of it on the floor
+static std::vector<LightFire> lightFires;static uint32_t lightFiresSerial=0;   // and the build of the effect loop that made them
+static re3model::Vec3 lightActorCentre{};static bool lightActorCentreKnown=false;   // the actor being prepared: all its draws take the same light
+static uint64_t lightFireDraws=0;
+static double lightGlowJobMs=0;static uint64_t lightGlowJobs=0;   // drawLightJob: time and count of light sprite jobs (flash and fire)
+static bool lightFiresNow(uint32_t serial){return lightFireOn&&!lightFires.empty()&&serial-lightFiresSerial<=3u;}
 static re3gpu::LightingConfig lightConfig;
 static float lightMinElevation=52.f,lightStrengthScale=1.f,lightFlashGain=1.f;
 static std::shared_ptr<re3gpu::ShadowGroup> gpuShadowGroup;            // while an actor's jobs are prepared
@@ -1188,7 +1241,7 @@ static std::unordered_map<const void*,uint32_t> lightHdShadow;         // actor 
 struct LightFlash{re3model::Vec3 position{};float radius=0,power=0,floorY=0;uint32_t build=0,born=0;};
 static std::vector<LightFlash> lightFlashes;
 static uint64_t lightGroupsMade=0,lightFramesDrawn=0,lightFlashCount=0,lightNativeHidden=0;
-static bool lightOn(){return (lightShadowMode>0||lightFlashOn)&&modelGpuEnabled&&!modelParity;}
+static bool lightOn(){return (lightShadowMode>0||lightFlashOn||lightFireOn)&&modelGpuEnabled&&!modelParity;}
 // The colour of a native shadow object (+0x1C): black-ish = the shadow of a living actor; the two stains are a corpse's blood
 // pool (808010) and the downed Nemesis' purple puddle (10AF10), which other modules replace.
 static bool lightPlainShadow(uint32_t colour){colour&=0xffffffu;return colour!=0x808010u&&colour!=0x10af10u;}
@@ -1218,6 +1271,10 @@ static std::shared_ptr<re3gpu::ShadowFrame> lightFrame(uint32_t serial,bool crea
             flash.position[0]=f.position.x;flash.position[1]=f.position.y;flash.position[2]=f.position.z;flash.radius=f.radius;flash.floorY=f.floorY;flash.fresh=age==0;
             for(unsigned k=0;k<3;++k)flash.colour[k]=kLightFlashColour[k]*f.power*kLightFlashCurve[age]*lightFlashGain;
             made->flashes.push_back(flash);}}
+    // fx 2026-11-11f: the floor under a fire: the same pool as a flash's, at its share of the light
+    if(lightFiresNow(serial))for(const auto& f:lightFires){if(!(f.pool>0)||made->flashes.size()>=24)continue;re3gpu::FlashLight fire;
+        fire.position[0]=f.position.x;fire.position[1]=f.position.y;fire.position[2]=f.position.z;fire.radius=f.radius;fire.floorY=f.floorY;fire.fresh=false;
+        for(unsigned k=0;k<3;++k)fire.colour[k]=f.colour[k]*f.pool;made->flashes.push_back(fire);}
     lightFrames.push_back(made);return made;
 }
 // The shadow group of an actor about to be prepared: its key light, the floor under it and its bounds. Null: no shadow
@@ -1271,17 +1328,231 @@ static void lightCommitActor(const std::shared_ptr<re3gpu::ShadowGroup>& group){
     built->groups.push_back(group);lightHdShadow[group->actor]=serial;
     if(!built->camera)for(const auto& weak:group->casters){const auto d=weak.lock();if(!d||d->skin==re3gpu::Skin::World)continue;
         built->camera=true;std::memcpy(built->cameraRows,d->cameraRows,sizeof(built->cameraRows));std::memcpy(built->origin,d->origin,sizeof(built->origin));
+        built->bucketDepth=d->bucketDepth;   // fix 2026-11-11c
         built->h=d->h;built->offsetX=d->offsetX;built->offsetY=d->offsetY;built->pixelOffsetX=d->pixelOffsetX;built->pixelOffsetY=d->pixelOffsetY;break;}
 }
 // A draw of the actor being prepared: caster and receiver of its group, lit by the flash of this build.
-static void lightAttach(const std::shared_ptr<re3gpu::Draw>& draw,bool caster){
+// fx 2026-11-11f: how bright a point light is at a place: its peak colour x the shader's fall-off (1 - d / radius)^2
+static float lightLevelAt(const re3gpu::FlashLight& l,const re3model::Vec3& at){
+    const float dx=l.position[0]-at.x,dy=l.position[1]-at.y,dz=l.position[2]-at.z,a=(std::max)(0.f,1.f-std::sqrt(dx*dx+dy*dy+dz*dz)/(std::max)(1.f,l.radius));
+    return (std::max)(l.colour[0],(std::max)(l.colour[1],l.colour[2]))*a*a;
+}
+// own: the middle of this draw (for draws outside an actor: props, doors)
+static void lightAttach(const std::shared_ptr<re3gpu::Draw>& draw,bool caster,const re3model::Vec3* own=nullptr){
     if(gpuShadowGroup){draw->shadow=gpuShadowGroup;if(caster)gpuShadowGroup->casters.push_back(draw);}
-    if(lightFlashOn&&!lightFlashes.empty()){re3gpu::FlashLight flash;
-        if(lightFlashNow(re3bridge::BuildSerial(),flash)){for(unsigned k=0;k<3;++k){draw->flash[k]=flash.position[k];draw->flash[4+k]=flash.colour[k];}draw->flash[3]=1.f/(std::max)(1.f,flash.radius);}}
+    const uint32_t serial=re3bridge::BuildSerial();
+    re3gpu::FlashLight light;bool have=false;
+    if(lightFlashOn&&!lightFlashes.empty())have=lightFlashNow(serial,light);
+    // fx 2026-11-11f: a fire that is stronger at this actor than the flash (or there is no flash): its light instead
+    const re3model::Vec3* at=lightActorCentreKnown?&lightActorCentre:own;
+    if(at&&lightFiresNow(serial)&&lightOn()){
+        float level=have?lightLevelAt(light,*at):0.f;bool fire=false;
+        for(const auto& f:lightFires){re3gpu::FlashLight l;l.position[0]=f.position.x;l.position[1]=f.position.y;l.position[2]=f.position.z;l.radius=f.radius;l.floorY=f.floorY;
+            for(unsigned k=0;k<3;++k)l.colour[k]=f.colour[k];
+            const float v=lightLevelAt(l,*at);if(v>level&&v>0.004f){light=l;level=v;have=true;fire=true;}}
+        if(fire)++lightFireDraws;
+        // the floor light needs the frame of this build and its camera, also when no actor casts a shadow
+        if(draw->skin!=re3gpu::Skin::World){auto built=lightFrame(serial,true);
+            if(!built->camera){built->camera=true;std::memcpy(built->cameraRows,draw->cameraRows,sizeof(built->cameraRows));std::memcpy(built->origin,draw->origin,sizeof(built->origin));
+                built->bucketDepth=draw->bucketDepth;built->h=draw->h;built->offsetX=draw->offsetX;built->offsetY=draw->offsetY;built->pixelOffsetX=draw->pixelOffsetX;built->pixelOffsetY=draw->pixelOffsetY;}}
+    }
+    if(have){for(unsigned k=0;k<3;++k){draw->flash[k]=light.position[k];draw->flash[4+k]=light.colour[k];}draw->flash[3]=1.f/(std::max)(1.f,light.radius);}
+}
+// fix 2026-11-11c (user 11.11, warehouse R10102 catwalk: the floor shadow is missing in rectangles near the railing, cut off
+// along straight lines): the shadow is multiplied into the picture right after the background, and a mask tile drawn later
+// repaints that background without it - right for a tile in front of the shadowed floor, wrong for one that is not: the
+// catwalk floor of R10102 is itself masks (strips that hide Jill when she walks UNDER the catwalk) whose slots lie behind
+// the catwalk surface they show. So the shadow goes over such a tile again (ModelRenderer::shadowOverMask) when
+//  - the tile's own ordering-table slot (proxy.cpp: the u16 array at A4BAA4) is not nearer than the floor plane of a caster
+//    at the nearest corner / centre of the tile (slot = camera depth / bucketDepth of the frame, kLightMaskSlack slots of
+//    slack); a zone-OT tile (slot >= 0x400) lies beyond the main room and always takes it. R10102 (RDT camera 2): catwalk
+//    strips slot 185..650, each behind the floor of its own rows; railing / stairs in front (slot 135 against floor
+//    200..300) keep cutting it;
+//  - without a slot (tile not identified): it is drawn before that caster's first HD job (the ordering table runs far to
+//    near), as the native blob shadow sorted at the actor's depth.
+// Only inside the screen rectangle that caster's shadow can reach (the floor square of fadeEnd round its feet + the blur).
+struct LightMaskCaster {const re3gpu::ShadowGroup* group=nullptr;float rect[4]{},floorY=0;bool reached=false;};
+struct LightMaskCamera {bool valid=false;float inverse[9]{},eye[3]{},origin[3]{},h=256,offsetX=160,offsetY=120,pixelOffsetX=0,pixelOffsetY=0,bucketDepth=0;D3DVIEWPORT9 vp{};};
+static std::vector<LightMaskCaster> lightMaskCasters;static LightMaskCamera lightMaskCamera;static unsigned lightMaskFrame=~0u;static bool lightMaskValid=false;
+static std::uint64_t lightMaskTiles=0,lightMaskFailures=0,lightMaskInFront=0;
+static constexpr int kLightMaskSlack=8;   // ordering-table slots (~32 world units each at zsf3 341)
+static void lightMaskReached(const re3gpu::ShadowGroup* group){
+    if(!lightMaskValid||!group)return;for(auto& c:lightMaskCasters)if(c.group==group)c.reached=true;
+}
+// camera of the frame for the per-pixel floor depth: the inverse of the 3x3 rows and the eye (world - origin)
+static void lightMaskSetCamera(const re3gpu::ShadowFrame& f,const D3DVIEWPORT9& vp){
+    auto& m=lightMaskCamera;m.valid=false;if(!f.camera||!(f.bucketDepth>0.f)||!(f.h>0.f))return;
+    const float* r=f.cameraRows;
+    const float a=r[0],b=r[1],c=r[2],d=r[4],e=r[5],g=r[6],h=r[8],i=r[9],k=r[10];
+    const float A=e*k-g*i,B=-(d*k-g*h),C=d*i-e*h,det=a*A+b*B+c*C;if(!std::isfinite(det)||std::abs(det)<1e-12f)return;
+    const float s=1.f/det;
+    const float inv[9]={A*s,-(b*k-c*i)*s,(b*g-c*e)*s, B*s,(a*k-c*h)*s,-(a*g-c*d)*s, C*s,-(a*i-b*h)*s,(a*e-b*d)*s};
+    std::memcpy(m.inverse,inv,sizeof(inv));
+    for(unsigned row=0;row<3;++row)m.eye[row]=-(inv[row*3]*r[3]+inv[row*3+1]*r[7]+inv[row*3+2]*r[11]);
+    std::memcpy(m.origin,f.origin,sizeof(m.origin));m.h=f.h;m.offsetX=f.offsetX;m.offsetY=f.offsetY;m.pixelOffsetX=f.pixelOffsetX;m.pixelOffsetY=f.pixelOffsetY;
+    m.bucketDepth=f.bucketDepth;m.vp=vp;m.valid=true;
+}
+// camera depth of the floor plane y = floorY (world) seen at a target pixel; <= 0: that pixel looks above the horizon
+static float lightMaskFloorDepth(float sx,float sy,float floorY){
+    const auto& m=lightMaskCamera;const float W=float(m.vp.Width),H=float(m.vp.Height);
+    const float px=((sx-float(m.vp.X)-m.pixelOffsetX)*320.f/W-m.offsetX)/m.h,py=((sy-float(m.vp.Y)-m.pixelOffsetY)*240.f/H-m.offsetY)/m.h;
+    const float wy=m.inverse[3]*px+m.inverse[4]*py+m.inverse[5];if(std::abs(wy)<1e-9f)return -1.f;
+    const float s=(floorY-m.origin[1]-m.eye[1])/wy;return std::isfinite(s)?s:-1.f;
+}
+// the screen rectangle (target pixels) a group's floor shadow can reach: the floor square of +-fadeEnd round its feet,
+// plus the blur; the whole viewport when the camera is unknown or the square reaches behind it
+static void lightMaskRect(const re3gpu::ShadowFrame& f,const re3gpu::ShadowGroup& g,const D3DVIEWPORT9& vp,float rect[4]){
+    const float X=float(vp.X),Y=float(vp.Y),W=float(vp.Width),H=float(vp.Height),margin=0.03f*W;
+    rect[0]=X;rect[1]=Y;rect[2]=X+W;rect[3]=Y+H;if(!f.camera)return;
+    const float R=lightConfig.fadeEnd;const float* cam=f.cameraRows;float l=1e30f,t=1e30f,r=-1e30f,b=-1e30f;
+    for(unsigned k=0;k<4;++k){
+        const float wx=g.feet[0]+((k&1)?R:-R)-f.origin[0],wy=g.floorY-f.origin[1],wz=g.feet[2]+((k&2)?R:-R)-f.origin[2];
+        const float cx=cam[0]*wx+cam[1]*wy+cam[2]*wz+cam[3],cy=cam[4]*wx+cam[5]*wy+cam[6]*wz+cam[7],cz=cam[8]*wx+cam[9]*wy+cam[10]*wz+cam[11];
+        if(!(cz>=64.f))return;
+        const float sx=(f.h*cx/cz+f.offsetX)*W/320.f+f.pixelOffsetX+X,sy=(f.h*cy/cz+f.offsetY)*H/240.f+f.pixelOffsetY+Y;
+        if(!std::isfinite(sx)||!std::isfinite(sy))return;
+        l=(std::min)(l,sx);r=(std::max)(r,sx);t=(std::min)(t,sy);b=(std::max)(b,sy);}
+    // the feet and the actor above them lie inside the projected square; the shadow is blurred past it
+    rect[0]=(std::max)(X,l-margin);rect[1]=(std::max)(Y,t-margin);rect[2]=(std::min)(X+W,r+margin);rect[3]=(std::min)(Y+H,b+margin);
+}
+// whether the tile takes this caster's shadow (see above)
+static bool lightMaskBehind(const LightMaskCaster& c,const float tile[4],int maskDepth){
+    if(maskDepth<0||!lightMaskCamera.valid)return !c.reached;
+    if(maskDepth>=0x400)return true;
+    float nearest=1e30f;
+    const float xs[3]={tile[0],0.5f*(tile[0]+tile[2]),tile[2]},ys[3]={tile[1],0.5f*(tile[1]+tile[3]),tile[3]};
+    for(float x:xs)for(float y:ys){const float z=lightMaskFloorDepth(x,y,c.floorY);if(z>0.f)nearest=(std::min)(nearest,z);}
+    if(!(nearest<1e29f))return false;   // the floor is not seen in this tile
+    return maskDepth>=int(nearest/lightMaskCamera.bucketDepth)-kLightMaskSlack;
+}
+// fix 2026-11-11d: the mask tiles one frame drew (target pixels, alpha texture, slot), for the next frame's floor shadow
+// pass (ModelRenderer::renderMaskDepth: a mask nearer than the floor point hides its shadow). Kept with the camera they
+// belong to; a frame of another camera, an old list or a device reset / release drops them. The list holds a reference to
+// each texture (the scene may be unloaded meanwhile) and lets go of them before a reset or a device release.
+static std::vector<re3model::ModelRenderer::MaskOccluder> lightMaskTileList;static unsigned lightMaskTileFrame=~0u;static uint32_t lightMaskTileCamera=0;
+static uint32_t lightCameraKey(){return (uint32_t(*(uint16_t*)(gameBase+0x661fa6))<<16)|(uint32_t(*(uint16_t*)(gameBase+0x661fa8))<<8)|*(uint16_t*)(gameBase+0x661faa);}
+static void lightMaskClearTiles(){for(auto& m:lightMaskTileList)if(m.cover)m.cover->Release();lightMaskTileList.clear();}
+static void lightMaskRecord(float left,float top,float right,float bottom,IDirect3DTexture9* cover,float u0,float v0,float u1,float v1,int maskDepth){
+    const uint32_t key=lightCameraKey();
+    if(lightMaskTileFrame!=frame||lightMaskTileCamera!=key){lightMaskClearTiles();lightMaskTileFrame=frame;lightMaskTileCamera=key;}
+    if(!cover||maskDepth<0||lightMaskTileList.size()>=1024)return;
+    cover->AddRef();re3model::ModelRenderer::MaskOccluder m{{left,top,right,bottom},cover,{u0,v0,u1,v1},maskDepth};lightMaskTileList.push_back(m);
+}
+static void lightMaskForget(){modelRenderer.maskOccluders.clear();lightMaskClearTiles();lightMaskTileFrame=~0u;}
+// proxy.cpp spriteHook, right after an HD mask tile was drawn (target pixels; cover = the texture holding its alpha;
+// maskDepth = its ordering-table slot, -1 unknown)
+static void lightShadowOverMask(float left,float top,float right,float bottom,IDirect3DTexture9* cover,float u0,float v0,float u1,float v1,int maskDepth){
+    lightMaskRecord(left,top,right,bottom,cover,u0,v0,u1,v1,maskDepth);   // fix 2026-11-11d
+    if(!lightMaskShadowOn||!lightMaskValid||lightMaskFrame!=frame||!cover||gpuFlushing||!gameDevice||!gogWrapper||!modelRenderer.maskShadowReady())return;
+    const float tile[4]={left,top,right,bottom};
+    float clip[4]={1e30f,1e30f,-1e30f,-1e30f};bool any=false,overlap=false;
+    for(const auto& c:lightMaskCasters){const float* q=c.rect;
+        if(!(q[0]<right&&left<q[2]&&q[1]<bottom&&top<q[3]))continue;overlap=true;
+        if(!lightMaskBehind(c,tile,maskDepth))continue;
+        clip[0]=(std::min)(clip[0],q[0]);clip[1]=(std::min)(clip[1],q[1]);clip[2]=(std::max)(clip[2],q[2]);clip[3]=(std::max)(clip[3],q[3]);any=true;}
+    if(!any){if(overlap)++lightMaskInFront;return;}
+    clip[0]=(std::max)(clip[0],left);clip[1]=(std::max)(clip[1],top);clip[2]=(std::min)(clip[2],right);clip[3]=(std::min)(clip[3],bottom);
+    if(!(clip[2]>clip[0])||!(clip[3]>clip[1]))return;
+    auto dd=gogWrapper;
+    {auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);}
+    bool ownScene=!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))return;
+    const float uv[4]={u0,v0,u1,v1};
+    gpuFlushing=true;const HRESULT hr=modelRenderer.shadowOverMask(tile,clip,cover,uv);gpuFlushing=false;
+    if(ownScene)gameDevice->EndScene();
+    if(hr==S_OK)++lightMaskTiles;
+    else if(FAILED(hr)&&!re3model::IsTransientDrawStatus(hr)&&++lightMaskFailures==1)log("LIGHT_MASK_SHADOW_FAILED hr=%08lx (%s)",hr,modelRenderer.gpuShaderError().c_str());
+}
+// fix 2026-11-11d (user 11.11: shadows running past the floor -> cut them at the floor edge and lay the cut part on the
+// walls; F5 "Shadow at floor edges" = pilot.ini shadow_edges 0 endless floor / 1 cut / 2 cut + walls): the room's floor
+// model baked from its collision data (tools\rdt_floor\bake_floors.py over rdt_sca.RoomModel: the exe's ground query with
+// see-through railings / invisible barriers opened -> model-pack\floors\<room>.r3floor): per walkable height the floor
+// cells numbered by connected area, the wall faces bordering each area, and the solids that can hide the floor from the
+// camera. Per actor and frame: the area under its feet at its floor height (no file, no such height or the feet off the
+// floor - stairs, ramps -: nothing, the endless plane as before), the blocks between it and the eye (never one holding the
+// eye) and, for 2, up to 4 wall faces near it that its light falls on and the camera sees.
+struct LightFloorLevel {int y=0;std::vector<uint16_t> labels;std::vector<std::pair<re3gpu::ShadowFace,uint16_t>> faces;};
+struct LightRoomFloors {uint32_t key=~0u;bool valid=false;int x0=0,z0=0,cell=64,nx=0,nz=0;std::vector<re3gpu::ShadowBlock> blocks;std::vector<LightFloorLevel> levels;
+    std::vector<std::pair<uint32_t,std::shared_ptr<const re3gpu::FloorArea>>> areas;};
+static LightRoomFloors lightFloors;
+static std::uint64_t lightFloorHits=0,lightFloorMisses=0;
+static void lightLoadRoomFloors(){
+    const uint32_t stage=*(uint16_t*)(gameBase+0x661fa6),room=*(uint16_t*)(gameBase+0x661fa8),key=(stage<<8)|(room&0xff);
+    if(lightFloors.key==key)return;
+    lightFloors=LightRoomFloors{};lightFloors.key=key;
+    char name[16];sprintf_s(name,"R%X%02X",unsigned(stage+1)&0xf,unsigned(room&0xff));
+    const std::string path=root+"/model-pack/floors/"+name+".r3floor";
+    std::ifstream in(path,std::ios::binary);if(!in){log("LIGHT_FLOORS %s none: shadows on the endless floor",name);return;}
+    const std::vector<char> b((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+    std::size_t o=0;bool bad=false;
+    auto rd=[&](void* dst,std::size_t n){if(bad||o+n>b.size()){bad=true;std::memset(dst,0,n);return;}std::memcpy(dst,b.data()+o,n);o+=n;};
+    char magic[4];uint16_t version=0,levels=0,cell=0,nx=0,nz=0,blocks=0;int32_t x0=0,z0=0;
+    rd(magic,4);rd(&version,2);rd(&levels,2);rd(&x0,4);rd(&z0,4);rd(&cell,2);rd(&nx,2);rd(&nz,2);rd(&blocks,2);
+    if(bad||std::memcmp(magic,"R3FL",4)||version!=1||!cell||!nx||!nz||nx>4096||nz>4096){log("LIGHT_FLOORS %s unreadable header",name);return;}
+    auto& F=lightFloors;F.x0=x0;F.z0=z0;F.cell=cell;F.nx=nx;F.nz=nz;
+    for(unsigned k=0;k<blocks&&!bad;++k){float v[10];rd(v,40);re3gpu::ShadowBlock s;std::memcpy(s.q,v,32);s.top=v[8];s.bottom=v[9];F.blocks.push_back(s);}
+    for(unsigned l=0;l<levels&&!bad;++l){
+        int32_t y=0;uint16_t areas=0,faces=0;uint32_t runs=0;rd(&y,4);rd(&areas,2);rd(&faces,2);rd(&runs,4);
+        LightFloorLevel L;L.y=y;L.labels.assign(std::size_t(nx)*nz,0);std::size_t p=0;
+        for(uint32_t r=0;r<runs&&!bad;++r){uint16_t length=0,label=0;rd(&length,2);rd(&label,2);if(p+length>L.labels.size()){bad=true;break;}std::fill_n(L.labels.begin()+p,length,label);p+=length;}
+        for(unsigned f=0;f<faces&&!bad;++f){float v[8];uint16_t label=0,pad=0;rd(v,32);rd(&label,2);rd(&pad,2);
+            re3gpu::ShadowFace face;face.a[0]=v[0];face.a[1]=v[1];face.b[0]=v[2];face.b[1]=v[3];face.n[0]=v[4];face.n[1]=v[5];face.top=v[6];face.bottom=v[7];L.faces.push_back({face,label});}
+        F.levels.push_back(std::move(L));}
+    if(bad){log("LIGHT_FLOORS %s truncated: shadows on the endless floor",name);lightFloors=LightRoomFloors{};lightFloors.key=key;return;}
+    F.valid=true;std::string ys;for(const auto& L:F.levels)ys+=(ys.empty()?"":",")+std::to_string(L.y);
+    log("LIGHT_FLOORS %s heights=%s blocks=%u grid=%ux%u cell=%u",name,ys.c_str(),unsigned(F.blocks.size()),unsigned(nx),unsigned(nz),unsigned(cell));
+}
+static bool lightQuadHolds(const float* q,float x,float z){
+    float lo=1e30f,hi=-1e30f;
+    for(int k=0;k<4;++k){const float ax=q[k*2],az=q[k*2+1],bx=q[(k+1)%4*2],bz=q[(k+1)%4*2+1];const float s=(bx-ax)*(z-az)-(bz-az)*(x-ax);lo=(std::min)(lo,s);hi=(std::max)(hi,s);}
+    return lo>=-1.f||hi<=1.f;
+}
+static std::shared_ptr<const re3gpu::ShadowReceivers> lightReceivers(const re3gpu::ShadowGroup& g,const float eye[3]){
+    if(lightShadowEdges<=0)return nullptr;
+    lightLoadRoomFloors();auto& F=lightFloors;if(!F.valid)return nullptr;
+    int level=-1;for(std::size_t i=0;i<F.levels.size();++i)if(std::abs(float(F.levels[i].y)-g.floorY)<=60.f){level=int(i);break;}
+    if(level<0){++lightFloorMisses;return nullptr;}
+    const auto& L=F.levels[level];
+    const int ci=int(std::floor((g.feet[0]-float(F.x0))/float(F.cell))),cj=int(std::floor((g.feet[2]-float(F.z0))/float(F.cell)));
+    uint16_t label=0;
+    for(int r=0;r<=3&&!label;++r)for(int dj=-r;dj<=r&&!label;++dj)for(int di=-r;di<=r&&!label;++di){const int i=ci+di,j=cj+dj;if(i>=0&&i<F.nx&&j>=0&&j<F.nz)label=L.labels[std::size_t(j)*F.nx+i];}
+    if(!label){++lightFloorMisses;return nullptr;}
+    const uint32_t key=(uint32_t(level)<<16)|label;std::shared_ptr<const re3gpu::FloorArea> area;
+    for(const auto& a:F.areas)if(a.first==key){area=a.second;break;}
+    if(!area){auto a=std::make_shared<re3gpu::FloorArea>();a->x0=F.x0;a->z0=F.z0;a->cell=F.cell;a->nx=F.nx;a->nz=F.nz;a->inside.resize(L.labels.size());
+        for(std::size_t k=0;k<L.labels.size();++k)a->inside[k]=L.labels[k]==label?255:0;
+        area=a;F.areas.push_back({key,area});}
+    auto rc=std::make_shared<re3gpu::ShadowReceivers>();rc->mode=lightShadowEdges;rc->area=area;++lightFloorHits;
+    // blocks: in the box spanned by the eye and the actor's shadow square, nearest to the feet first
+    const float R=lightConfig.fadeEnd+600.f,fx=g.feet[0],fz=g.feet[2];
+    const float bx0=(std::min)(eye[0],fx-R),bx1=(std::max)(eye[0],fx+R),bz0=(std::min)(eye[2],fz-R),bz1=(std::max)(eye[2],fz+R);
+    std::vector<std::pair<float,const re3gpu::ShadowBlock*>> nearBlocks;
+    for(const auto& k:F.blocks){float x0=1e30f,x1=-1e30f,z0=1e30f,z1=-1e30f;
+        for(int c=0;c<4;++c){x0=(std::min)(x0,k.q[c*2]);x1=(std::max)(x1,k.q[c*2]);z0=(std::min)(z0,k.q[c*2+1]);z1=(std::max)(z1,k.q[c*2+1]);}
+        if(x1<bx0||x0>bx1||z1<bz0||z0>bz1)continue;
+        if(eye[1]>=k.top&&eye[1]<=k.bottom&&lightQuadHolds(k.q,eye[0],eye[2]))continue;
+        const float dx=(std::max)(0.f,(std::max)(x0-fx,fx-x1)),dz=(std::max)(0.f,(std::max)(z0-fz,fz-z1));nearBlocks.push_back({dx*dx+dz*dz,&k});}
+    std::sort(nearBlocks.begin(),nearBlocks.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+    for(std::size_t k=0;k<nearBlocks.size()&&k<32;++k)rc->blocks.push_back(*nearBlocks[k].second);
+    if(lightShadowEdges>=2){
+        std::vector<std::pair<float,re3gpu::ShadowFace>> faces;
+        const float lx=g.floorDir[0],lz=g.floorDir[2];
+        for(const auto& f:L.faces){if(f.second!=label)continue;const auto& s=f.first;
+            const float ex=s.b[0]-s.a[0],ez=s.b[1]-s.a[1],len2=(std::max)(1.f,ex*ex+ez*ez);
+            const float t=(std::max)(0.f,(std::min)(1.f,((fx-s.a[0])*ex+(fz-s.a[1])*ez)/len2));
+            const float dx=fx-(s.a[0]+t*ex),dz=fz-(s.a[1]+t*ez),d2=dx*dx+dz*dz;if(d2>R*R)continue;
+            if((fx-s.a[0])*s.n[0]+(fz-s.a[1])*s.n[1]<50.f)continue;                 // the actor in front of it
+            if(lx*s.n[0]+lz*s.n[1]<0.1f)continue;                                     // its light falls on it
+            if((eye[0]-s.a[0])*s.n[0]+(eye[2]-s.a[1])*s.n[1]<=0.f)continue;            // the camera sees its front
+            faces.push_back({d2,s});}
+        std::sort(faces.begin(),faces.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+        for(std::size_t k=0;k<faces.size()&&k<4;++k)rc->faces.push_back(faces[k].second);
+    }
+    return rc;
 }
 // Right after the room background of a frame (proxy.cpp backgroundHook): the shadow maps and floor shadows of the build in
 // the renderer's queue, the floor light of its flashes. The in-between frame comes here too and blends the palettes.
 static void lightAfterBackground(void* renderer){
+    lightMaskValid=false;lightMaskCasters.clear();   // fix 2026-11-11c: set again once this frame's floor shadow is down
     if(!lightOn()||!modelActive||!enabled||gpuFlushing||!gameDevice||!gogWrapper||lightFrames.empty())return;
     bool mode=false;uint32_t serial=0;
     if(!re3bridge::detail::QueuedMode(renderer,mode,serial)||!mode)return;
@@ -1290,12 +1561,24 @@ static void lightAfterBackground(void* renderer){
     flushGame(renderer);auto dd=gogWrapper;
     {auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);}
     bool ownScene=!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))return;
-    re3gpu::LightingConfig config=lightConfig;config.floor=lightShadowMode>=1;config.self=lightShadowMode>=2;config.pool=lightFlashOn;
+    re3gpu::LightingConfig config=lightConfig;config.floor=lightShadowMode>=1;config.self=lightShadowMode>=2;config.pool=lightFlashOn||lightFireOn;
+    // fix 2026-11-11d: the masks of the last frames of this camera hide the floor shadow behind them
+    modelRenderer.maskOcclusion=lightMaskShadowOn;
+    if(lightMaskTileCamera!=lightCameraKey()||frame-lightMaskTileFrame>4u)lightMaskClearTiles();
+    if(lightMaskShadowOn)modelRenderer.maskOccluders=lightMaskTileList;else modelRenderer.maskOccluders.clear();
+    if(lightShadowEdges<=0){for(auto& gp:shadowFrame->groups)if(gp)gp->receivers=nullptr;}   // fix 2026-11-11d3: the endless floor, nothing to look up
+    else{float eye[3]{};const bool eyeKnown=re3model::ModelRenderer::frameEye(*shadowFrame,eye);   // fix 2026-11-11d: the floor model round each actor
+        for(auto& gp:shadowFrame->groups)if(gp)gp->receivers=eyeKnown?lightReceivers(*gp,eye):nullptr;}
     gpuFlushing=true;
     const HRESULT hr=modelRenderer.renderLighting(*shadowFrame,fps60Pass?fps60PassWeight:1.f,config,gpuStats);
-    gpuFlushing=false;
+    gpuFlushing=false;modelRenderer.maskOccluders.clear();   // fix 2026-11-11d: not kept past this pass (the list owns the references)
     if(ownScene)gameDevice->EndScene();
     ++lightFramesDrawn;
+    if(SUCCEEDED(hr)&&modelRenderer.maskShadowReady()){   // fix 2026-11-11c: the casters whose shadow went down, for the masks after it
+        D3DVIEWPORT9 vp{};gameDevice->GetViewport(&vp);lightMaskSetCamera(*shadowFrame,vp);
+        for(const auto& gp:shadowFrame->groups){if(!gp||gp->casters.empty()||!(gp->strength>0.01f))continue;
+            LightMaskCaster c;c.group=gp.get();c.floorY=gp->floorY;lightMaskRect(*shadowFrame,*gp,vp,c.rect);lightMaskCasters.push_back(c);}
+        lightMaskFrame=frame;lightMaskValid=!lightMaskCasters.empty();}
     const double spent=modelClockMs()-started;if(fps60Pass)fps60PassDrawMs+=spent;else modelFrameDrawMs+=spent;
     if(FAILED(hr)&&!re3model::IsTransientDrawStatus(hr)&&modelObserved.insert("lighting-failed").second){
         log("LIGHT_FX_FAILED hr=%08lx: dynamic shadows and the flash light are off for this session (%s)",hr,modelRenderer.gpuShaderError().c_str());lightShadowMode=0;lightFlashOn=false;}
@@ -1304,6 +1587,7 @@ static void lightAfterBackground(void* renderer){
 static bool drawLightJob(ModelJob& job,void* renderer){
     if(!job.glow||job.glow->empty()||!gameDevice)return true;
     if(fps60Pass&&job.glowFresh)return true;   // born in this build: not in the in-between frame before it (as the native flash)
+    struct GlowCost{double started=modelClockMs();~GlowCost(){lightGlowJobMs+=modelClockMs()-started;++lightGlowJobs;}} glowCost;   // fx 2026-11-11f
     gpuFlushPending();
     flushGame(renderer);auto dd=gogWrapper;if(!dd)return false;
     {auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);}
@@ -1316,6 +1600,20 @@ static bool drawLightJob(ModelJob& job,void* renderer){
     if(ownScene)gameDevice->EndScene();
     return SUCCEEDED(hr)||re3model::IsTransientDrawStatus(hr);
 }
+// fx 2026-11-11e: a slime body (fx_nemesis_cloud.h slimeUpdate): a job in the ordering table at its depth, drawn into the
+// current target and the HD models' depth buffer; the in-between frame of the 60 fps mode blends the build before with this one.
+static bool drawSlimeJob(ModelJob& job,void* renderer){
+    if(!job.slime||!gameDevice)return true;
+    gpuFlushPending();
+    flushGame(renderer);auto dd=gogWrapper;if(!dd)return false;
+    {auto critical=reinterpret_cast<CRITICAL_SECTION*>(dd+0x181fb0);EnterCriticalSection(critical);((void(__cdecl*)())(dd+0x45b30))();LeaveCriticalSection(critical);}
+    bool ownScene=!*(uint32_t*)(dd+0x181fe4);if(ownScene&&FAILED(gameDevice->BeginScene()))return false;
+    gpuFlushing=true;
+    const HRESULT hr=modelRenderer.drawSlime(*job.slime,fps60Pass?fps60PassWeight:1.f);
+    gpuFlushing=false;
+    if(ownScene)gameDevice->EndScene();
+    return SUCCEEDED(hr)||re3model::IsTransientDrawStatus(hr);
+}
 static void lightLoadConfig(){
     const std::string ini=root+"\\pilot.ini";
     auto percent=[&](const char* key,int def,int lo,int hi){return float((std::max)(lo,(std::min)(hi,int(GetPrivateProfileIntA("pilot",key,def,ini.c_str())))))/100.f;};
@@ -1324,24 +1622,34 @@ static void lightLoadConfig(){
     lightStrengthScale=percent("shadow_strength",100,0,200);
     modelRenderer.lightingSelfStrength=percent("shadow_self_strength",75,0,100);
     lightFlashGain=percent("flash_light_gain",100,0,300);
+    lightFireOn=GetPrivateProfileIntA("pilot","fire_light",1,ini.c_str())!=0;lightFireGain=percent("fire_light_gain",100,0,300);   // fx 2026-11-11f
+    log("LIGHT_FX fire_light=%d fire_light_gain=%.2f (fx 2026-11-11f: halo, model and floor light of the native fire effects)",int(lightFireOn),lightFireGain);
     lightMinElevation=float((std::max)(20,(std::min)(85,int(GetPrivateProfileIntA("pilot","light_min_elevation",52,ini.c_str())))));
     lightConfig.tileSize=GetPrivateProfileIntA("pilot","shadow_map_tile",1024,ini.c_str())>=1024?1024u:512u;
+    lightMaskShadowOn=GetPrivateProfileIntA("pilot","shadow_over_masks",1,ini.c_str())!=0;   // fix 2026-11-11c
+    modelRenderer.leatherOn=GetPrivateProfileIntA("pilot","leather_fx",1,ini.c_str())!=0;   // fx 2026-11-11e: Leather materials (Nemesis' suit)
+    lightShadowEdges=0;   // fix 2026-11-11d3 (user 11.11: the cut modes have problems in many places, not offered): pilot.ini shadow_edges is not read; QA command light-edges-1|2 still switches
     log("LIGHT_FX dynamic_shadows=%d flash_light=%d shadow_strength=%.2f shadow_self_strength=%.2f light_min_elevation=%.0f shadow_map_tile=%u flash_light_gain=%.2f (lighting round 2026-11-10; needs gpu_models=1)",
         lightShadowMode,int(lightFlashOn),lightStrengthScale,modelRenderer.lightingSelfStrength,lightMinElevation,lightConfig.tileSize,lightFlashGain);
+    log("LIGHT_FX shadow_over_masks=%d shadow_edges=%d (fix 2026-11-11c/d: masks hide / keep the floor shadow; 0 endless floor, 1 cut at the floor edge, 2 + walls)",int(lightMaskShadowOn),lightShadowEdges);
 }
 // once per build (beginModelBuild): the renderer's switches follow the menu, old flashes and actors go, statistics
 static void lightBeginBuild(uint32_t serial){
     if(lightShadowRequest>=0){lightShadowMode=lightShadowRequest;lightShadowRequest=-1;log("LIGHT_FX dynamic_shadows=%d (command)",lightShadowMode);}
     if(lightFlashRequest>=0){lightFlashOn=lightFlashRequest!=0;lightFlashRequest=-1;log("LIGHT_FX flash_light=%d (command)",int(lightFlashOn));}
-    modelRenderer.lightingFx=lightOn()&&(lightShadowMode>=2||lightFlashOn);modelRenderer.lightingSelf=lightShadowMode>=2;
+    if(lightFireRequest>=0){lightFireOn=lightFireRequest!=0;lightFireRequest=-1;log("LIGHT_FX fire_light=%d (command)",int(lightFireOn));}   // fx 2026-11-11f
+    modelRenderer.lightingFx=lightOn()&&(lightShadowMode>=2||lightFlashOn||lightFiresNow(serial));modelRenderer.lightingSelf=lightShadowMode>=2;
     lightFlashes.erase(std::remove_if(lightFlashes.begin(),lightFlashes.end(),[&](const LightFlash& f){return f.build&&serial-f.build>8;}),lightFlashes.end());
     static uint32_t lightRoom=~0u;const uint32_t roomNow=(uint32_t(*(uint16_t*)(gameBase+0x661fa6))<<16)|*(uint16_t*)(gameBase+0x661fa8);
-    if(roomNow!=lightRoom){lightRoom=roomNow;lightNativeShadow.clear();lightHdShadow.clear();lightFlashes.clear();}   // actor slots are reused
+    if(roomNow!=lightRoom){lightRoom=roomNow;lightNativeShadow.clear();lightHdShadow.clear();lightFlashes.clear();lightFires.clear();}   // actor slots are reused
     if(serial%300==0){
         if(modelRenderer.lightingPasses){const double n=double(modelRenderer.lightingPasses);
-            log("LIGHT_FX_STATS builds=300 passes=%llu groups=%llu caster_draws_per_pass=%.1f shadow_tiles_per_pass=%.1f ms_per_pass=%.3f flashes=%llu native_shadows_hidden=%llu mode=%d flash=%d",
+            log("LIGHT_FX_STATS builds=300 passes=%llu groups=%llu caster_draws_per_pass=%.1f shadow_tiles_per_pass=%.1f ms_per_pass=%.3f flashes=%llu native_shadows_hidden=%llu mode=%d flash=%d mask_tiles_per_pass=%.1f mask_in_front_per_pass=%.1f mask_failures=%llu camera_slot=%.1f occlusion_passes=%llu occluder_tiles_per_pass=%.1f edges=%d cut_groups=%llu wall_draws=%llu floor_hits=%llu floor_misses=%llu",
                 (unsigned long long)modelRenderer.lightingPasses,(unsigned long long)lightGroupsMade,double(modelRenderer.lightingCasters)/n,double(modelRenderer.lightingTiles)/n,modelRenderer.lightingMs/n,
-                (unsigned long long)lightFlashCount,(unsigned long long)lightNativeHidden,lightShadowMode,int(lightFlashOn));
+                (unsigned long long)lightFlashCount,(unsigned long long)lightNativeHidden,lightShadowMode,int(lightFlashOn),double(lightMaskTiles)/n,double(lightMaskInFront)/n,(unsigned long long)lightMaskFailures,lightMaskCamera.valid?lightMaskCamera.bucketDepth:0.f,
+                (unsigned long long)modelRenderer.maskOcclusionPasses,modelRenderer.maskOcclusionPasses?double(modelRenderer.maskOcclusionTiles)/double(modelRenderer.maskOcclusionPasses):0.0,
+                lightShadowEdges,(unsigned long long)modelRenderer.clipGroups,(unsigned long long)modelRenderer.clipFacePasses,(unsigned long long)lightFloorHits,(unsigned long long)lightFloorMisses);
+            lightMaskTiles=0;lightMaskInFront=0;modelRenderer.maskOcclusionPasses=modelRenderer.maskOcclusionTiles=0;modelRenderer.clipGroups=modelRenderer.clipFacePasses=0;lightFloorHits=lightFloorMisses=0;
             modelRenderer.lightingPasses=modelRenderer.lightingCasters=modelRenderer.lightingTiles=0;modelRenderer.lightingMs=0;lightGroupsMade=0;lightFlashCount=0;lightNativeHidden=0;}}
 }
 // The native shadow update of an actor just ran (blood_fx.h shadowHook, black shadows only): whether it shows the shadow
@@ -1555,7 +1863,8 @@ static int appendGpuJobs(const std::shared_ptr<ModelAsset>& asset,const std::vec
     }
     bool empty=false;if(!gpuBuckets(*asset,*draw,projection,zmin,zmax,empty))return 0;
     gpuLastBody=draw;if(empty)return 1;
-    lightAttach(draw,true);   // lighting round 2026-11-10
+    {re3model::Vec3 middle{};for(const auto& b:bones)middle=middle+re3model::Vec3{b.m[3],b.m[7],b.m[11]};if(!bones.empty())middle=middle*(1.f/float(bones.size()));
+        lightAttach(draw,true,bones.empty()?nullptr:&middle);}   // lighting round 2026-11-10; fx 2026-11-11f: where it stands, for the fire light
     const bool boneCaps=asset->limbCap&&wallBoneCapsOn();   // fx3 2026-11-08 wall: the caps of a bone-split body split by bone too
     if(gpuWallSplit.rule&&gpuWallSplit.beyondBones&&!preskinned&&(asset->characterBody||boneCaps)&&asset->mesh.inverseBind.size()>=16){   // fix 2026-11-08: bone split
         ensureTriangleBones(*asset);   // filled lazily (parts gone); empty = every triangle in BOTH halves
@@ -1584,7 +1893,8 @@ static void appendWoundsGpu(const std::vector<re3wound::Wound>& wounds,const Mod
     const std::vector<uint8_t>* occlusion=found!=re3model::AssetLightingStore().end()&&found->second.sculpted&&!found->second.occlusion.empty()?&found->second.occlusion:nullptr;
     auto draw=std::make_shared<re3gpu::Draw>();draw->owner=decals;draw->mesh=mesh;draw->name="wound-decals";draw->skin=re3gpu::Skin::Decal;draw->textures=decals->textures;
     std::memcpy(draw->cameraRows,bodyDraw->cameraRows,sizeof(draw->cameraRows));draw->h=bodyDraw->h;draw->offsetX=bodyDraw->offsetX;draw->offsetY=bodyDraw->offsetY;draw->pixelOffsetX=bodyDraw->pixelOffsetX;draw->pixelOffsetY=bodyDraw->pixelOffsetY;draw->nearPlane=bodyDraw->nearPlane;
-    std::memcpy(draw->tint,bodyDraw->tint,sizeof(draw->tint));draw->light=bodyDraw->light;draw->lit=bodyDraw->lit;draw->palette=bodyDraw->palette;draw->previous=bodyDraw->previous;draw->paletteRegs=bodyDraw->paletteRegs;
+    std::memcpy(draw->tint,bodyDraw->tint,sizeof(draw->tint));for(unsigned k=0;k<3;++k)draw->tint[k]*=re3wound::bloodBrightness;   // fx 2026-11-11e: the blood brightness
+    draw->light=bodyDraw->light;draw->lit=bodyDraw->lit;draw->palette=bodyDraw->palette;draw->previous=bodyDraw->previous;draw->paletteRegs=bodyDraw->paletteRegs;
     std::memcpy(draw->rect,bodyDraw->rect,sizeof(draw->rect));draw->epoch=bodyDraw->epoch;draw->bucketHigh=bodyDraw->bucketHigh;draw->bucketLow=bodyDraw->bucketLow;draw->bucketDepth=bodyDraw->bucketDepth;draw->nearClosed=bodyDraw->nearClosed;
     for(unsigned k=0;k<3;++k)draw->eye[k]=view.m[k*4+3]-bodyDraw->origin[k];
     for(unsigned texture=0;texture<re3wound::kTextures;++texture){
@@ -1676,7 +1986,9 @@ static void gpuFlushRect(float left,float top,float right,float bottom){
 // A job only extends its model's bucket range while nothing native lies in between. Anything queued natively since the
 // last job goes over the models gathered so far, and under this one: they are drawn, then the native queues.
 static bool drawGpuJob(ModelJob& job,void* renderer){
-    auto dd=gogWrapper;if(!dd||!gameDevice)return false;auto& draw=*job.gpu;if(!draw.ready())return true;
+    auto dd=gogWrapper;if(!dd||!gameDevice)return false;auto& draw=*job.gpu;
+    if(draw.shadow)lightMaskReached(draw.shadow.get());   // fix 2026-11-11c: masks from here on lie in front of this caster
+    if(!draw.ready())return true;
     keepDeviceHooks();   // the native draws after this job have to find the flush
     const uint32_t queuedGame=*(uint32_t*)(static_cast<uint8_t*>(renderer)+0x84+0x8088);
     // the wrapper's deferred queue: vertex and primitive counts the end of its flush 45B30 clears (47110, 47116); another
@@ -1893,6 +2205,8 @@ static void appendWounds(const std::vector<re3wound::Wound>& wounds,const std::v
     if(placed.empty())return;
     mesh.vertices.resize(placed.size());
     auto projection=bodyProjection;projection.hiddenMaterials=nullptr;projection.sortWithinBucketByMaterial=false;projection.vertexTint=nullptr;
+    if(re3wound::bloodBrightness!=1.f){uint32_t t=projection.tintARGB&0xff000000u;   // fx 2026-11-11e: the blood brightness (this path cannot go over white)
+        for(unsigned s=0;s<24;s+=8)t|=uint32_t((std::min)(255.f,float((projection.tintARGB>>s)&255u)*re3wound::bloodBrightness+.5f))<<s;projection.tintARGB=t;}
     re3model::SculptedLighting sculpted;
     if(bodyLight){sculpted=re3model::MakeSculptedLighting(*static_cast<const re3model::NativeLighting*>(bodyProjection.shadeContext),*bodyLight,{0,-1,0});
         sculpted.occlusion=bodyLight->occlusion.empty()?nullptr:&placedOcclusion;projection.shade=nullptr;projection.shadeVertex=&re3model::ShadeSculpted;projection.shadeContext=&sculpted;}
@@ -2440,6 +2754,7 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     const auto tint=re3bridge::detail::Read<uint32_t>(context.bones[0].nativePart,0x68)&0xffffffu;
     if(re3model::CaptureNativeLighting(lighting,context.worldLight,context.gte.data(),context.gte.size(),tint)){
         projection.shade=&re3model::ShadeNativeNccs;projection.shadeContext=&lighting;
+        actor.nativeLight=lighting;actor.nativeLightKnown=true;   // fx 2026-11-11e
         // blood round 2026-11-07: the same native light on a white surface facing the camera / facing up (Y-down world)
         re3model::Material white;white.baseColorRGBA=0xffffffffu;
         re3model::Matrix3x4 view;re3model::Vec3 toEye{0,0,-1};
@@ -2448,8 +2763,10 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
         actor.bloodLightUp=re3model::ShadeNativeNccs(&lighting,{},re3model::Vec3{0,-1,0},white);
     }
     // lighting round 2026-11-10: every draw of this actor casts and receives its shadow; kept only when the actor is drawn HD
-    struct LightScope{bool commit=false;~LightScope(){if(gpuShadowGroup){if(commit)lightCommitActor(gpuShadowGroup);gpuShadowGroup.reset();}}} lightScope;
+    struct LightScope{bool commit=false;~LightScope(){lightActorCentreKnown=false;if(gpuShadowGroup){if(commit)lightCommitActor(gpuShadowGroup);gpuShadowGroup.reset();}}} lightScope;
     if(projection.shade==&re3model::ShadeNativeNccs&&!modelParity)gpuShadowGroup=lightBeginActor(context,lighting,bones,name);
+    // fx 2026-11-11f: the middle of the actor: body, weapon and kit parts are lit by the same fire
+    if(lightFireOn&&!bones.empty()){re3model::Vec3 middle{};for(const auto& b:bones)middle=middle+re3model::Vec3{b.m[3],b.m[7],b.m[11]};lightActorCentre=middle*(1.f/float(bones.size()));lightActorCentreKnown=true;}
     std::shared_ptr<ModelAsset> weapon,weaponAux;
     const WeaponEntry* weaponRule=nullptr;
     uint8_t equippedItem=0;
@@ -2787,6 +3104,7 @@ static const re3model::GpuFrame* fps60Mid(const std::shared_ptr<re3model::GpuFra
 }
 static bool drawModelJob(void*,void* renderer,uintptr_t token){
     if(auto lightJob=reinterpret_cast<ModelJob*>(token);lightJob&&lightJob->glow)return drawLightJob(*lightJob,renderer);   // lighting round 2026-11-10
+    if(auto slimeJob=reinterpret_cast<ModelJob*>(token);slimeJob&&slimeJob->slime)return drawSlimeJob(*slimeJob,renderer);   // fx 2026-11-11e
     if(auto gpuJob=reinterpret_cast<ModelJob*>(token);gpuJob&&gpuJob->gpu){
         ModelCostTimer cost(fps60Pass?fps60PassDrawMs:modelFrameDrawMs);gpuInJob=true;if(!fps60Pass)++modelFrameJobs;const bool okay=drawGpuJob(*gpuJob,renderer);gpuInJob=false;return okay;}
     // round models-2026-11-03: a slice with AlphaBlend runs draws its other runs now and queues the blended ones (cpuBlendFlush);
@@ -2839,13 +3157,13 @@ static bool drawModelJob(void*,void* renderer,uintptr_t token){
     return true;
 }
 static size_t releaseModelDeviceResources(ULONG* deviceReferences){
-    gpuDropDraws();
+    gpuDropDraws();lightMaskForget();   // fix 2026-11-11d: the mask textures it holds belong to the old device
     if(deviceReferences)*deviceReferences=modelRenderer.deviceReferences();
     const size_t assets=modelAssets.size();
     modelRenderer.releaseDeviceResources();modelAssets.clear();modelObserved.clear();modelFatal=false;
     return assets;
 }
-static void beforeModelDeviceReset(){gpuDropDraws();modelRenderer.beforeReset();}
+static void beforeModelDeviceReset(){gpuDropDraws();lightMaskForget();modelRenderer.beforeReset();}
 static void afterModelDeviceReset(HRESULT result){modelRenderer.afterReset(result);if(SUCCEEDED(result)){modelFatal=false;modelObserved.erase("transient-device");}}
 // v12 wounds: the enemy shot test 452DB0 (hand matrix, per-model weapon table, weapon) walks the enemy list (A5CDCC up
 // to the end pointer at A5CE6C: the actor loop's own actor pointers past the player and partner) and writes a hit into
@@ -2924,15 +3242,16 @@ static void corpseShotRay(const re3model::Matrix3x4& h,int weapon){
         unsigned(re3bridge::detail::Read<uint8_t>(best,0x4a)),bestT,re3bridge::detail::Read<uint32_t>(best,4),int(re3bridge::detail::Read<int16_t>(best,0xcc)));}
 }
 static void corpseShot(const re3bridge::Matrix32* hand,int weapon){corpseShotRay(re3model::FromNativeMatrix(*hand),weapon);}
-// QA (pilot.command enemy-life-1, debug_warp; fix 2026-11-08): every enemy of the list with more life gets 1 (one shot downs it)
-static void enemyLifeOne(){
+// QA (pilot.command enemy-life-1, debug_warp; fix 2026-11-08): every enemy of the list with more life gets 1 (one shot downs it);
+// fx 2026-11-11f: enemy-life-<n> gives n
+static void enemyLifeOne(int wanted=1){
     const auto end=re3bridge::detail::Read<uintptr_t>(reinterpret_cast<void*>(gameBase+0x65ce6c));
     for(uintptr_t at=gameBase+0x65cdcc;at<end&&at<gameBase+0x65cdcc+48*4;at+=4){
         auto* actor=re3bridge::detail::Read<uint8_t*>(reinterpret_cast<void*>(at));
         if(!re3bridge::detail::Accessible(actor,0x134))continue;
         auto* life=reinterpret_cast<int16_t*>(actor+0xcc);
-        log("MODEL_QA_ENEMY_LIFE actor=%p model=%02x routine=%08x life=%d%s",actor,unsigned(actor[0x4a]),re3bridge::detail::Read<uint32_t>(actor,4),int(*life),*life>1?" -> 1":"");
-        if(*life>1)*life=1;}
+        log("MODEL_QA_ENEMY_LIFE actor=%p model=%02x routine=%08x life=%d -> %d",actor,unsigned(actor[0x4a]),re3bridge::detail::Read<uint32_t>(actor,4),int(*life),*life>wanted?wanted:int(*life));
+        if(*life>wanted)*life=int16_t(wanted);}
 }
 // QA (pilot.command blood-corpse-test, debug_warp): one M4A1 shot from Jill's chest height at the nearest HD corpse's root
 // part, through the same box test and queued-hit path as a real shot that hit no live enemy

@@ -19,6 +19,7 @@ static bool installed = false;
 static constexpr uint32_t kOrderingTableSlots = 1024;
 static constexpr uint32_t kObjectStride = 0x194, kMaxObjects = 64;
 static Table table;
+static DoorFits doorFits;   // door round 2026-11-11: model-pack/door-fit.txt
 static std::unordered_set<std::string> tableAssets;
 static bool traceParts = false; // debug_warp: MODEL_PROP_SEEN once for every distinct drawn part (table work)
 
@@ -351,6 +352,10 @@ inline void loadTable() {
     for (const auto& e : table.doors) doorRows += e.second.size();
     log("MODEL_PROP_TABLE rows=%u object=%zu any_room=%zu door=%zu assets=%zu invalid=%u first_invalid_line=%u", table.rows, objectRows, anyRows,
         doorRows, table.assets.size(), table.invalid, table.firstInvalid);
+    // door round 2026-11-11: optional handle placement fits (prop_table.h DoorFit, extra_model_integration.h prepareDoor)
+    std::ifstream fits(root + "/model-pack/door-fit.txt");
+    if (fits) { ParseDoorFits(fits, doorFits);
+        log("MODEL_DOOR_FIT_TABLE rows=%u keys=%zu invalid=%u first_invalid_line=%u", doorFits.count, doorFits.rows.size(), doorFits.invalid, doorFits.firstInvalid); }
 }
 } // namespace re3prop
 

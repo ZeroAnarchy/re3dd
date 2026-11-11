@@ -266,6 +266,7 @@ public:
     // fps60 (2026-10-27): while nonzero, every slice drawn shares this depth epoch (one depth clear for the whole
     // in-between pass, whatever build its frames were uploaded for)
     std::uint64_t passKey=0;
+    bool leatherOn=true;   // fx 2026-11-11e: Leather materials (pilot.ini leather_fx / F5)
     // false: the previous full D3DSBT_ALL state block per slice (A/B measurement)
     bool lightStateRestore=true;
     ModelRenderer()=default;
@@ -466,6 +467,89 @@ public:
         device_->SetPixelShaderConstantF(14,g,2);device_->SetPixelShaderConstantF(17,g+12,2);
         return true;
     }
+    // Door round 2026-11-11: the METAL shaders for material m of d when it is a Metal material with a linear skin (either
+    // phase); sets the eye (VS c17), the draw's light (PS c2..c12, profile z = lit) and the metal.txt values (PS c14..c17).
+    // false = draw it as before (CPU path, other skins, failed build).
+    bool metalWarned_=false;
+    bool beginMetal(const re3gpu::Draw& d,std::size_t m,bool lit){
+        if(!(d.mesh->materialFlags[m]&Metal)||d.skin!=re3gpu::Skin::Linear||d.mesh->materialMetal.size()<(m+1)*kMetalParams)return false;
+        IDirect3DVertexShader9* vertex=nullptr;IDirect3DPixelShader9* pixel=nullptr;
+        if(!gpuShaders_.metal(device_,vertex,pixel)){
+            if(!metalWarned_){metalWarned_=true;char text[700];std::snprintf(text,sizeof(text),"MODEL_METAL_SHADER_FAILED %.600s; Metal materials draw as plain materials\n",gpuShaders_.lastError().c_str());log(text);}
+            return false;}
+        if(FAILED(device_->SetVertexShader(vertex))||FAILED(device_->SetPixelShader(pixel)))return false;
+        const float eye[4]={d.eye[0],d.eye[1],d.eye[2],0};device_->SetVertexShaderConstantF(17,eye,1);
+        device_->SetPixelShaderConstantF(2,&d.light.rows[0][0],10);
+        float profile[4];std::memcpy(profile,d.light.profile1,16);profile[2]=lit?1.f:0.f;device_->SetPixelShaderConstantF(12,profile,1);
+        device_->SetPixelShaderConstantF(14,&d.mesh->materialMetal[m*kMetalParams],4);
+        return true;
+    }
+    // fx 2026-11-11e: the grain of leather, computed once - cells with fine grooves between them (the distance to the nearest
+    // cell border of a wrapped point pattern) and smaller pores on top; rg = the slope of that height per tile (0.5 = flat,
+    // +-96 at the ends), b = the height. Mip levels average the slopes: far away the grain flattens instead of sparkling.
+    IDirect3DTexture9* leatherGrain_=nullptr;bool leatherGrainFailed_=false,leatherWarned_=false,leatherBound_=false;
+    DWORD leatherSampler_[6]{};IDirect3DBaseTexture9* leatherTexture2_=nullptr;
+    static float grainCells(float u,float v,unsigned cells,std::uint32_t seed){
+        const float x=u*float(cells),y=v*float(cells);const int cx=int(std::floor(x)),cy=int(std::floor(y));float d1=9.f,d2=9.f;
+        for(int j=-1;j<=1;++j)for(int i=-1;i<=1;++i){const int gx=cx+i,gy=cy+j;
+            std::uint32_t h=std::uint32_t((gx%int(cells)+int(cells))%int(cells))*374761393u+std::uint32_t((gy%int(cells)+int(cells))%int(cells))*668265263u+seed;
+            h=(h^(h>>13))*1274126177u;h^=h>>16;const float px=float(gx)+0.15f+0.7f*float(h&0xffffu)/65535.f,py=float(gy)+0.15f+0.7f*float(h>>16)/65535.f;
+            const float d=std::sqrt((px-x)*(px-x)+(py-y)*(py-y));if(d<d1){d2=d1;d1=d;}else if(d<d2)d2=d;}
+        const float edge=(std::min)(1.f,(d2-d1)/0.34f);return edge*edge*(3.f-2.f*edge)*(0.8f+0.2f*(1.f-(std::min)(1.f,d1)));
+    }
+    bool ensureLeatherGrain(){
+        if(leatherGrain_)return true;if(leatherGrainFailed_)return false;
+        const unsigned n=256;unsigned levels=0;for(unsigned s=n;s;s>>=1)++levels;
+        if(FAILED(device_->CreateTexture(n,n,levels,0,D3DFMT_A8R8G8B8,D3DPOOL_MANAGED,&leatherGrain_,nullptr))){leatherGrainFailed_=true;return false;}
+        std::vector<float> height(std::size_t(n)*n);
+        for(unsigned y=0;y<n;++y)for(unsigned x=0;x<n;++x){const float u=(x+.5f)/n,v=(y+.5f)/n;
+            height[std::size_t(y)*n+x]=0.82f*grainCells(u,v,14,0x51ed27u)+0.18f*grainCells(u,v,37,0x9e3779b9u);}
+        std::vector<float> level(std::size_t(n)*n*3);   // slope u, slope v, height
+        for(unsigned y=0;y<n;++y)for(unsigned x=0;x<n;++x){auto at=[&](unsigned ax,unsigned ay){return height[std::size_t(ay%n)*n+ax%n];};
+            float* o=&level[(std::size_t(y)*n+x)*3];o[0]=(at(x+1,y)-at(x+n-1,y))*0.5f*float(n);o[1]=(at(x,y+1)-at(x,y+n-1))*0.5f*float(n);o[2]=at(x,y);}
+        unsigned size=n;
+        for(unsigned l=0;l<levels;++l){
+            D3DLOCKED_RECT lock{};if(FAILED(leatherGrain_->LockRect(l,&lock,nullptr,0))){re3gpu::SafeRelease(leatherGrain_);leatherGrainFailed_=true;return false;}
+            for(unsigned y=0;y<size;++y){auto* row=static_cast<std::uint8_t*>(lock.pBits)+std::size_t(y)*lock.Pitch;
+                for(unsigned x=0;x<size;++x){const float* o=&level[(std::size_t(y)*size+x)*3];
+                    auto pack=[](float f){return std::uint8_t((std::min)(255.f,(std::max)(0.f,f*255.f+.5f)));};
+                    row[x*4+2]=pack(0.5f+o[0]/192.f);row[x*4+1]=pack(0.5f+o[1]/192.f);row[x*4]=pack(o[2]);row[x*4+3]=255;}}
+            leatherGrain_->UnlockRect(l);
+            if(size>1){const unsigned half=size/2;std::vector<float> next(std::size_t(half)*half*3);
+                for(unsigned y=0;y<half;++y)for(unsigned x=0;x<half;++x)for(unsigned c=0;c<3;++c)
+                    next[(std::size_t(y)*half+x)*3+c]=0.25f*(level[(std::size_t(y*2)*size+x*2)*3+c]+level[(std::size_t(y*2)*size+x*2+1)*3+c]+level[(std::size_t(y*2+1)*size+x*2)*3+c]+level[(std::size_t(y*2+1)*size+x*2+1)*3+c]);
+                level.swap(next);size=half;}
+        }
+        return true;
+    }
+    // fx 2026-11-11e: the LEATHER shaders for material m of d when it is a Leather material with a linear skin (opaque phase);
+    // sets the draw's light (PS c2..c12, profile z = lit: the vertex-light variant never set them), the eye (PS c20), the
+    // leather.txt values (PS c21..c26) and the grain map (s2). The shadow map / flash constants c14..c19 stay as the draw
+    // set them. false = draw it as before (other skins, failed build).
+    bool beginLeather(const re3gpu::Draw& d,std::size_t m,bool lit,unsigned variant){
+        if(!(d.mesh->materialFlags[m]&Leather)||(d.skin!=re3gpu::Skin::Linear&&d.skin!=re3gpu::Skin::LinearPose)||d.mesh->materialLeather.size()<(m+1)*kLeatherParams)return false;
+        if(!leatherOn||!ensureLeatherGrain())return false;
+        IDirect3DVertexShader9* vertex=nullptr;IDirect3DPixelShader9* pixel=nullptr;
+        if(!gpuShaders_.leather(device_,d.skin==re3gpu::Skin::LinearPose,variant==2,vertex,pixel)){
+            if(!leatherWarned_){leatherWarned_=true;char text[700];std::snprintf(text,sizeof(text),"MODEL_LEATHER_SHADER_FAILED %.600s; Leather materials draw as plain materials\n",gpuShaders_.lastError().c_str());log(text);}
+            return false;}
+        if(FAILED(device_->SetVertexShader(vertex))||FAILED(device_->SetPixelShader(pixel)))return false;
+        device_->SetPixelShaderConstantF(2,&d.light.rows[0][0],10);
+        float profile[4];std::memcpy(profile,d.light.profile1,16);profile[2]=lit?1.f:0.f;device_->SetPixelShaderConstantF(12,profile,1);
+        const float eye[4]={d.eye[0],d.eye[1],d.eye[2],0};device_->SetPixelShaderConstantF(20,eye,1);
+        device_->SetPixelShaderConstantF(21,&d.mesh->materialLeather[m*kLeatherParams],6);
+        static constexpr D3DSAMPLERSTATETYPE kState[]={D3DSAMP_ADDRESSU,D3DSAMP_ADDRESSV,D3DSAMP_MINFILTER,D3DSAMP_MAGFILTER,D3DSAMP_MIPFILTER,D3DSAMP_SRGBTEXTURE};
+        static constexpr DWORD kValue[]={D3DTADDRESS_WRAP,D3DTADDRESS_WRAP,D3DTEXF_LINEAR,D3DTEXF_LINEAR,D3DTEXF_LINEAR,FALSE};
+        if(!leatherBound_){leatherBound_=true;for(unsigned i=0;i<6;++i){device_->GetSamplerState(2,kState[i],&leatherSampler_[i]);device_->SetSamplerState(2,kState[i],kValue[i]);}
+            device_->GetTexture(2,&leatherTexture2_);device_->SetTexture(2,leatherGrain_);}
+        return true;
+    }
+    void endLeather(){
+        if(!leatherBound_)return;leatherBound_=false;
+        static constexpr D3DSAMPLERSTATETYPE kState[]={D3DSAMP_ADDRESSU,D3DSAMP_ADDRESSV,D3DSAMP_MINFILTER,D3DSAMP_MAGFILTER,D3DSAMP_MIPFILTER,D3DSAMP_SRGBTEXTURE};
+        device_->SetTexture(2,leatherTexture2_);if(leatherTexture2_){leatherTexture2_->Release();leatherTexture2_=nullptr;}
+        for(unsigned i=0;i<6;++i)device_->SetSamplerState(2,kState[i],leatherSampler_[i]);
+    }
     static void blendPalette(const re3gpu::Draw& d,float weight,float* out){
         const auto& to=*d.palette;const auto& from=*d.previous;const std::size_t count=to.size();
         if(d.skin==re3gpu::Skin::Affine){
@@ -586,6 +670,8 @@ public:
                     if((m<64&&((d.hiddenMaterials>>m)&1u))||(!range2.staticIndices&&!range2.dynamicIndices)||!material(m))continue;
                     // crystals round 2026-11-07: a Gem material (blended phase, linear skin) takes the GEM shaders, far facets first
                     const bool gem=beginGem(d,m,lit);
+                    const bool metal=!gem&&beginMetal(d,m,lit);   // door round 2026-11-11
+                    const bool leather=!gem&&!metal&&!phase&&beginLeather(d,m,lit,variant);   // fx 2026-11-11e
                     for(unsigned side=0;side<(gem?2u:1u)&&SUCCEEDED(hr);++side){
                         if(gem){const float* g=&d.mesh->materialGem[m*kGemParams];const float pass[4]={side?1.f:-1.f,g[9],g[10],g[11]};device_->SetPixelShaderConstantF(16,pass,1);}
                         if(range2.staticIndices){bindStatic();
@@ -593,12 +679,13 @@ public:
                         if(range2.dynamicIndices&&SUCCEEDED(hr)){bindDynamic();
                             if(SUCCEEDED(hr))drawChunks(range2.firstChunk+range2.staticChunks,range2.dynamicChunks,range2.firstDynamic,range2.dynamicIndices,poseDynamic?0:INT(d.ringVertex),UINT(d.dynamic.size()));}
                     }
-                    if(gem){auto* shader=gpuShaders_.vertex(device_,currentSkin,variant);if(shader)device_->SetVertexShader(shader);device_->SetPixelShader(pixelShader);
-                        if(variant==2){device_->SetPixelShaderConstantF(14,&fx[0][0],4);device_->SetPixelShaderConstantF(18,&flash[0][0],2);}}   // the gem constants share c14..c18
+                    if(gem||metal||leather){auto* shader=gpuShaders_.vertex(device_,currentSkin,variant);if(shader)device_->SetVertexShader(shader);device_->SetPixelShader(pixelShader);
+                        if(variant==2&&!leather){device_->SetPixelShaderConstantF(14,&fx[0][0],4);device_->SetPixelShaderConstantF(18,&flash[0][0],2);}}   // the gem / metal constants share c14..c18 (fx 2026-11-11e: leather leaves them alone)
                 }
             }
             device_->SetStreamSource(1,nullptr,0,0);
         }
+        endLeather();   // fx 2026-11-11e: sampler 2 as it was
         device_->SetRenderState(D3DRS_CLIPPING,savedClipping);
         const HRESULT depthRestore=device_->SetDepthStencilSurface(previousDepth);if(previousDepth)previousDepth->Release();
         device_->SetIndices(savedIndices);if(savedIndices)savedIndices->Release();
@@ -620,15 +707,26 @@ public:
     unsigned floorWidth_=0,floorHeight_=0,shadowAtlasSize_=0,shadowTileSize_=0;
     int variantState_[5]={-1,-1,-1,-1,-1};
     std::uint64_t lightingPass_=0;
+    // fix 2026-11-11c (shadowOverMask): the composite of the last renderLighting can be laid again over a mask tile
+    IDirect3DPixelShader9* maskShadowShader_=nullptr;bool maskShadowFailed_=false,maskShadowReady_=false;
+    float maskShadowTint_[4]{};D3DVIEWPORT9 maskShadowViewport_{};
+    // fix 2026-11-11d: the nearest mask of the background per pixel of the floor target (renderMaskDepth)
+    IDirect3DTexture9* maskDepthTexture_=nullptr;IDirect3DSurface9* maskDepthSurface_=nullptr;
+    IDirect3DPixelShader9* maskDepthShader_=nullptr;bool maskDepthFailed_=false;
     void releaseLighting(){
         for(auto& s:floorSurface_)re3gpu::SafeRelease(s);for(auto& t:floorTexture_)re3gpu::SafeRelease(t);
         for(auto& s:wideSurface_)re3gpu::SafeRelease(s);for(auto& t:wideTexture_)re3gpu::SafeRelease(t);
+        re3gpu::SafeRelease(maskDepthSurface_);re3gpu::SafeRelease(maskDepthTexture_);releaseAreaTextures();
         re3gpu::SafeRelease(shadowAtlasSurface_);re3gpu::SafeRelease(shadowAtlasDepth_);re3gpu::SafeRelease(shadowAtlas_);re3gpu::SafeRelease(glowTexture_);
-        floorWidth_=floorHeight_=shadowAtlasSize_=shadowTileSize_=0;floorFailed_=atlasFailed_=false;
+        re3gpu::SafeRelease(leatherGrain_);leatherGrainFailed_=false;if(leatherTexture2_){leatherTexture2_->Release();leatherTexture2_=nullptr;}leatherBound_=false;   // fx 2026-11-11e
+        for(auto& s:slimeShader_)re3gpu::SafeRelease(s);re3gpu::SafeRelease(slimeNoise_);slimeFailed_=false;slimeWarned_=false;   // fx 2026-11-11e (the compiled code is kept: slimeCode_)
+        re3gpu::SafeRelease(slimeScene_);slimeSceneW_=slimeSceneH_=0;slimeSceneFailed_=false;slimeSceneMisses_=0;   // fx 2026-11-11f
+
+        floorWidth_=floorHeight_=shadowAtlasSize_=shadowTileSize_=0;floorFailed_=atlasFailed_=false;maskShadowReady_=false;
     }
     void releaseLightingShaders(){
-        re3gpu::SafeRelease(blurShader_);re3gpu::SafeRelease(compositeShader_);re3gpu::SafeRelease(glowShader_);
-        blurFailed_=compositeFailed_=glowFailed_=false;for(auto& s:variantState_)s=-1;
+        re3gpu::SafeRelease(blurShader_);re3gpu::SafeRelease(compositeShader_);re3gpu::SafeRelease(glowShader_);re3gpu::SafeRelease(maskShadowShader_);re3gpu::SafeRelease(maskDepthShader_);
+        blurFailed_=compositeFailed_=glowFailed_=maskShadowFailed_=maskDepthFailed_=false;maskShadowReady_=false;for(auto& s:variantState_)s=-1;
     }
     void lightingNote(const char* what,HRESULT hr){char text[400];std::snprintf(text,sizeof(text),"MODEL_LIGHTING %s hr=%08lx %.250s\n",what,static_cast<unsigned long>(hr),gpuShaders_.lastError().c_str());log(text);}
     // Every skin's vertex shader and the pixel shader of a lighting variant (2 receive, 3 floor caster, 4 shadow map caster):
@@ -653,8 +751,11 @@ public:
         if(floorFailed_&&floorWidth_==w&&floorHeight_==h)return false;
         for(auto& s:floorSurface_)re3gpu::SafeRelease(s);for(auto& t:floorTexture_)re3gpu::SafeRelease(t);
         for(auto& s:wideSurface_)re3gpu::SafeRelease(s);for(auto& t:wideTexture_)re3gpu::SafeRelease(t);
+        re3gpu::SafeRelease(maskDepthSurface_);re3gpu::SafeRelease(maskDepthTexture_);
         floorWidth_=w;floorHeight_=h;bool okay=true;
         for(unsigned i=0;i<2&&okay;++i)okay=renderTexture(w,h,D3DFMT_A8R8G8B8,floorTexture_[i],floorSurface_[i])&&renderTexture((w+1)/2,(h+1)/2,D3DFMT_A8R8G8B8,wideTexture_[i],wideSurface_[i]);
+        // fix 2026-11-11d: optional (no target = no mask occlusion, as 11.11c)
+        if(okay&&!renderTexture(w,h,D3DFMT_A8R8G8B8,maskDepthTexture_,maskDepthSurface_))lightingNote("mask depth target unavailable, masks do not hide floor shadows;",E_FAIL);
         if(!okay){for(auto& s:floorSurface_)re3gpu::SafeRelease(s);for(auto& t:floorTexture_)re3gpu::SafeRelease(t);for(auto& s:wideSurface_)re3gpu::SafeRelease(s);for(auto& t:wideTexture_)re3gpu::SafeRelease(t);
             floorFailed_=true;lightingNote("floor shadow targets unavailable;",E_FAIL);return false;}
         floorFailed_=false;char text[160];std::snprintf(text,sizeof(text),"MODEL_LIGHTING floor shadow targets %ux%u + %ux%u\n",w,h,(w+1)/2,(h+1)/2);log(text);
@@ -744,6 +845,81 @@ public:
         if(poseDynamic)device_->SetStreamSource(1,nullptr,0,0);
         return hr;
     }
+    // fix 2026-11-11d (user 11.11, R10105: Dario lies on the lower floor partly under the office walkway, and the silhouette
+    // of his body showed on the walkway's edge beam): the floor shadows of all actors share one target, and 11.11c lays that
+    // target again over a mask tile that lies behind SOME caster (Jill on the walkway) - with the shadows of the others in it.
+    // So the masks themselves now hide what lies behind them already in the floor pass: every mask tile of the last frame
+    // (maskOccluders, target pixels) is drawn into a target of the floor shadow's size with its own alpha (> 0.5) and its
+    // ordering-table slot + slack as (slot + slack) / 1020 in 8 bits, nearest kept (MIN); the caster shader drops a floor
+    // point whose camera depth lies beyond that. Tiles of the zone table (slot >= 0x400) lie beyond the room: no occlusion.
+    bool renderMaskDepth(const D3DVIEWPORT9& viewport,float bucketDepth){
+        if(!maskOcclusion||maskOccluders.empty()||!maskDepthSurface_||!(bucketDepth>0.f)||maskDepthFailed_)return false;
+        if(!maskDepthShader_){static const char source[]="sampler2D cover:register(s0);float4 main(float4 colour:COLOR0,float2 uv:TEXCOORD0):COLOR0{clip(tex2D(cover,uv).a-0.5);return colour;}";
+            if(!gpuShaders_.quadShader(device_,source,maskDepthShader_,maskDepthFailed_)){lightingNote("mask depth shader failed, masks do not hide floor shadows;",E_FAIL);return false;}}
+        device_->SetRenderTarget(0,maskDepthSurface_);device_->SetDepthStencilSurface(nullptr);
+        device_->Clear(0,nullptr,D3DCLEAR_TARGET,0xffffffffu,1,0);
+        quadPipeline(maskDepthShader_);
+        device_->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);device_->SetRenderState(D3DRS_BLENDOP,D3DBLENDOP_MIN);
+        device_->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_ONE);device_->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_ONE);
+        const float X=float(viewport.X),Y=float(viewport.Y);
+        const float sx=float(floorWidth_)/float((std::max)(DWORD(1),viewport.Width)),sy=float(floorHeight_)/float((std::max)(DWORD(1),viewport.Height));
+        unsigned drawn=0;
+        for(const auto& m:maskOccluders){if(m.slot<0||m.slot>=0x400||!m.cover)continue;
+            const int v=(std::min)(255,int(std::ceil(float(m.slot+maskOcclusionSlack)*255.f/1020.f)));if(v>=255)continue;
+            device_->SetTexture(0,m.cover);
+            lightQuad((m.rect[0]-X)*sx,(m.rect[1]-Y)*sy,(m.rect[2]-X)*sx,(m.rect[3]-Y)*sy,m.uv[0],m.uv[1],m.uv[2],m.uv[3],0xff000000u|(DWORD(v)<<16)|(DWORD(v)<<8)|DWORD(v));++drawn;}
+        device_->SetTexture(0,nullptr);device_->SetRenderState(D3DRS_BLENDOP,D3DBLENDOP_ADD);device_->SetRenderState(D3DRS_ALPHABLENDENABLE,FALSE);
+        if(drawn){++maskOcclusionPasses;maskOcclusionTiles+=drawn;}
+        return drawn>0;
+    }
+    // fix 2026-11-11d: the eye of the frame's camera in world units (the rows map world - origin to the camera)
+    static bool cameraEye(const re3gpu::ShadowFrame& f,float eye[3]){
+        if(!f.camera)return false;const float* r=f.cameraRows;
+        const float a=r[0],b=r[1],c=r[2],d=r[4],e=r[5],g=r[6],h=r[8],i=r[9],k=r[10];
+        const float A=e*k-g*i,B=-(d*k-g*h),C=d*i-e*h,det=a*A+b*B+c*C;if(!std::isfinite(det)||std::abs(det)<1e-12f)return false;
+        const float s=1.f/det;
+        const float inv[9]={A*s,-(b*k-c*i)*s,(b*g-c*e)*s, B*s,(a*k-c*h)*s,-(a*g-c*d)*s, C*s,-(a*i-b*h)*s,(a*e-b*d)*s};
+        for(unsigned row=0;row<3;++row)eye[row]=f.origin[row]-(inv[row*3]*r[3]+inv[row*3+1]*r[7]+inv[row*3+2]*r[11]);
+        return std::isfinite(eye[0])&&std::isfinite(eye[1])&&std::isfinite(eye[2]);
+    }
+    // fix 2026-11-11d: the pixel shader constants of the cut (variant 3, c16..c20, c64..c159, sampler 2 = the area mask);
+    // nullptr / mode 0 / no mask texture = none. Returns whether the cut is on.
+    bool setClip(const re3gpu::ShadowReceivers* rc,int mode,const float eye[3],float floorY){
+        float counts[4]={0,0,0,0};
+        IDirect3DTexture9* mask=rc&&mode>0&&rc->area?areaTexture(rc->area):nullptr;
+        if(mask){
+            const unsigned nb=unsigned((std::min)(std::size_t(32),rc->blocks.size()));
+            static float a[32*4],b[32*4],h[32*4];
+            for(unsigned n=0;n<nb;++n){const auto& k=rc->blocks[n];std::memcpy(a+n*4,k.q,16);std::memcpy(b+n*4,k.q+4,16);h[n*4]=k.top;h[n*4+1]=k.bottom;h[n*4+2]=h[n*4+3]=0;}
+            if(nb){device_->SetPixelShaderConstantF(64,a,nb);device_->SetPixelShaderConstantF(96,b,nb);device_->SetPixelShaderConstantF(128,h,nb);}
+            counts[1]=float(nb);counts[2]=1;
+            const float e[4]={eye[0],eye[1],eye[2],floorY};device_->SetPixelShaderConstantF(17,e,1);
+            const auto& A=*rc->area;const float map[4]={float(A.x0),float(A.z0),1.f/float((std::max)(1,A.cell*A.nx)),1.f/float((std::max)(1,A.cell*A.nz))};
+            device_->SetPixelShaderConstantF(20,map,1);
+        }
+        device_->SetTexture(2,mask);
+        device_->SetPixelShaderConstantF(16,counts,1);
+        return mask!=nullptr;
+    }
+    // fix 2026-11-11d: the mask texture of a floor area (L8, linear between cells: the edge runs between cell centres), made
+    // at its first use and kept while the area lives (a room keeps its areas; another room's go with it)
+    struct AreaTexture {std::weak_ptr<const re3gpu::FloorArea> area;const re3gpu::FloorArea* key=nullptr;IDirect3DTexture9* texture=nullptr;};
+    std::vector<AreaTexture> areaTextures_;bool areaTextureFailed_=false;
+    void releaseAreaTextures(){for(auto& a:areaTextures_)re3gpu::SafeRelease(a.texture);areaTextures_.clear();}
+    IDirect3DTexture9* areaTexture(const std::shared_ptr<const re3gpu::FloorArea>& area){
+        for(std::size_t i=0;i<areaTextures_.size();){if(areaTextures_[i].area.expired()){re3gpu::SafeRelease(areaTextures_[i].texture);areaTextures_.erase(areaTextures_.begin()+i);}else ++i;}
+        for(const auto& a:areaTextures_)if(a.key==area.get())return a.texture;
+        if(areaTextureFailed_||area->nx<=0||area->nz<=0||area->inside.size()<std::size_t(area->nx)*area->nz)return nullptr;
+        IDirect3DTexture9* texture=nullptr;bool l8=true;
+        if(FAILED(device_->CreateTexture(area->nx,area->nz,1,0,D3DFMT_L8,D3DPOOL_MANAGED,&texture,nullptr))){l8=false;
+            if(FAILED(device_->CreateTexture(area->nx,area->nz,1,0,D3DFMT_A8R8G8B8,D3DPOOL_MANAGED,&texture,nullptr))){areaTextureFailed_=true;lightingNote("floor area texture unavailable, shadows not cut at floor edges;",E_FAIL);return nullptr;}}
+        D3DLOCKED_RECT lock{};if(FAILED(texture->LockRect(0,&lock,nullptr,0))){texture->Release();return nullptr;}
+        for(int z=0;z<area->nz;++z){auto* row=static_cast<std::uint8_t*>(lock.pBits)+std::size_t(z)*lock.Pitch;const auto* src=area->inside.data()+std::size_t(z)*area->nx;
+            if(l8)std::memcpy(row,src,area->nx);else for(int x=0;x<area->nx;++x){row[x*4]=row[x*4+1]=row[x*4+2]=src[x];row[x*4+3]=255;}}
+        texture->UnlockRect(0);
+        if(areaTextures_.size()>=24){re3gpu::SafeRelease(areaTextures_.front().texture);areaTextures_.erase(areaTextures_.begin());}
+        AreaTexture a;a.area=area;a.key=area.get();a.texture=texture;areaTextures_.push_back(a);return texture;
+    }
     static void localRows(const float (*rows)[4],const float* origin,float out[3][4]){
         for(unsigned r=0;r<3;++r){for(unsigned c=0;c<3;++c)out[r][c]=rows[r][c];out[r][3]=rows[r][3]+rows[r][0]*origin[0]+rows[r][1]*origin[1]+rows[r][2]*origin[2];}
     }
@@ -753,10 +929,16 @@ public:
     bool lightingSelf=true;     // ... and use the shadow map
     float lightingSelfStrength=0.75f,lightingBias=7.f,lightingSlopeBias=26.f;
     std::uint64_t lightingPasses=0,lightingCasters=0,lightingTiles=0;double lightingMs=0;
+    // fix 2026-11-11d: the mask tiles the last frame drew (model_integration.h), for renderMaskDepth
+    struct MaskOccluder {float rect[4];IDirect3DTexture9* cover;float uv[4];int slot;};
+    std::vector<MaskOccluder> maskOccluders;bool maskOcclusion=true;int maskOcclusionSlack=8;std::uint64_t maskOcclusionPasses=0,maskOcclusionTiles=0;
+    std::uint64_t clipGroups=0,clipFacePasses=0;   // fix 2026-11-11d: groups drawn with the floor cut, caster draws on wall faces
+    static bool frameEye(const re3gpu::ShadowFrame& f,float eye[3]){return cameraEye(f,eye);}
     // Shadow maps and floor shadows of one frame, then the floor light of its muzzle flashes and the shadow composite on
     // the current target. Called once per drawn frame right after the room background (also by the in-between frame, with
     // its weight). The caller holds the scene open and keeps the hooks quiet. S_FALSE: nothing to draw.
     HRESULT renderLighting(re3gpu::ShadowFrame& frame,float weight,const re3gpu::LightingConfig& config,re3gpu::Stats& stats){
+        maskShadowReady_=false;   // fix 2026-11-11c: set again below once this frame's composite is down
         if(resetPending_)return D3DERR_DEVICELOST;
         if(!device_||!shader_)return E_INVALIDARG;
         ++lightingPass_;
@@ -824,11 +1006,28 @@ public:
         // ---- floor shadows: silhouettes on the floor plane, then the two blurs
         bool floorDrawn=false;
         if(wantFloor&&SUCCEEDED(hr)){
+            const bool occlusion=renderMaskDepth(viewport,frame.bucketDepth);   // fix 2026-11-11d
             device_->SetRenderTarget(0,floorSurface_[0]);device_->SetDepthStencilSurface(nullptr);
             device_->Clear(0,nullptr,D3DCLEAR_TARGET,0,1,0);
             state(D3DRS_ZENABLE,D3DZB_FALSE);state(D3DRS_ZWRITEENABLE,FALSE);state(D3DRS_ALPHABLENDENABLE,TRUE);state(D3DRS_SRCBLEND,D3DBLEND_ONE);state(D3DRS_DESTBLEND,D3DBLEND_ONE);state(D3DRS_BLENDOP,D3DBLENDOP_MAX);
             device_->SetPixelShader(gpuShaders_.pixel(device_,3));
+            {const float mask[4]={1.f/float(floorWidth_),1.f/float(floorHeight_),occlusion?1.f/((std::max)(1.f,frame.bucketDepth)*1020.f):0.f,occlusion?1.f:0.f};
+                device_->SetPixelShaderConstantF(15,mask,1);device_->SetTexture(1,occlusion?maskDepthTexture_:nullptr);
+                device_->SetSamplerState(1,D3DSAMP_MINFILTER,D3DTEXF_POINT);device_->SetSamplerState(1,D3DSAMP_MAGFILTER,D3DTEXF_POINT);device_->SetSamplerState(1,D3DSAMP_MIPFILTER,D3DTEXF_NONE);}
+            // fix 2026-11-11d3 (user: the endless floor must cost what it did before the cut modes): no actor with a cut (always
+            // so with shadow_edges 0) = no eye, no sampler 2 round trip, no per-actor constants, only the cut switched off once
+            bool anyClip=false;for(const auto& gp:frame.groups)if(gp&&gp->receivers){anyClip=true;break;}
+            float eye[3]{};const bool eyeKnown=anyClip&&cameraEye(frame,eye);   // fix 2026-11-11d
+            if(!anyClip){const float none[4]={0,0,0,0};device_->SetPixelShaderConstantF(16,none,1);}
+            // fix 2026-11-11d: sampler 2 (the floor area mask) is not in SavedState: kept and put back after the pass
+            static constexpr D3DSAMPLERSTATETYPE kSampler2[]={D3DSAMP_ADDRESSU,D3DSAMP_ADDRESSV,D3DSAMP_MINFILTER,D3DSAMP_MAGFILTER,D3DSAMP_MIPFILTER,D3DSAMP_SRGBTEXTURE};
+            static constexpr DWORD kValue2[]={D3DTADDRESS_CLAMP,D3DTADDRESS_CLAMP,D3DTEXF_LINEAR,D3DTEXF_LINEAR,D3DTEXF_NONE,FALSE};
+            DWORD sampler2[6]{};IDirect3DBaseTexture9* texture2=nullptr;
+            if(anyClip){for(unsigned i=0;i<6;++i){device_->GetSamplerState(2,kSampler2[i],&sampler2[i]);device_->SetSamplerState(2,kSampler2[i],kValue2[i]);}device_->GetTexture(2,&texture2);}
             for(const auto& gp:frame.groups){if(!gp||gp->casters.empty()||!(gp->strength>0.01f))continue;const auto& g=*gp;
+                // fix 2026-11-11d: the room round this actor (floors of its height, blocks, wall faces) for the cut and the walls
+                const auto* rc=g.receivers.get();
+                const int clipMode=anyClip&&setClip(rc,rc&&eyeKnown?rc->mode:0,eye,g.floorY)?rc->mode:0;
                 // along the light, then (run 2: with the light above or behind the actor nothing showed round the feet) straight
                 // down at a share of the darkness: the contact shadow
                 const bool contact=config.contact>0.01f&&g.floorDir[1]>-0.97f;
@@ -837,10 +1036,34 @@ public:
                     for(const auto& weak:g.casters){const auto d=weak.lock();if(!d||!d->ready())continue;
                         const float plane[4]={pass?0.f:g.floorDir[0],pass?-1.f:g.floorDir[1],pass?0.f:g.floorDir[2],g.floorY-d->origin[1]};
                         const float feet[4]={g.feet[0]-d->origin[0],g.feet[1]-d->origin[1],g.feet[2]-d->origin[2],1.f/(std::max)(1.f,config.referenceHeight)};
+                        const float receiver[4]={0,-1,0,-(g.floorY-d->origin[1])},origin[4]={d->origin[0],d->origin[1],d->origin[2],0};   // fix 2026-11-11d: the floor
                         device_->SetVertexShaderConstantF(19,plane,1);device_->SetVertexShaderConstantF(20,feet,1);
+                        device_->SetVertexShaderConstantF(21,receiver,1);device_->SetVertexShaderConstantF(22,origin,1);
                         hr=drawCaster(*d,3,weight,float(floorWidth_),float(floorHeight_),stats);++lightingCasters;floorDrawn=true;if(FAILED(hr))break;}}
+                // fix 2026-11-11d: the part of the shadow the floor cut off, on the wall faces it runs into (along the light only)
+                if(clipMode>=2&&SUCCEEDED(hr)){
+                    const float caster[4]={(std::min)(1.f,g.strength),config.fadeStart,1.f/(std::max)(1.f,config.fadeEnd-config.fadeStart),0};device_->SetPixelShaderConstantF(14,caster,1);
+                    unsigned faces=0;
+                    for(const auto& f:rc->faces){if(faces>=4)break;++faces;
+                        const float pass2[4]={0,float(rc->blocks.size()<32?rc->blocks.size():32),2.f,0};
+                        const float faceA[4]={f.a[0],f.a[1],f.b[0],f.b[1]},faceB[4]={f.top,f.bottom,0,0};
+                        device_->SetPixelShaderConstantF(16,pass2,1);device_->SetPixelShaderConstantF(18,faceA,1);device_->SetPixelShaderConstantF(19,faceB,1);
+                        for(const auto& weak:g.casters){const auto d=weak.lock();if(!d||!d->ready())continue;
+                            const float plane[4]={g.floorDir[0],g.floorDir[1],g.floorDir[2],g.floorY-d->origin[1]};
+                            const float feet[4]={g.feet[0]-d->origin[0],g.feet[1]-d->origin[1],g.feet[2]-d->origin[2],1.f/(std::max)(1.f,config.referenceHeight)};
+                            const float receiver[4]={f.n[0],0,f.n[1],f.n[0]*(f.a[0]-d->origin[0])+f.n[1]*(f.a[1]-d->origin[2])},origin[4]={d->origin[0],d->origin[1],d->origin[2],0};
+                            device_->SetVertexShaderConstantF(19,plane,1);device_->SetVertexShaderConstantF(20,feet,1);
+                            device_->SetVertexShaderConstantF(21,receiver,1);device_->SetVertexShaderConstantF(22,origin,1);
+                            hr=drawCaster(*d,3,weight,float(floorWidth_),float(floorHeight_),stats);++lightingCasters;++clipFacePasses;if(FAILED(hr))break;}
+                        if(FAILED(hr))break;}
+                }
+                if(clipMode>0)++clipGroups;
+                if(anyClip)setClip(nullptr,0,eye,g.floorY);
                 if(FAILED(hr))break;}
             state(D3DRS_BLENDOP,D3DBLENDOP_ADD);state(D3DRS_ALPHABLENDENABLE,FALSE);
+            if(anyClip){device_->SetTexture(2,texture2);if(texture2)texture2->Release();for(unsigned i=0;i<6;++i)device_->SetSamplerState(2,kSampler2[i],sampler2[i]);}   // fix 2026-11-11d (d3: only when it was changed)
+            device_->SetTexture(1,nullptr);   // fix 2026-11-11d: sampler 1 back as setCommon left it (the composite reads the wide blur there)
+            device_->SetSamplerState(1,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);device_->SetSamplerState(1,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);device_->SetSamplerState(1,D3DSAMP_MIPFILTER,D3DTEXF_LINEAR);
             if(floorDrawn&&SUCCEEDED(hr)){
                 quadPipeline(blurShader_);
                 const unsigned w=floorWidth_,h=floorHeight_,qw=(w+1)/2,qh=(h+1)/2;
@@ -886,6 +1109,7 @@ public:
                 state(D3DRS_SRCBLEND,D3DBLEND_DESTCOLOR);state(D3DRS_DESTBLEND,D3DBLEND_ZERO);
                 lightQuad(X,Y,X+W,Y+H);
                 device_->SetTexture(1,nullptr);
+                maskShadowReady_=true;std::memcpy(maskShadowTint_,tint,sizeof(tint));maskShadowViewport_=viewport;   // fix 2026-11-11c
             }
         }
         device_->SetStreamSource(1,nullptr,0,0);
@@ -899,6 +1123,196 @@ public:
         lightingMs+=double(clockEnd.QuadPart-clockStart.QuadPart)*1000.0/double(frequency.QuadPart);++lightingPasses;
         return hr;
     }
+    // fix 2026-11-11c (user 11.11, warehouse R10102: at the catwalk railing the floor shadow is missing in rectangles and cut
+    // off along straight lines). A mask tile repaints the room background as it was, without the shadow multiplied into it
+    // after the background - and the catwalk floor there is a mask (it hides Jill when she walks under the catwalk). The
+    // caller (model_integration.h lightShadowOverMask) asks for this only for a tile that the ordering table draws before a
+    // caster, i.e. a tile behind it. The picture inside `clip` (target pixels, part of the tile `tile`) is multiplied by the
+    // same composite as in renderLighting, weighted by the tile's own alpha (cover.a at the tile's uv, as drawQuad masks).
+    // S_FALSE: nothing to draw.
+    std::uint64_t maskShadowQuads=0;
+    bool maskShadowReady()const{return maskShadowReady_&&floorTexture_[0]&&wideTexture_[1];}
+    HRESULT shadowOverMask(const float tile[4],const float clip[4],IDirect3DTexture9* cover,const float uv[4]){
+        if(resetPending_)return D3DERR_DEVICELOST;
+        if(!device_||!shader_||!cover||!maskShadowReady())return S_FALSE;
+        if(!maskShadowShader_&&!maskShadowFailed_){static const char source[]=
+            "sampler2D tight:register(s0);sampler2D wide:register(s1);sampler2D cover:register(s2);float4 tint:register(c0);\n"
+            "float4 main(float2 uv:TEXCOORD0,float2 mv:TEXCOORD1):COLOR0{float2 a=tex2D(tight,uv).rg,b=tex2D(wide,uv).rg;\n"
+            // the composite of renderLighting, unchanged
+            "float h=saturate(1-b.g/max(b.r,1.0/255.0));float s=lerp(a.r,b.r,smoothstep(0.2,0.95,h))*(1-0.45*smoothstep(0.3,1.0,h));\n"
+            "s=saturate(s*tint.w)*tex2D(cover,mv).a;return float4(lerp(float3(1,1,1),tint.rgb,s),1);}";
+            if(!gpuShaders_.quadShader(device_,source,maskShadowShader_,maskShadowFailed_))lightingNote("mask shadow shader failed, masks keep no floor shadow;",E_FAIL);}
+        if(!maskShadowShader_)return S_FALSE;
+        const float tw=tile[2]-tile[0],th=tile[3]-tile[1];if(!(tw>0)||!(th>0)||!(clip[2]>clip[0])||!(clip[3]>clip[1]))return S_FALSE;
+        const D3DVIEWPORT9& vp=maskShadowViewport_;const float X=float(vp.X),Y=float(vp.Y),W=float((std::max)(1ul,vp.Width)),H=float((std::max)(1ul,vp.Height));
+        SavedState saved;HRESULT hr=saved.capture(device_);if(FAILED(hr))return hr;
+        // the third sampler is not in SavedState: kept and put back here
+        static constexpr D3DSAMPLERSTATETYPE kSampler[]={D3DSAMP_ADDRESSU,D3DSAMP_ADDRESSV,D3DSAMP_MINFILTER,D3DSAMP_MAGFILTER,D3DSAMP_MIPFILTER,D3DSAMP_SRGBTEXTURE};
+        static constexpr DWORD kValue[]={D3DTADDRESS_CLAMP,D3DTADDRESS_CLAMP,D3DTEXF_LINEAR,D3DTEXF_LINEAR,D3DTEXF_NONE,FALSE};
+        DWORD sampler2[6]{};IDirect3DBaseTexture9* texture2=nullptr;
+        for(unsigned i=0;i<6;++i)device_->GetSamplerState(2,kSampler[i],&sampler2[i]);device_->GetTexture(2,&texture2);
+        hr=setCommon();
+        if(SUCCEEDED(hr)){
+            device_->SetFVF(D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX2);device_->SetPixelShader(maskShadowShader_);
+            const auto state=[&](D3DRENDERSTATETYPE s,DWORD v){device_->SetRenderState(s,v);};
+            state(D3DRS_ZENABLE,D3DZB_FALSE);state(D3DRS_ZWRITEENABLE,FALSE);state(D3DRS_ALPHABLENDENABLE,TRUE);state(D3DRS_BLENDOP,D3DBLENDOP_ADD);
+            state(D3DRS_SRCBLEND,D3DBLEND_DESTCOLOR);state(D3DRS_DESTBLEND,D3DBLEND_ZERO);
+            for(DWORD s=0;s<3;++s)for(unsigned i=0;i<6;++i)device_->SetSamplerState(s,kSampler[i],kValue[i]);
+            device_->SetTexture(0,floorTexture_[0]);device_->SetTexture(1,wideTexture_[1]);device_->SetTexture(2,cover);
+            device_->SetPixelShaderConstantF(0,maskShadowTint_,1);
+            // same pixel centres as renderLighting's composite (screen) and drawQuad's mask (tile)
+            struct MaskVertex {float x,y,z,rhw;DWORD colour;float su,sv,mu,mv;};
+            auto corner=[&](float x,float y){const float fx=(x-tile[0])/tw,fy=(y-tile[1])/th;
+                return MaskVertex{x-.5f,y-.5f,0,1,0xffffffffu,(x-X)/W,(y-Y)/H,uv[0]+fx*(uv[2]-uv[0]),uv[1]+fy*(uv[3]-uv[1])};};
+            const MaskVertex v[4]={corner(clip[0],clip[1]),corner(clip[2],clip[1]),corner(clip[0],clip[3]),corner(clip[2],clip[3])};
+            hr=device_->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,v,sizeof(MaskVertex));if(SUCCEEDED(hr))++maskShadowQuads;
+        }
+        device_->SetTexture(2,texture2);if(texture2)texture2->Release();
+        for(unsigned i=0;i<6;++i)device_->SetSamplerState(2,kSampler[i],sampler2[i]);
+        const HRESULT restored=saved.restore(device_);
+        if(SUCCEEDED(hr)&&FAILED(restored))hr=restored;
+        return hr;
+    }
+    // ---------------------------------------------------------------- fx 2026-11-11e: volumetric slime (model_gpu.h SlimeBatch)
+    IDirect3DPixelShader9* slimeShader_[5]{};bool slimeFailed_=false,slimeWarned_=false;IDirect3DVolumeTexture9* slimeNoise_=nullptr;
+    // a tiling volume of smooth value noise: r 4 cells per tile, g mostly 8 cells per tile (8 texels a cell: no facets in the highlights);
+    // fx 2026-11-11f: b = distance to the nearest of the scattered points (one per cell of 8 texels: the froth's small bubbles),
+    // a = how far the second nearest is behind it (0 on the seam between two bubbles)
+    bool ensureSlimeNoise(){
+        if(slimeNoise_)return true;
+        const unsigned n=64;
+        if(FAILED(device_->CreateVolumeTexture(n,n,n,1,0,D3DFMT_A8R8G8B8,D3DPOOL_MANAGED,&slimeNoise_,nullptr)))return false;
+        D3DLOCKED_BOX box{};if(FAILED(slimeNoise_->LockBox(0,&box,nullptr,0))){re3gpu::SafeRelease(slimeNoise_);return false;}
+        auto lattice=[](unsigned x,unsigned y,unsigned z,unsigned period,std::uint32_t seed){
+            std::uint32_t h=(x%period)*374761393u+(y%period)*668265263u+(z%period)*2147483647u+seed;h=(h^(h>>13))*1274126177u;h^=h>>16;return float(h&0xffffu)/65535.f;};
+        auto value=[&](float x,float y,float z,unsigned period,std::uint32_t seed){
+            const unsigned ix=unsigned(std::floor(x)),iy=unsigned(std::floor(y)),iz=unsigned(std::floor(z));float fx=x-float(ix),fy=y-float(iy),fz=z-float(iz);
+            fx=fx*fx*(3-2*fx);fy=fy*fy*(3-2*fy);fz=fz*fz*(3-2*fz);float r=0;
+            for(unsigned c=0;c<8;++c){const unsigned dx=c&1u,dy=(c>>1)&1u,dz=c>>2;
+                r+=lattice(ix+dx,iy+dy,iz+dz,period,seed)*(dx?fx:1-fx)*(dy?fy:1-fy)*(dz?fz:1-fz);}
+            return r;};
+        for(unsigned z=0;z<n;++z)for(unsigned y=0;y<n;++y){auto* row=static_cast<std::uint8_t*>(box.pBits)+std::size_t(z)*box.SlicePitch+std::size_t(y)*box.RowPitch;
+            for(unsigned x=0;x<n;++x){const float u=(x+.5f)/n,v=(y+.5f)/n,w=(z+.5f)/n;
+                const float a=value(u*4,v*4,w*4,4,0x1234567u),b=0.7f*value(u*8,v*8,w*8,8,0x89abcdeu)+0.3f*value(u*4+0.5f,v*4+0.5f,w*4+0.5f,4,0x3c6ef37u);
+                // the scattered points of the 27 cells round this texel (cells wrap with the tile)
+                const float px=u*8,py=v*8,pz=w*8;const int cx=int(px),cy=int(py),cz=int(pz);float d1=9.f,d2=9.f;
+                for(int k=0;k<27;++k){const int nx=cx+k%3-1,ny=cy+(k/3)%3-1,nz=cz+k/9-1;const unsigned wx=unsigned(nx+8)%8u,wy=unsigned(ny+8)%8u,wz=unsigned(nz+8)%8u;
+                    const float fx=float(nx)+0.15f+0.7f*lattice(wx,wy,wz,8,0x51ed27u)-px,fy=float(ny)+0.15f+0.7f*lattice(wx,wy,wz,8,0x2545f49u)-py,fz=float(nz)+0.15f+0.7f*lattice(wx,wy,wz,8,0x6c8e9cfu)-pz;
+                    const float d=std::sqrt(fx*fx+fy*fy+fz*fz);if(d<d1){d2=d1;d1=d;}else if(d<d2)d2=d;}
+                row[x*4+2]=std::uint8_t(a*255.f+.5f);row[x*4+1]=std::uint8_t(b*255.f+.5f);
+                row[x*4]=std::uint8_t((std::min)(1.f,d1)*255.f+.5f);row[x*4+3]=std::uint8_t((std::min)(1.f,(d2-d1)*1.6f)*255.f+.5f);}}
+        slimeNoise_->UnlockBox(0);return true;
+    }
+    // The five shaders (4, 8, 12, 16, 24 primitives) are compiled on a worker thread the first time they are asked for
+    // (about three seconds in all): false until they exist - the caller keeps the native sprites meanwhile.
+    std::shared_ptr<re3gpu::Shaders::Background> slimeCode_;
+    bool slimeReady(){
+        if(slimeFailed_||!device_)return false;
+        if(slimeShader_[4]&&slimeNoise_)return true;
+        if(!slimeCode_){slimeCode_=gpuShaders_.compileInBackground(re3gpu::SlimeSource(),"SLIME_PRIMS",{"4","8","12","16","24"},"ps_3_0");log("SLIME_SHADERS compiling in the background\n");}
+        const int state=slimeCode_->state.load();if(!state)return false;
+        bool okay=state>0&&slimeCode_->code.size()==5;if(state<0)gpuShaders_.setLastError(slimeCode_->error);
+        for(unsigned i=0;i<5&&okay;++i)if(!slimeShader_[i])okay=SUCCEEDED(device_->CreatePixelShader(reinterpret_cast<const DWORD*>(slimeCode_->code[i].data()),&slimeShader_[i]))&&slimeShader_[i];
+        okay=okay&&ensureSlimeNoise();
+        if(!okay){slimeFailed_=true;for(auto& s:slimeShader_)re3gpu::SafeRelease(s);
+            if(!slimeWarned_){slimeWarned_=true;char text[700];std::snprintf(text,sizeof(text),"SLIME_SHADER_FAILED %.600s; the native sprites stay\n",gpuShaders_.lastError().c_str());log(text);}
+            return false;}
+        if(!slimeWarned_){slimeWarned_=true;log("SLIME_SHADERS ready\n");}
+        return true;
+    }
+    IDirect3DPixelShader9* slimeShader(unsigned prims){
+        if(!slimeReady())return nullptr;
+        return slimeShader_[prims<=4?0u:prims<=8?1u:prims<=12?2u:prims<=16?3u:4u];
+    }
+    bool slimeUsable(){return slimeReady();}
+    // fx 2026-11-11f: the picture behind a batch - the part of the current target under `area` (target pixels) copied into a
+    // texture of the target's size; the slime shows it through itself. False: no copy (the shader then blends by alpha).
+    IDirect3DTexture9* slimeScene_=nullptr;UINT slimeSceneW_=0,slimeSceneH_=0;D3DFORMAT slimeSceneFormat_=D3DFMT_UNKNOWN;bool slimeSceneFailed_=false;unsigned slimeSceneMisses_=0;
+    bool slimeSceneCopy(const RECT& area,float& invW,float& invH){
+        if(slimeSceneFailed_||!slimeRefraction)return false;
+        IDirect3DSurface9* target=nullptr;if(FAILED(device_->GetRenderTarget(0,&target))||!target)return false;
+        D3DSURFACE_DESC desc{};bool okay=SUCCEEDED(target->GetDesc(&desc))&&desc.Width&&desc.Height;
+        if(okay&&(!slimeScene_||slimeSceneW_!=desc.Width||slimeSceneH_!=desc.Height||slimeSceneFormat_!=desc.Format)){
+            re3gpu::SafeRelease(slimeScene_);
+            okay=SUCCEEDED(device_->CreateTexture(desc.Width,desc.Height,1,D3DUSAGE_RENDERTARGET,desc.Format,D3DPOOL_DEFAULT,&slimeScene_,nullptr))&&slimeScene_;
+            if(okay){slimeSceneW_=desc.Width;slimeSceneH_=desc.Height;slimeSceneFormat_=desc.Format;
+                char text[160];std::snprintf(text,sizeof(text),"SLIME_SCENE %ux%u format=%u (the picture behind the slime)\n",desc.Width,desc.Height,unsigned(desc.Format));log(text);}
+        }
+        if(okay){RECT r=area;r.left=(std::max<LONG>)(0,r.left);r.top=(std::max<LONG>)(0,r.top);r.right=(std::min<LONG>)(LONG(desc.Width),r.right);r.bottom=(std::min<LONG>)(LONG(desc.Height),r.bottom);
+            okay=r.right>r.left&&r.bottom>r.top;
+            if(okay){IDirect3DSurface9* to=nullptr;okay=SUCCEEDED(slimeScene_->GetSurfaceLevel(0,&to))&&to;
+                if(okay)okay=SUCCEEDED(device_->StretchRect(target,&r,to,&r,D3DTEXF_NONE));
+                if(to)to->Release();
+                if(!okay&&++slimeSceneMisses_>=8){slimeSceneFailed_=true;log("SLIME_SCENE_FAILED the picture behind the slime cannot be copied: it is blended by alpha instead\n");}}}
+        target->Release();invW=1.f/float((std::max)(1u,desc.Width));invH=1.f/float((std::max)(1u,desc.Height));
+        return okay;
+    }
+    bool slimeRefraction=true;   // false: never copy the target (the alpha fallback)
+    // Draws one batch into the current target and the models' depth buffer (the same clear-per-epoch rule as drawGpu).
+    // weight: 1 = the build itself, below 1 the in-between frame toward it. origin = the viewport's corner in the target.
+    HRESULT drawSlime(const re3gpu::SlimeBatch& batch,float weight){
+        if(resetPending_)return D3DERR_DEVICELOST;
+        if(!device_||!shader_||batch.now.empty())return E_INVALIDARG;
+        const std::size_t count=(std::min<std::size_t>)(batch.now.size(),re3gpu::kSlimeMaxPrims);
+        auto* pixel=slimeShader(unsigned(count));if(!pixel)return S_FALSE;
+        const bool blend=weight<1.f&&batch.before.size()==batch.now.size();
+        D3DVIEWPORT9 viewport{};device_->GetViewport(&viewport);
+        SavedState saved;HRESULT hr=saved.capture(device_);if(FAILED(hr))return hr;
+        IDirect3DSurface9* previousDepth=nullptr;device_->GetDepthStencilSurface(&previousDepth);
+        DWORD addressW=D3DTADDRESS_WRAP;device_->GetSamplerState(0,D3DSAMP_ADDRESSW,&addressW);
+        const bool useDepth=ensureDepth()&&SUCCEEDED(device_->SetDepthStencilSurface(depth_));
+        hr=setCommon();quadPipeline(pixel);
+        if(useDepth){
+            const std::uint64_t depthKey=passKey?passKey:batch.epoch;
+            if(renderedEpoch_!=depthKey){renderedEpoch_=depthKey;depthCleared_=false;++depthResets;}
+            if(!depthCleared_)depthCleared_=SUCCEEDED(device_->Clear(0,nullptr,D3DCLEAR_ZBUFFER,0,1,0));
+        }
+        const std::pair<D3DRENDERSTATETYPE,DWORD> states[]={{D3DRS_ZENABLE,useDepth?D3DZB_TRUE:D3DZB_FALSE},{D3DRS_ZWRITEENABLE,useDepth},{D3DRS_ZFUNC,D3DCMP_LESSEQUAL},{D3DRS_ALPHABLENDENABLE,TRUE},
+            {D3DRS_SRCBLEND,D3DBLEND_SRCALPHA},{D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA},{D3DRS_BLENDOP,D3DBLENDOP_ADD}};
+        for(const auto& state:states)device_->SetRenderState(state.first,state.second);
+        device_->SetTexture(0,slimeNoise_);
+        const std::pair<D3DSAMPLERSTATETYPE,DWORD> samplers[]={{D3DSAMP_ADDRESSU,D3DTADDRESS_WRAP},{D3DSAMP_ADDRESSV,D3DTADDRESS_WRAP},{D3DSAMP_ADDRESSW,D3DTADDRESS_WRAP},
+            {D3DSAMP_MINFILTER,D3DTEXF_LINEAR},{D3DSAMP_MAGFILTER,D3DTEXF_LINEAR},{D3DSAMP_MIPFILTER,D3DTEXF_NONE},{D3DSAMP_SRGBTEXTURE,FALSE}};
+        for(const auto& state:samplers)device_->SetSamplerState(0,state.first,state.second);
+        // fx 2026-11-11f: the picture behind the batch (stage 1), a little wider than the batch: the surface's slope shifts it
+        const float l=(std::max)(0.f,std::floor(batch.rect[0]))+float(viewport.X),t=(std::max)(0.f,std::floor(batch.rect[1]))+float(viewport.Y);
+        const float r=(std::min)(float(viewport.Width),std::ceil(batch.rect[2]))+float(viewport.X),b=(std::min)(float(viewport.Height),std::ceil(batch.rect[3]))+float(viewport.Y);
+        const float shift=batch.refraction*float(viewport.Width)/2560.f;float sceneInv[2]{};bool haveScene=false;
+        if(r>l&&b>t){const LONG margin=LONG(std::ceil(shift))+2;const RECT area{LONG(l)-margin,LONG(t)-margin,LONG(r)+margin,LONG(b)+margin};haveScene=slimeSceneCopy(area,sceneInv[0],sceneInv[1]);}
+        device_->SetTexture(1,haveScene?slimeScene_:nullptr);
+        const std::pair<D3DSAMPLERSTATETYPE,DWORD> sceneSamplers[]={{D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP},{D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP},
+            {D3DSAMP_MINFILTER,D3DTEXF_LINEAR},{D3DSAMP_MAGFILTER,D3DTEXF_LINEAR},{D3DSAMP_MIPFILTER,D3DTEXF_NONE},{D3DSAMP_SRGBTEXTURE,FALSE}};
+        for(const auto& state:sceneSamplers)device_->SetSamplerState(1,state.first,state.second);
+        auto mix=[&](float a,float b){return blend?b+(a-b)*weight:a;};
+        float constants[21][4]{};std::memcpy(constants[18],batch.look,16);std::memcpy(constants[20],batch.look2,16);
+        constants[19][0]=sceneInv[0];constants[19][1]=sceneInv[1];constants[19][2]=shift;constants[19][3]=haveScene?1.f:0.f;
+        // the ray of a target pixel: viewport pixels = target pixels - the viewport corner
+        constants[0][0]=batch.ray[0];constants[0][1]=batch.ray[1]-batch.ray[0]*float(viewport.X);constants[0][2]=batch.ray[2];constants[0][3]=batch.ray[3]-batch.ray[2]*float(viewport.Y);
+        for(unsigned k=0;k<4;++k)constants[1][k]=mix(batch.bound[k],batch.boundBefore[k]);
+        if(blend){   // the sphere of the in-between frame holds both ends
+            float d=0;for(unsigned k=0;k<3;++k){const float e=batch.bound[k]-batch.boundBefore[k];d+=e*e;}constants[1][3]=(std::max)(batch.bound[3],batch.boundBefore[3])+0.5f*std::sqrt(d);}
+        constants[2][0]=mix(batch.time,batch.timeBefore);constants[2][1]=batch.nearPlane;constants[2][2]=batch.sharpness;constants[2][3]=batch.noise;
+        std::memcpy(constants[3],batch.floorPlane,16);std::memcpy(constants[4],batch.lightDir,48);std::memcpy(constants[7],batch.lightColour,48);
+        std::memcpy(constants[10],batch.ambient,16);constants[10][3]=batch.opacity;std::memcpy(constants[11],batch.up,12);constants[11][3]=batch.noiseScale;
+        std::memcpy(constants[12],batch.tones,96);
+        device_->SetPixelShaderConstantF(0,&constants[0][0],21);
+        static const unsigned kSlots[5]={4,8,12,16,24};const unsigned slots=kSlots[count<=4?0:count<=8?1:count<=12?2:count<=16?3:4];
+        float prims[re3gpu::kSlimeMaxPrims*3][4];
+        for(unsigned i=0;i<slots;++i){
+            if(i<count){const auto& a=batch.now[i];const auto* was=blend?&batch.before[i]:nullptr;
+                for(unsigned k=0;k<4;++k){prims[i*3][k]=was?was->a[k]+(a.a[k]-was->a[k])*weight:a.a[k];prims[i*3+1][k]=was?was->b[k]+(a.b[k]-was->b[k])*weight:a.b[k];prims[i*3+2][k]=a.c[k];}}
+            else{const float away[4]={0,0,-1.e6f,0};std::memcpy(prims[i*3],away,16);std::memcpy(prims[i*3+1],away,16);std::memset(prims[i*3+2],0,16);}
+        }
+        device_->SetPixelShaderConstantF(21,&prims[0][0],slots*3);
+        if(r>l&&b>t&&SUCCEEDED(hr)){const LightVertex v[4]={{l-.5f,t-.5f,0,1,0xffffffffu,0,0},{r-.5f,t-.5f,0,1,0xffffffffu,1,0},{l-.5f,b-.5f,0,1,0xffffffffu,0,1},{r-.5f,b-.5f,0,1,0xffffffffu,1,1}};
+            hr=device_->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,v,sizeof(LightVertex));++slimeQuads;slimePixels+=std::uint64_t((r-l)*(b-t));}
+        device_->SetSamplerState(0,D3DSAMP_ADDRESSW,addressW);
+        const HRESULT depthRestore=device_->SetDepthStencilSurface(previousDepth);if(previousDepth)previousDepth->Release();
+        const HRESULT restored=saved.restore(device_);
+        if(SUCCEEDED(hr)&&FAILED(depthRestore))hr=depthRestore;if(SUCCEEDED(hr)&&FAILED(restored))hr=restored;
+        return hr;
+    }
+    std::uint64_t slimeQuads=0,slimePixels=0;
     // Additive light sprites (muzzle flash halo, core, afterglow) on the current target, in its pixels.
     HRESULT drawGlow(const re3gpu::GlowQuad* quads,std::size_t count,float gain){
         if(resetPending_)return D3DERR_DEVICELOST;

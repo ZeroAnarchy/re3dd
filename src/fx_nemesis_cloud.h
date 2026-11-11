@@ -90,6 +90,11 @@ static double perfSum=0,perfMax=0;static unsigned perfFrames=0,perfQuads=0;   //
 inline float rnd(){seedState=seedState*1664525u+1013904223u;return float((seedState>>8)&0xffff)/65535.f;}
 inline float rnd(float a,float b){return a+(b-a)*rnd();}
 inline bool nemesisModel(std::uint8_t m){return m>=0x34&&m<=0x3b;}
+// fx 2026-11-11f: 37 / 39 / 3B are set beside the bodies 36 / 38 / 35 by the rooms' scripts (his second form: em_set 36 + 37) and
+// stand with life -1 while he lives: never "the downed Nemesis", and a sprite of theirs belongs to the body in the room
+inline bool nemesisCompanion(std::uint8_t m){return m==0x37||m==0x39||m==0x3b;}
+static const std::uint8_t* nemesisBody=nullptr;   // the body actor in the room this tick (a living one first)
+inline const std::uint8_t* bodyOf(const std::uint8_t* owner){return owner&&nemesisCompanion(owner[0x4a])&&nemesisBody?nemesisBody:owner;}
 
 inline std::shared_ptr<ModelAsset> pack(){
     auto asset=getModel("fx-nemesis-cloud");
@@ -106,7 +111,8 @@ inline const std::uint8_t* nemesisSprite(const void* effect){
     if(!accessible(owner,0x100)||!nemesisModel(owner[0x4a]))return nullptr;
     return owner;
 }
-inline Kind kindOf(std::uint16_t key){switch(key){case 0x0c00:return Spray;case 0x1700:return Splat;case 0x0500:return Drip;case 0x0d00:return Floor;}return Unknown;}
+// fx 2026-11-11f: 1800 (class 01, the falling drop of his second form: the tentacle actor 37 throws pairs 1700 + 1800) = a drop
+inline Kind kindOf(std::uint16_t key){switch(key){case 0x0c00:return Spray;case 0x1700:return Splat;case 0x0500:case 0x1800:return Drip;case 0x0d00:return Floor;}return Unknown;}
 // one of Nemesis' own non-blood sprites out of his body while he goes down: set 0 (blood effects), owner +0xBC a Nemesis
 // actor with life <= 0 (downing xx0103 at -7, down 0007/0107/0207 at -1), palette +0xB3 not 0 (0 = the red hit blood)
 inline const std::uint8_t* ownerOf(const void* effect){
@@ -114,7 +120,7 @@ inline const std::uint8_t* ownerOf(const void* effect){
     const auto key=read<std::uint16_t>(effect,0x28);if(key&0xffu)return nullptr;
     if(!(read<std::uint8_t>(effect,0xb3)&15u))return nullptr;
     const auto* owner=read<const std::uint8_t*>(effect,0xbc);
-    if(!accessible(owner,0x100)||!nemesisModel(owner[0x4a])||read<std::int16_t>(owner,0xcc)>0)return nullptr;
+    if(!accessible(owner,0x100)||!nemesisModel(owner[0x4a])||read<std::int16_t>(bodyOf(owner),0xcc)>0)return nullptr;
     return owner;
 }
 // blood_fx.h collapseNativeSpray: Nemesis' palette 2/4 sprites are not blood (no red replacement, texture not taken as blood's).
@@ -174,12 +180,8 @@ inline void emit(Kind kind,const Vec3& at,const Vec3& from,std::uint32_t light,s
 // arm puffs: pilot.ini nemesis_cloud_arm_purple_density (percent, default 45) scales their opacity, they are 0.8x smaller, and
 // puffs born in the same tick closer than 220 units merge (was 60), so the hand gets separate wisps instead of one thick fog
 // fx5: 0 = the native arm sprites with the 8x texture (armBinding), 1 = the HD gas puffs on them (rounds 2-4)
-inline int armMode(){
-    static int value=-1;
-    if(value<0){value=GetPrivateProfileIntA("pilot","nemesis_cloud_arm",0,(root+"\\pilot.ini").c_str())!=0?1:0;
-        log("NEMESIS_CLOUD_ARM_MODE %d (%s)",value,value?"HD gas on the living Nemesis' sprites":"native sprites, 8x texture native-arm-p5/p9");}
-    return value;
-}
+// fx 2026-11-11e: 2 = the volumetric slime (the default; pilot.ini nemesis_slime=0 or the F5 row: 0)
+inline int armMode();
 inline int purpleDensity(){
     static int value=-1;
     if(value<0){value=(std::max)(5,(std::min)(100,int(GetPrivateProfileIntA("pilot","nemesis_cloud_arm_purple_density",45,(root+"\\pilot.ini").c_str()))));
@@ -203,6 +205,127 @@ inline void emitArm(Kind native,const Vec3& at,std::uint32_t light,std::uintptr_
     if(palette==4){p.alpha*=float(purpleDensity())/100.f;p.size*=0.8f;}   // fx4: sparser purple fog around the hand
     addPuff(p);++armSpawned;
 }
+// ---------------------------------------------------------------- fx 2026-11-11e: volumetric slime at the living Nemesis' hand
+// User 11.11: "redo the bubbling purple slime out of his right fist after all, it looks too much like a flat picture - work on it
+// properly so it looks cool and volumetric". Mode 2 of the arm effect (the default; pilot.ini nemesis_slime=0 or the F5 row give
+// mode 0, the native sprites at 8x; nemesis_cloud_arm=1 the old gas): every sprite of the living Nemesis' own set (keys 0C00 /
+// 1700 / 0500 / 0D00, palettes 2 and 4) keeps running in the game as before - same birth, flight and life - but is hidden at
+// the renderer copy and drives a piece of one slime body instead (fx_slime_sim.h: bubbles on a core that rides the hand, drops
+// on strands, gobs, domes on the floor). The body is drawn by ModelRenderer::drawSlime (model_gpu.h SlimeSource: a surface
+// found per pixel, with its own depth against the HD models, lit by Nemesis' native light) as jobs in the ordering table at
+// its depth; the in-between frame of the 60 fps mode blends the two builds. While the shaders compile (a worker thread, about
+// three seconds after Nemesis first enters a room) or when they cannot be made, the native sprites stay.
+static int armModeSetting=-1;   // 0 native sprites (8x page), 1 HD gas (rounds 2-4), 2 volumetric slime; -1 = not read yet
+static bool slimeLiftOn=true;   // pilot.ini nemesis_slime_lift (QA): 0 = the mass stays where the sprites are born (inside the body)
+static float slimeBrightness=1.f;   // fx 2026-11-11f2: pilot.ini nemesis_slime_brightness (percent, 30..200; 100 = the look of the build)
+static re3slime::Sim slimeSim;
+static std::vector<re3slime::Sprite> slimeLive;
+// part = the body part the sprites come from (-1: not one of the body's), local = the mean place they are born at in that part's
+// own space, lift = how far the mass is moved out of the body toward the eye (smoothed)
+struct SlimeSource {std::uint32_t key=0;const std::uint8_t* owner=nullptr;const void* matrix=nullptr;int part=-1;Vec3 local{};float samples=0,lift=0;};
+static re3model::NativeLighting slimeLight;static bool slimeLightKnown=false;   // the last native light of a Nemesis (the puddles outlive him)
+static unsigned slimeTraceLines=0;
+inline int partOf(const std::uint8_t* owner,const void* matrix);
+// fx 2026-11-11f: the native sprites are born inside the body (at a part's origin +-20 units) and drawn over it; a mass there
+// would be hidden in the HD body. How far the body reaches from `local` (the part's own space) along `dir`: the farthest vertex
+// of the HD mesh near that line. The vertices near the place are kept per part (their bind positions in the part's space).
+struct SlimeBody {const void* asset=nullptr;int part=-1;Vec3 about{};std::vector<Vec3> points;};
+static std::vector<SlimeBody> slimeBodies;
+inline float slimeReach(const std::uint8_t* body,int part,const Vec3& local,const Vec3& dir){
+    if(part<0)return 0;
+    const auto found=actorRuntime.find(const_cast<std::uint8_t*>(body));if(found==actorRuntime.end()||found->second.asset.empty())return 0;
+    const auto asset=getModel(found->second.asset);if(!asset||std::size_t(part)>=asset->mesh.inverseBind.size())return 0;
+    SlimeBody* cache=nullptr;for(auto& b:slimeBodies)if(b.asset==asset.get()&&b.part==part){cache=&b;break;}
+    if(cache){const Vec3 d=cache->about-local;if(re3model::Dot(d,d)>70.f*70.f)cache->points.clear();}
+    if(!cache){if(slimeBodies.size()>=12)slimeBodies.erase(slimeBodies.begin());slimeBodies.push_back({});cache=&slimeBodies.back();cache->asset=asset.get();cache->part=part;}
+    if(cache->points.empty()){cache->about=local;re3slime::BodyPoints(asset->mesh,std::size_t(part),local,cache->points);
+        if(cache->points.empty())cache->points.push_back(local);
+        log("NEMESIS_SLIME_BODY asset=%s part=%d about=%.0f,%.0f,%.0f points=%zu (the HD body round the place the sprites are born at)",found->second.asset.c_str(),part,local.x,local.y,local.z,cache->points.size());}
+    return re3slime::BodyReach(cache->points,local,dir);
+}
+static std::vector<SlimeSource> slimeSources;
+static bool slimeOk=false;static std::uint64_t slimeSprites=0,slimeBatches=0,slimeFrames=0;static unsigned slimeLogged=0;static double slimePerf=0;
+static std::vector<std::uint64_t> slimeSeen;   // the sprites met before (a new one adds its birth place to its source)
+static bool traceOn=false;   // QA diagnostics below (pilot.ini nemesis_cloud_trace)
+// 2 only while the slime can be drawn; else what the native sprites get
+inline int armEffective(){const int mode=armMode();return mode==2?(slimeOk?2:0):mode;}
+// a live sprite of the living Nemesis for the slime (scanEffects, mode 2)
+inline void slimeSprite(Kind kind,const std::uint8_t* e,const std::uint8_t* owner,std::uint64_t generation){
+    re3slime::Sprite s;s.id=generation?generation:std::uint64_t(reinterpret_cast<std::uintptr_t>(e))|0x8000000000000000ull;
+    s.kind=kind==Splat?re3slime::Splat:kind==Drip?re3slime::Drip:kind==Floor?re3slime::Floor:re3slime::Spray;
+    s.palette=std::uint8_t((read<std::uint8_t>(e,0xb3)&15u)==2?2:4);
+    s.pos={float(read<std::int32_t>(e,0x48)),float(read<std::int32_t>(e,0x4c)),float(read<std::int32_t>(e,0x50))};
+    const void* matrix=kind==Floor?nullptr:read<const void*>(e,0xc0);   // the part it was thrown from
+    s.emitter=std::uint32_t(reinterpret_cast<std::uintptr_t>(owner))*2654435761u^std::uint32_t(reinterpret_cast<std::uintptr_t>(matrix));
+    SlimeSource* source=nullptr;for(auto& src:slimeSources)if(src.key==s.emitter){source=&src;break;}
+    const bool fresh=!source;
+    if(!source){if(slimeSources.size()>=16)slimeSources.erase(slimeSources.begin());slimeSources.push_back({});source=&slimeSources.back();source->key=s.emitter;source->owner=owner;source->matrix=matrix;
+        source->part=matrix?partOf(owner,matrix):-1;}
+    Vec3 local{};bool haveLocal=false;
+    // the place it is born at in its part's own space (a sprite is seen from its first tick: its place then)
+    if(matrix&&accessible(matrix,sizeof(re3bridge::Matrix32))){const auto m=re3model::FromNativeMatrix(read<re3bridge::Matrix32>(matrix));
+        const Vec3 d{s.pos.x-m.m[3],s.pos.y-m.m[7],s.pos.z-m.m[11]};local={d.x*m.m[0]+d.y*m.m[4]+d.z*m.m[8],d.x*m.m[1]+d.y*m.m[5]+d.z*m.m[9],d.x*m.m[2]+d.y*m.m[6]+d.z*m.m[10]};
+        haveLocal=std::isfinite(local.x+local.y+local.z)&&re3model::Dot(local,local)<900.f*900.f;}
+    bool born=true;for(const auto& o:slimeSeen)if(o==s.id){born=false;break;}
+    if(born){if(slimeSeen.size()>=192)slimeSeen.erase(slimeSeen.begin());slimeSeen.push_back(s.id);
+        if(haveLocal&&(kind==Splat||kind==Drip)){source->samples=(std::min)(24.f,source->samples+1.f);source->local=source->local+(local-source->local)*(1.f/source->samples);}
+        if(traceOn&&slimeTraceLines<500){++slimeTraceLines;log("NEMESIS_SLIME_NEW key=%04x pal=%u owner=%02x part=%d local=%.0f,%.0f,%.0f%s at=%.0f,%.0f,%.0f up=%.0f routine=%08x",unsigned(read<std::uint16_t>(e,0x28)),unsigned(s.palette),unsigned(owner[0x4a]),source->part,
+            local.x,local.y,local.z,haveLocal?"":" (no part matrix)",s.pos.x,s.pos.y,s.pos.z,actorFloorY(bodyOf(owner))-s.pos.y,read<std::uint32_t>(bodyOf(owner),4));}}
+    slimeLive.push_back(s);++slimeSprites;
+    if(slimeLogged<12||(fresh&&slimeLogged<40)){++slimeLogged;log("NEMESIS_SLIME key=%04x pal=%u at=%.0f,%.0f,%.0f owner=%02x part=%d matrix=%p routine=%08x life=%d (the native sprite drives the slime)",unsigned(read<std::uint16_t>(e,0x28)),unsigned(s.palette),s.pos.x,s.pos.y,s.pos.z,
+        unsigned(owner[0x4a]),source->part,matrix,read<std::uint32_t>(bodyOf(owner),4),int(read<std::int16_t>(bodyOf(owner),0xcc)));}
+}
+inline void slimeUpdate(){
+    if(slimeLive.empty()&&slimeSim.empty()){slimeSources.clear();slimeSeen.clear();return;}
+    LARGE_INTEGER f,a,b;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&a);
+    re3model::Projection pr;const bool haveView=snapshotProjection(pr);
+    re3model::Matrix3x4 view;Vec3 eye{};const bool haveEye=haveView&&re3model::InverseAffine(pr.camera,view);if(haveEye)eye={view.m[3],view.m[7],view.m[11]};
+    // the parts now: where each one's matrix stands this tick (the core of the mass rides it)
+    std::vector<re3slime::Emitter> emitters;const std::uint8_t* owner=nullptr;
+    for(auto& src:slimeSources){re3slime::Emitter em;em.key=src.key;
+        const std::uint8_t* body=accessible(src.owner,0x164)&&nemesisModel(src.owner[0x4a])?bodyOf(src.owner):nullptr;
+        if(body&&accessible(body,0x164)){owner=body;em.floorY=actorFloorY(body);em.floorKnown=true;
+            if(src.matrix&&accessible(src.matrix,sizeof(re3bridge::Matrix32))){const auto m=re3model::FromNativeMatrix(read<re3bridge::Matrix32>(src.matrix));
+                em.origin={m.m[3],m.m[7],m.m[11]};for(unsigned c=0;c<3;++c)em.axis[c]={m.m[c],m.m[4+c],m.m[8+c]};
+                // a part of this actor: within reach of its root (a stale pointer reads anything)
+                const float dx=em.origin.x-float(read<std::int32_t>(body,0x34)),dy=em.origin.y-float(read<std::int32_t>(body,0x38)),dz=em.origin.z-float(read<std::int32_t>(body,0x3c));
+                em.valid=std::isfinite(dx+dy+dz)&&dx*dx+dy*dy+dz*dz<6000.f*6000.f;
+                // out of the HD body toward the eye, as far as the body reaches there from the place the sprites are born at
+                if(em.valid&&haveEye&&slimeLiftOn){const Vec3 at=em.origin+em.axis[0]*src.local.x+em.axis[1]*src.local.y+em.axis[2]*src.local.z;Vec3 to=eye-at;const float far2=re3model::Dot(to,to);
+                    if(far2>400.f*400.f){to=to*(1.f/std::sqrt(far2));const Vec3 dir{re3model::Dot(to,em.axis[0]),re3model::Dot(to,em.axis[1]),re3model::Dot(to,em.axis[2])};
+                        const float reach=src.owner==body?slimeReach(body,src.part,src.local,dir):0.f;src.lift+=(reach-src.lift)*0.35f;em.lift=to*src.lift;}}}}
+        emitters.push_back(em);}
+    slimeSim.step(slimeLive,emitters);slimeLive.clear();
+    std::vector<re3slime::Group> groups;slimeSim.build(groups,re3gpu::kSlimeMaxPrims);
+    if(groups.empty()||!slimeOk||!haveView||!modelRenderer.resetDevice(gameDevice))return;
+    if(owner){const auto found=actorRuntime.find(const_cast<std::uint8_t*>(owner));if(found!=actorRuntime.end()&&found->second.nativeLightKnown){slimeLight=found->second.nativeLight;slimeLightKnown=true;}}
+    const re3model::NativeLighting* light=slimeLightKnown?&slimeLight:nullptr;
+    const auto chooseTable=reinterpret_cast<ChooseTable>(gameBase+0x5adc0);unsigned made=0;
+    for(const auto& g:groups){
+        auto batch=std::make_shared<re3gpu::SlimeBatch>();re3slime::DefaultTones(*batch,slimeBrightness);
+        if(!re3slime::MakeBatch(g,pr,320.f*pr.scaleX,240.f*pr.scaleY,slimeSim.tick(),*batch))continue;
+        re3slime::SetLight(*batch,light,pr.camera);batch->epoch=modelRenderer.epoch();
+        const auto& first=g.now.front();const std::int32_t position[3]={std::int32_t(first.a.x),std::int32_t(first.a.y),std::int32_t(first.a.z)};
+        auto* table=chooseTable(position);if(!table||!accessible(table,1024*4,true))continue;
+        // fx 2026-11-11f: drawn after what it lies on (the picture behind it shows through): at its nearest depth; the depth
+        // buffer of the HD models does the rest pixel by pixel
+        const int bucket=int((std::max)(1.f,batch->bound[2]-batch->bound[3]))>>5;
+        auto job=std::make_shared<ModelJob>();job->slime=batch;job->name="nemesis-slime";
+        std::vector<re3bridge::BucketJob> jobs;jobs.push_back({std::uint16_t((std::min)(1023,(std::max)(1,bucket))),reinterpret_cast<std::uintptr_t>(job.get()),job});
+        if(re3bridge::EnqueueBatch(table,1024,jobs)){++made;++slimeBatches;}else once("nemesis-slime-enqueue","the slime skipped for one ordering table");
+    }
+    QueryPerformanceCounter(&b);slimePerf+=double(b.QuadPart-a.QuadPart)*1000.0/double(f.QuadPart);
+    if(made&&++slimeFrames%150==0){log("NEMESIS_SLIME_PERF frames=150 update_avg_ms=%.3f batches_total=%llu sprites_total=%llu blobs=%zu puddles=%zu groups=%zu rect_pixels_total=%llu",slimePerf/150.0,(unsigned long long)slimeBatches,(unsigned long long)slimeSprites,slimeSim.blobs(),slimeSim.puddles(),groups.size(),
+        (unsigned long long)modelRenderer.slimePixels);slimePerf=0;}
+}
+inline int armMode(){
+    if(armModeSetting<0){const std::string ini=root+"\\pilot.ini";
+        armModeSetting=GetPrivateProfileIntA("pilot","nemesis_cloud_arm",0,ini.c_str())==1?1:GetPrivateProfileIntA("pilot","nemesis_slime",1,ini.c_str())!=0?2:0;
+        slimeLiftOn=GetPrivateProfileIntA("pilot","nemesis_slime_lift",1,ini.c_str())!=0;
+        slimeBrightness=float((std::max)(30,(std::min)(200,int(GetPrivateProfileIntA("pilot","nemesis_slime_brightness",100,ini.c_str())))))/100.f;
+        log("NEMESIS_CLOUD_ARM_MODE %d (%s) slime_brightness=%d%%",armModeSetting,armModeSetting==2?"volumetric slime on the living Nemesis' sprites":armModeSetting?"HD gas on the living Nemesis' sprites":"native sprites, 8x texture native-arm-p5/p9",int(slimeBrightness*100.f+0.5f));}
+    return armModeSetting;
+}
 // every live effect of the pool (96 x 0xD4 at A46720) that is one of Nemesis' sprites: a puff at its first frame, the puff
 // follows the native sprite while it lives (the native sprite flies out of the body), then drifts on its own
 inline void scanEffects(){
@@ -213,11 +336,13 @@ inline void scanEffects(){
         if((read<std::uint16_t>(e,0x24)&0xa000u)!=0xa000u)continue;
         const auto* owner=nemesisSprite(e);if(!owner)continue;
         const auto key=read<std::uint16_t>(e,0x28);const Kind kind=kindOf(key);
-        if(read<std::int16_t>(owner,0xcc)>0){   // fx2: the living Nemesis (tentacle attacks)
-            if(kind==Unknown||!armPack||armMode()==0)continue;   // fx5: native sprites (armBinding draws them at 8x)
-            armActive=true;
+        if(read<std::int16_t>(bodyOf(owner),0xcc)>0){   // fx2: the living Nemesis (tentacle attacks)
+            if(kind==Unknown){static unsigned lines=0;if(traceOn&&lines<60){++lines;log("NEMESIS_SLIME_OTHER key=%04x class=%02x pal=%u clut=%04x tpage=%04x owner=%02x (a sprite of the living Nemesis that is not one of the four: left native)",key,e[0],unsigned(read<std::uint8_t>(e,0xb3)&15u),read<std::uint16_t>(e,0x44),read<std::uint16_t>(e,0x46),owner[0x4a]);}continue;}
             const auto address=reinterpret_cast<std::uintptr_t>(e);
             const auto at=effectGeneration.find(address);const std::uint64_t generation=at==effectGeneration.end()?0:at->second;
+            if(armEffective()==2){armActive=true;noteTexture(e);slimeSprite(kind,e,owner,generation);continue;}   // fx 2026-11-11e: the slime
+            if(!armPack||armEffective()!=1)continue;   // fx5: native sprites (armBinding draws them at 8x)
+            armActive=true;
             bool known=false;for(auto& sn:seen)if(sn.effect==address&&sn.generation==generation){sn.tick=tick;known=true;break;}
             if(known)continue;
             seen.push_back({address,generation,tick});++armSeen;noteTexture(e);
@@ -616,7 +741,7 @@ static bool armBinding(const std::uint8_t* p,unsigned tpage,unsigned clut,float 
     (void)p;
     if(!enabled||(tpage&0x19fu)!=0x1eu||(clut!=0x7891u&&clut!=0x7911u))return false;
     if(minU<0.f||minV<0.f||maxU>240.f||maxV>88.f)return false;
-    if(armMode()!=0||!active())return false;
+    if(armEffective()!=0||!active())return false;   // fx 2026-11-11e: also while the slime is not ready
     static int present=-1;
     if(present<0){present=GetFileAttributesA((root+"\\model-pack\\fx-nemesis-cloud\\native-arm-p5.png").c_str())!=INVALID_FILE_ATTRIBUTES&&
                           GetFileAttributesA((root+"\\model-pack\\fx-nemesis-cloud\\native-arm-p9.png").c_str())!=INVALID_FILE_ATTRIBUTES?1:0;
@@ -637,10 +762,10 @@ static bool armBinding(const std::uint8_t* p,unsigned tpage,unsigned clut,float 
 // pilot.ini nemesis_cloud_debug_burst=N (+ _every=K ticks): the first Nemesis sprite in palette 2/4 of a living Nemesis (or of a
 // downed one with _burst_down=1) starts N frame captures, one every K effect-loop ticks (game time, the game keeps running;
 // files captures\frame-NCB<n>-...tga, moved by the QA driver).
-static bool traceOn=false,debugLoaded=false,burstDown=false;
+static bool debugLoaded=false,burstDown=false;
 static unsigned burstCount=0,burstEvery=4,burstLeft=0,burstNext=0,burstSerial=0,burstQuietUntil=0,traceLines=0;
 struct Traced{bool live=false;std::uint16_t key=0;std::uint8_t palette=0;std::uint32_t born=0;std::int32_t pos[3]{};};
-static Traced traced[96];
+static Traced traced[96];static bool anyTraced[96]{};
 inline void loadDebugKeys(){
     if(debugLoaded)return;debugLoaded=true;const std::string ini=root+"\\pilot.ini";
     if(!GetPrivateProfileIntA("pilot","debug_warp",0,ini.c_str()))return;
@@ -674,6 +799,10 @@ inline void diagnose(){
                 read<std::int32_t>(e,0x48),read<std::int32_t>(e,0x4c),read<std::int32_t>(e,0x50));}
             t.live=false;
         }
+        if(live&&!nem&&traceOn&&nemesisHere&&(key&0xffu)==0&&(read<std::uint8_t>(e,0xb3)&15u)&&!anyTraced[slot]){anyTraced[slot]=true;
+            if(traceLines<1600){++traceLines;log("NEMESIS_FX_ANY slot=%u key=%04x class=%02x pal=%u clut=%04x tpage=%04x owner=%p model=%02x pos=%d,%d,%d (set 0, another palette, not owned by a Nemesis actor)",slot,key,e[0],unsigned(read<std::uint8_t>(e,0xb3)&15u),read<std::uint16_t>(e,0x44),read<std::uint16_t>(e,0x46),
+                owner,accessible(owner,0x100)?unsigned(owner[0x4a]):0xffu,read<std::int32_t>(e,0x48),read<std::int32_t>(e,0x4c),read<std::int32_t>(e,0x50));}}
+        if(!live)anyTraced[slot]=false;
         if(!nem||t.live)continue;
         t.live=true;t.key=key;t.palette=std::uint8_t(read<std::uint8_t>(e,0xb3)&15u);t.born=tick;for(unsigned r=0;r<3;++r)t.pos[r]=read<std::int32_t>(e,0x48+r*4);
         const int life=read<std::int16_t>(owner,0xcc);
@@ -690,6 +819,7 @@ inline void diagnose(){
 inline void update(){
     const std::uint32_t now=(std::uint32_t(read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa6)))<<16)|read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa8));
     if(now!=room){
+        slimeSim.clear();slimeLive.clear();slimeSources.clear();slimeSeen.clear();slimeBodies.clear();slimeLightKnown=false;nemesisBody=nullptr;   // fx 2026-11-11e
         if(room!=~0u&&(spawned||nativeSeen||armSeen))log("NEMESIS_CLOUD_CLEAR room=%x native=%llu puffs=%llu hidden_packets=%llu stain_frames_hidden=%llu arm_native=%llu arm_puffs=%llu puddle_frames=%llu",now,(unsigned long long)nativeSeen,(unsigned long long)spawned,(unsigned long long)hidden,(unsigned long long)stainsHidden,(unsigned long long)armSeen,(unsigned long long)armSpawned,(unsigned long long)puddleDrawn);
         puddleTestEnd("room change");   // r6 puddle QA
         room=now;puffs.clear();seen.clear();stains.clear();textureCount=0;testUntil=0;
@@ -698,15 +828,18 @@ inline void update(){
     try{diagnose();}catch(...){once("nemesis-cloud-diagnose","QA diagnostics skipped");}
     try{puddleRequests();puddleTestStep();}catch(...){once("nemesis-puddle-qa","puddle QA step skipped");}   // r6 puddle QA (pilot.command nemesis-puddle-*)
     if(!enabled)return;
-    nemesisHere=false;nemesisDown=false;std::uint8_t* downed[4]{};unsigned downedCount=0;
+    nemesisHere=false;nemesisDown=false;nemesisBody=nullptr;std::uint8_t* downed[4]{};unsigned downedCount=0;
     {const auto end=read<std::uintptr_t>(reinterpret_cast<void*>(gameBase+0x65ce6c));
         for(std::uintptr_t a=gameBase+0x65cdcc;a<end&&a<gameBase+0x65cdcc+48*4;a+=4){const auto* actor=read<const std::uint8_t*>(reinterpret_cast<void*>(a));
             if(!accessible(actor,0x164)||!nemesisModel(actor[0x4a]))continue;
             nemesisHere=true;
-            if(read<std::int16_t>(actor,0xcc)<=0){nemesisDown=true;if(downedCount<4)downed[downedCount++]=read<std::uint8_t*>(actor,0x160);}}}
+            if(nemesisCompanion(actor[0x4a]))continue;   // fx 2026-11-11f: his tentacle actor stands with life -1 while he lives
+            const bool alive=read<std::int16_t>(actor,0xcc)>0;
+            if(!nemesisBody||(alive&&read<std::int16_t>(nemesisBody,0xcc)<=0))nemesisBody=actor;
+            if(!alive){nemesisDown=true;if(downedCount<4)downed[downedCount++]=read<std::uint8_t*>(actor,0x160);}}}
     // F8 (original): the purple stain is drawn again (a downed body's shadow may no longer be updated by 457130: flag 4
     // would stay off)
-    if(!active()){puffs.clear();for(const auto& st:stains)if(!st.test&&accessible(st.shadow,0x68,true)&&purpleStain(st.shadow))st.shadow[0xe]=std::uint8_t(st.shadow[0xe]|4u);stains.clear();
+    if(!active()){slimeSim.clear();slimeLive.clear();puffs.clear();for(const auto& st:stains)if(!st.test&&accessible(st.shadow,0x68,true)&&purpleStain(st.shadow))st.shadow[0xe]=std::uint8_t(st.shadow[0xe]|4u);stains.clear();
         if(puddleNativeHide)for(unsigned k=0;k<downedCount;++k)if(accessible(downed[k],0x68,true)&&purpleStain(downed[k]))downed[k][0xe]=std::uint8_t(downed[k][0xe]&~4u);   // r6 puddle QA: F8 without the stain
         return;}
     {const auto asset=pack();packOk=bool(asset);armPack=packOk&&asset->mesh.materials.size()>=2&&asset->textures.size()>=2;
@@ -716,7 +849,10 @@ inline void update(){
     if(!packOk)return;
     armActive=false;   // fx2: set by scanEffects while a sprite of the living Nemesis lives (the copy filter hides its texture then)
     test();
+    // fx 2026-11-11e: the slime can be drawn (asking starts the shader compile once a Nemesis is in the room)
+    slimeOk=nemesisHere&&armMode()==2&&modelRenderer.resetDevice(gameDevice)&&modelRenderer.slimeUsable();
     if(nemesisHere)scanEffects();
+    try{slimeUpdate();}catch(...){once("nemesis-slime-exception","the slime skipped a frame");}
     for(unsigned k=0;k<downedCount;++k)if(downed[k])onShadow(downed[k]);
     puddleFps60Captures();   // r6 puddle QA
     stainGas();

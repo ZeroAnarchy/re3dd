@@ -115,4 +115,72 @@ inline void ParseTable(std::istream& in,Table& out){
         else out.objects[ObjectKey(room,object,part)].push_back(rule);
     }
 }
+
+// Door round 2026-11-11: model-pack/door-fit.txt (written by qa/doors-2026-11-11/tools/fit.py, DOORS-2026-11-11.ru.txt)
+//   door <DO2 hex> <mesh record> <side> move=<dx,dy,dz> [at=<x|*>,<y|*>,<z|*>]
+// moves an HD door part in the frame of its native PARENT object: T' = (at or T) + move, T = the part's parent-relative
+// translation (door object +0x34/+0x38/+0x3C, int32). side: '*' any placement; x+ x- y+ y- z+ z- = sign of T on that
+// axis; f+ f- = sign of the part's own rotation m[0][0] (object +0x20). The first matching side row wins, then the first
+// '*' row. The DLL applies it after the native matrix as M . T(R^T (T' - T)), R = object +0x20, so a part the door
+// script turns keeps turning about its own moved axis.
+struct DoorFit {
+    std::uint8_t axis=4;   // 0..2 sign of T on x/y/z, 3 facing (m[0][0]), 4 any
+    std::int8_t sign=0;
+    float move[3]{},at[3]{};bool hasAt[3]{};unsigned line=0;
+};
+struct DoorFits {
+    std::unordered_map<std::uint32_t,std::vector<DoorFit>> rows;   // DoorKey
+    unsigned count=0,invalid=0,firstInvalid=0;
+};
+inline bool ParseFitVector(const std::string& text,float out[3],bool given[3],bool allowStar,float limit){
+    std::istringstream list(text);std::string item;unsigned n=0;
+    while(std::getline(list,item,',')){
+        if(n>=3||item.empty())return false;
+        if(item=="*"){if(!allowStar)return false;given[n]=false;out[n++]=0;continue;}
+        char* end=nullptr;const float v=std::strtof(item.c_str(),&end);
+        if(*end||!std::isfinite(v)||std::abs(v)>limit)return false;
+        given[n]=true;out[n++]=v;
+    }
+    return n==3;
+}
+inline void ParseDoorFits(std::istream& in,DoorFits& out){
+    out=DoorFits{};std::string line;unsigned number=0;
+    while(std::getline(in,line)){
+        ++number;const auto hash=line.find('#');if(hash!=std::string::npos)line.resize(hash);
+        std::istringstream fields(line);std::string kind,a,c,side,option;if(!(fields>>kind))continue;
+        DoorFit fit;fit.line=number;std::uint32_t do2=0,part=0;bool moveSeen=false;
+        bool ok=kind=="door"&&bool(fields>>a>>c>>side)&&a.size()==2&&HexValue(a,255,do2)&&DecimalValue(c,255,part);
+        if(ok){
+            if(side=="*")fit.axis=4;
+            else if(side.size()==2&&(side[1]=='+'||side[1]=='-')&&(side[0]=='x'||side[0]=='y'||side[0]=='z'||side[0]=='f')){
+                fit.axis=side[0]=='f'?3:std::uint8_t(side[0]-'x');fit.sign=side[1]=='+'?1:-1;}
+            else ok=false;
+        }
+        while(ok&&(fields>>option)){
+            const auto equal=option.find('=');if(equal==std::string::npos){ok=false;break;}
+            const std::string key=option.substr(0,equal),value=option.substr(equal+1);bool given[3]{};
+            if(key=="move"){ok=ParseFitVector(value,fit.move,given,false,4000.f);moveSeen=true;}
+            else if(key=="at")ok=ParseFitVector(value,fit.at,fit.hasAt,true,60000.f);
+            else ok=false;
+        }
+        ok=ok&&(moveSeen||fit.hasAt[0]||fit.hasAt[1]||fit.hasAt[2]);
+        if(!ok){if(!out.invalid)out.firstInvalid=number;++out.invalid;continue;}
+        out.rows[DoorKey(do2,part)].push_back(fit);++out.count;
+    }
+}
+// t: the part's parent-relative translation (object +0x34), m00: its rotation m[0][0] (object +0x20, 4096 = 1)
+inline const DoorFit* MatchDoorFit(const DoorFits& fits,std::uint32_t do2,std::uint32_t part,const std::int32_t t[3],std::int16_t m00){
+    const auto found=fits.rows.find(DoorKey(do2,part));if(found==fits.rows.end())return nullptr;
+    for(const auto& fit:found->second){
+        if(fit.axis>3)continue;
+        const std::int32_t v=fit.axis==3?std::int32_t(m00):t[fit.axis];
+        if((fit.sign>0&&v>0)||(fit.sign<0&&v<0))return &fit;
+    }
+    for(const auto& fit:found->second)if(fit.axis==4)return &fit;
+    return nullptr;
+}
+// the parent-frame displacement of the part: (at or t) + move - t
+inline void DoorFitOffset(const DoorFit& fit,const std::int32_t t[3],float out[3]){
+    for(unsigned k=0;k<3;++k)out[k]=(fit.hasAt[k]?fit.at[k]-float(t[k]):0.f)+fit.move[k];
+}
 } // namespace re3prop

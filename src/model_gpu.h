@@ -20,6 +20,9 @@
 #include <d3d9.h>
 #include <d3dcompiler.h>
 #include <array>
+#include <atomic>
+#include <string>
+#include <thread>
 #include <map>
 #include <memory>
 #include <new>
@@ -72,6 +75,8 @@ struct Mesh {
     std::vector<std::uint8_t> triangleBone;     // dominant bone of every source triangle
     std::vector<std::uint32_t> materialFlags;std::vector<float> materialColour;   // 4 per material, RGBA 0..1
     std::vector<float> materialGem;   // kGemParams per material (Gem materials, crystals round 2026-11-07)
+    std::vector<float> materialMetal; // kMetalParams per material (Metal materials, door round 2026-11-11)
+    std::vector<float> materialLeather; // kLeatherParams per material (Leather materials, fx 2026-11-11e)
     bool hasBlend=false;std::size_t bytes=0;
     Mesh()=default;Mesh(const Mesh&)=delete;Mesh& operator=(const Mesh&)=delete;
     ~Mesh(){SafeRelease(vertices);SafeRelease(pose);SafeRelease(dynamicPose);}
@@ -192,7 +197,9 @@ inline std::shared_ptr<Mesh> BuildMesh(IDirect3DDevice9* device,const re3model::
     gpu->materialFlags.reserve(source.materials.size());gpu->materialColour.reserve(source.materials.size()*4);
     for(const auto& m:source.materials){gpu->materialFlags.push_back(m.flags);gpu->hasBlend=gpu->hasBlend||(m.flags&re3model::AlphaBlend)!=0;
         for(unsigned k=0;k<4;++k)gpu->materialColour.push_back(float((m.baseColorRGBA>>(k*8))&255u)/255.f);
-        gpu->materialGem.insert(gpu->materialGem.end(),m.gem,m.gem+kGemParams);}
+        gpu->materialGem.insert(gpu->materialGem.end(),m.gem,m.gem+kGemParams);
+        gpu->materialMetal.insert(gpu->materialMetal.end(),m.metal,m.metal+kMetalParams);
+        gpu->materialLeather.insert(gpu->materialLeather.end(),m.leather,m.leather+kLeatherParams);}
     hr=S_OK;return gpu;
 }
 
@@ -212,6 +219,18 @@ struct DrawRange {std::uint32_t firstVertex=0,vertexCount=0,material=0;};
 // along floorDir onto the plane y = floorY (the floor shadow, drawn right after the room background) and rendered along
 // toLight into a tile of the shadow map (what the actor's own pixels and its neighbours' are tested against).
 struct Draw;
+// fix 2026-11-11d (shadow at floor edges): where an actor's floor shadow may lie, from the room's collision data baked per
+// room (model-pack\floors\<room>.r3floor, tools\rdt_floor\bake_floors.py; model_integration.h lightReceivers). World units,
+// Y down. None or mode 0: the endless plane as before.
+struct ShadowBlock {float q[8]{};float top=0,bottom=0;};          // a convex footprint (x,z corners in order) between two heights
+struct ShadowFace {float a[2]{},b[2]{},n[2]{};float top=0,bottom=0;};   // a vertical face a-b (x,z), unit normal n toward the actor
+struct FloorArea {int x0=0,z0=0,cell=64,nx=0,nz=0;std::vector<std::uint8_t> inside;};   // the floor area under the actor: 255 in its cells (row-major)
+struct ShadowReceivers {
+    int mode=0;                         // 0 endless plane, 1 cut at the floor edge, 2 + the cut part on wall faces
+    std::shared_ptr<const FloorArea> area;
+    std::vector<ShadowBlock> blocks;    // what can hide the floor from the camera (32 at most)
+    std::vector<ShadowFace> faces;      // mode 2: faces near the actor, lit from its side and seen by the camera (4 at most)
+};
 struct ShadowGroup {
     const void* actor=nullptr;
     float toLight[3]={0,-1,0};    // unit, world (Y down): from the actor toward its key light (the strongest native light row)
@@ -223,6 +242,7 @@ struct ShadowGroup {
     std::vector<std::weak_ptr<Draw>> casters;
     // the shadow map of the pass that drew it last (ModelRenderer::renderLighting)
     int tile=-1;float rows[3][4]{};float tileRect[4]{};float depthRange=1;std::uint64_t renderedPass=0;
+    std::shared_ptr<const ShadowReceivers> receivers;   // fix 2026-11-11d
 };
 // A point light of a muzzle flash at one build (world), already scaled by its age.
 struct FlashLight {float position[3]{},radius=0,colour[3]{},floorY=0;bool fresh=false;};
@@ -230,6 +250,7 @@ struct ShadowFrame {
     std::uint32_t serial=0;std::vector<std::shared_ptr<ShadowGroup>> groups;std::vector<FlashLight> flashes;
     // the camera of the build (of its first skinned draw): the floor light of a flash is placed with it
     bool camera=false;float cameraRows[12]{},origin[3]{},h=256,offsetX=160,offsetY=120,pixelOffsetX=0,pixelOffsetY=0;
+    float bucketDepth=0;   // fix 2026-11-11c: camera depth of one ordering-table slot (of that draw), for the mask depths
 };
 // An additive screen quad of the radial light texture (muzzle flash halo, core, afterglow), in target pixels.
 struct GlowQuad {float x=0,y=0,half=0;float colour[3]{};};
@@ -399,6 +420,11 @@ float4 wallPlane:register(c18);   // fix 2026-11-08: camera-space wall plane (Dr
 #ifdef SHADOW_FLOOR
 float4 shadowPlane:register(c19);   // xyz toward the light (unit), w the floor's y in the draw's space
 float4 shadowFeet:register(c20);    // xyz the actor's feet in the draw's space, w 1 / reference height
+// fix 2026-11-11d (shadow at floor edges): the plane the caster is laid on, in the draw's space - unit normal toward the
+// actor's side, w = dot(normal, a point of it); the floor is (0,-1,0,-floorY), a wall face its own plane - and the world
+// position of the draw's origin (the pixel shader tests the point against the room in world units)
+float4 receiverPlane:register(c21);
+float4 drawOrigin:register(c22);
 #endif
 #if defined(SHADOW_DEPTH)||defined(FX_LIGHT)
 float4 shadowRows[3]:register(c21); // the draw's space -> shadow map clip xy (-1..1) and depth (0..1) of its actor's tile
@@ -416,14 +442,23 @@ struct Input {
 #endif
 };
 struct Output {float4 position:POSITION;float4 colour:COLOR0;float2 uv:TEXCOORD0;float3 depthOcclusion:TEXCOORD1;
-#if defined(PIXEL_LIGHT)||defined(GEM)
+#if defined(PIXEL_LIGHT)||defined(GEM)||defined(METAL)
     float3 normal:TEXCOORD2;
 #endif
-#ifdef GEM
+#if defined(GEM)||defined(METAL)
     float3 toEye:TEXCOORD3;
 #endif
 #ifdef FX_LIGHT
     float3 world:TEXCOORD3;float3 shadowCoord:TEXCOORD4;
+#endif
+#ifdef SHADOW_FLOOR
+    float3 receiver:TEXCOORD2;   // fix 2026-11-11d: the shadow point in world units
+#endif
+#ifdef LEATHER
+#ifndef FX_LIGHT
+    float3 world:TEXCOORD3;
+#endif
+    float3 bind:TEXCOORD5;float3 bindNormal:TEXCOORD6;   // fx 2026-11-11e: the bind pose, for the grain
 #endif
 };
 #if defined(SKIN_LINEAR)
@@ -476,17 +511,20 @@ Output main(Input input){
     world=distance>40?out0+toEye*(10/distance):out0;
 #endif
 #ifdef SHADOW_FLOOR
-    // the vertex slides along the light onto the floor plane (Y down: above the floor = smaller y); below it, it stays
+    // the vertex slides along the light onto the receiving plane (Y down: above the floor = smaller y); behind it, it stays
+    // and is only put on it. For the floor (receiverPlane (0,-1,0,-floorY)) this is the 2026-11-10 formula.
     float height=max(0,shadowPlane.w-world.y);
-    world-=shadowPlane.xyz*(height/max(0.05,-shadowPlane.y));
-    world.y=shadowPlane.w;
+    float side=dot(receiverPlane.xyz,world)-receiverPlane.w;
+    world-=shadowPlane.xyz*(max(0,side)/max(0.05,dot(receiverPlane.xyz,shadowPlane.xyz)));
+    world-=receiverPlane.xyz*(dot(receiverPlane.xyz,world)-receiverPlane.w);
 #endif
     float4 h=float4(world,1);
     float3 camera=float3(dot(cameraRows[0],h),dot(cameraRows[1],h),dot(cameraRows[2],h));
     output.position=float4(projection.x*camera.x+projection.y*camera.z,projection.z*camera.y+projection.w*camera.z,camera.z-misc.x,camera.z);
     output.uv=input.uv;output.depthOcclusion=float3(camera.z,input.colour.r,dot(wallPlane.xyz,camera)+wallPlane.w);
 #ifdef SHADOW_FLOOR
-    output.depthOcclusion=float3(height*shadowFeet.w,length(world.xz-shadowFeet.xz),0);
+    output.depthOcclusion=float3(height*shadowFeet.w,length(world.xz-shadowFeet.xz),camera.z);   // fix 2026-11-11d: z = camera depth of the floor point
+    output.receiver=world+drawOrigin.xyz;
 #endif
 #ifdef SHADOW_DEPTH
     // orthographic along the light; what lies nearer to the light than the tile's range is flattened onto its near plane
@@ -497,16 +535,22 @@ Output main(Input input){
 #ifdef FX_LIGHT
     output.world=world;output.shadowCoord=float3(dot(shadowRows[0],h),dot(shadowRows[1],h),dot(shadowRows[2],h));
 #endif
+#ifdef LEATHER
+#ifndef FX_LIGHT
+    output.world=world;
+#endif
+    output.bind=input.position;output.bindNormal=bindNormal;
+#endif
     float4 colour=colourTint;
 #ifndef SKIN_DECAL
     colour.rgb*=tint;   // damage red belongs to the body, not to its wound decals
 #endif
-#if defined(PIXEL_LIGHT)||defined(GEM)
+#if defined(PIXEL_LIGHT)||defined(GEM)||defined(METAL)
     output.normal=normal;
 #elif !defined(SHADOW_FLOOR)&&!defined(SHADOW_DEPTH)
     if(lightData[10].z>0)colour.rgb*=Shade(normal,input.colour.r);
 #endif
-#ifdef GEM
+#if defined(GEM)||defined(METAL)
     output.toEye=eyeWorld.xyz-world;   // world and eye are both relative to the draw's origin (the rounded eye)
 #endif
     output.colour=colour;
@@ -558,14 +602,99 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float2 depthOcclusion:TEXCOOR
     alpha=saturate(max(alpha,dot(spec,float3(0.333,0.333,0.334))));
     return float4(colour,alpha*coverage*options.z);
 }
+#elif defined(METAL)
+// Door round 2026-11-11: an opaque metal (Metal materials, metal.txt values, model_integration.h loadMetalMaterials). The
+// native light still decides how bright the part is: a small diffuse share of the albedo, Blinn-Phong highlights of the
+// three native light rows (their colour-matrix column, as the GEM shader), and a sky-above / floor-below environment
+// reflection scaled by the light the scene gives a surface facing up and one facing the eye, so a knob in a dark corridor
+// stays dark. Highlights and reflection take the albedo colour by 'tint' (brass) with a Schlick fresnel toward white.
+float4 wallSide:register(c13);
+float4 metalA:register(c14);   // diffuse, specular, shininess, reflect
+float4 metalB:register(c15);   // sky rgb, fresnel
+float4 metalC:register(c16);   // floor rgb, tint
+float4 metalD:register(c17);   // gain, follow, horizon, softness
+float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOORD1,float3 normal:TEXCOORD2,float3 toEye:TEXCOORD3):COLOR0{
+    clip(depthOcclusion.x-range.x);clip(range.y-depthOcclusion.x);
+    clip(depthOcclusion.z*wallSide.x+wallSide.y);
+    float4 texel=tex2D(albedo,uv);
+    float coverage=texel.a*tint.a;
+    clip(coverage-options.x);
+    float3 base=texel.rgb*tint.rgb*metalD.x;
+    if(lightData[10].z<=0)return float4(base,coverage*options.z);   // unlit material / draw: plain, as before
+    float3 n=normalize(normal),v=normalize(toEye);
+    float ao=depthOcclusion.y,ndv=saturate(dot(n,v));
+    float3 spec=0;
+    [unroll] for(int i=0;i<3;++i){
+        float3 l=lightData[i].xyz;float strength=length(l);
+        if(strength>1e-4){float3 h=normalize(l/strength+v);
+            spec+=pow(saturate(dot(n,h)),metalA.z)*saturate(dot(n,l/strength)*4)*strength*float3(lightData[3][i],lightData[4][i],lightData[5][i]);}
+    }
+    spec*=metalA.y*lightData[7].rgb*(0.35+0.65*ao);
+    float3 up=lightData[8].xyz;
+    float3 level=0.5*(Shade(up,1)+Shade(v,1));
+    float3 r=reflect(-v,n);
+    float sky=smoothstep(metalD.z-metalD.w,metalD.z+metalD.w,dot(r,up));
+    float3 env=lerp(metalC.rgb,metalB.rgb,sky)*lerp(float3(1,1,1),level,metalD.y)*lerp(1,ao,0.8);
+    float3 f0=lerp(float3(1,1,1),saturate(base*1.6),metalC.w);
+    float3 fr=f0+(1-f0)*(metalB.w*pow(1-ndv,5));
+    float3 colour=base*Shade(n,ao)*metalA.x+(spec+env*metalA.w)*fr;
+    return float4(colour,coverage*options.z);
+}
 #elif defined(SHADOW_FLOOR)
 // lighting round 2026-11-10: a caster's silhouette on the floor. r = darkness, g = darkness x (1 - caster height 0..1).
 // Blended with MAX, so where several parts cover a floor point the LOWEST counts (run 3: with the highest, the head over
 // the feet under a light from above made the whole shadow "high": wide and faint). The composite takes the height back
 // from the blurred pair and widens the penumbra with it.
 float4 casterOptions:register(c14);  // x darkness of this actor's shadow, y fade start, z 1 / fade length (distance from the feet)
-float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 info:TEXCOORD1):COLOR0{
+// fix 2026-11-11d (user 11.11, R10105: Dario's body shadow on the beam of the walkway above him): the nearest mask of the
+// background at this pixel (ModelRenderer::renderMaskDepth, (slot + slack) / 1020, 1 = no mask); a floor point farther than
+// it lies behind that part of the picture and casts nothing there
+sampler2D maskDepth:register(s1);
+float4 maskOptions:register(c15);    // xy 1 / target size, z camera depth -> mask units, w 1 on
+// fix 2026-11-11d (user 11.11: "clip at the floor boundary and draw that part of the shadow on the walls"): the room from its
+// collision data (model_integration.h lightReceivers). A floor point casts only on the floor area under the actor's feet
+// (a mask of the room in cells, linear between them) where the camera sees it; the part cut off goes to the wall faces in
+// passes of its own (the caster laid on the face's plane), each point on its face, above the floor, seen by the camera.
+// Block footprints are convex quads (x,z corners in order; a triangle repeats a corner) between a top and a bottom y.
+sampler2D floorAreaMask:register(s2);
+float4 clipCounts:register(c16);     // y blocks, z pass (0 none, 1 floor, 2 wall face)
+float4 clipEye:register(c17);        // xyz the eye (world), w the floor's y
+float4 clipFaceA:register(c18);      // wall pass: the face from (x,z) to (z,w)
+float4 clipFaceB:register(c19);      // wall pass: x its top y, y its bottom y
+float4 floorMap:register(c20);       // the area mask: world x, z of its corner, 1 / its width, 1 / its depth
+float4 solidA[32]:register(c64);float4 solidB[32]:register(c96);float4 solidH[32]:register(c128);
+float Cross2(float2 u,float2 v){return u.x*v.y-u.y*v.x;}
+// whether the segment e -> p runs through the block (its footprint between its heights)
+bool BlockHit(float4 a,float4 b,float4 h,float3 e,float3 p){
+    float3 d=p-e;float t0=0,t1=1;
+    if(abs(d.y)<1e-3){if(e.y<h.x||e.y>h.y)return false;}
+    else{float ta=(h.x-e.y)/d.y,tb=(h.y-e.y)/d.y;t0=max(t0,min(ta,tb));t1=min(t1,max(ta,tb));}
+    float2 c0=a.xy,c1=a.zw,c2=b.xy,c3=b.zw;
+    float o=Cross2(c1-c0,c2-c0)+Cross2(c2-c0,c3-c0)>=0?1:-1;
+    float2 cs[4]={c0,c1,c2,c3};
+    [unroll] for(int k=0;k<4;++k){float2 c=cs[k],u=cs[k==3?0:k+1]-c;if(dot(u,u)<1e-2)continue;
+        float f0=o*Cross2(u,e.xz-c),f1=o*Cross2(u,p.xz-c);
+        if(f0<0&&f1<0)return false;
+        if(f0<0)t0=max(t0,f0/(f0-f1));else if(f1<0)t1=min(t1,f0/(f0-f1));}
+    return t0<t1;
+}
+float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 info:TEXCOORD1,float3 receiver:TEXCOORD2,float2 vpos:VPOS):COLOR0{
     clip(tex2D(albedo,uv).a*tint.a-options.x);
+    if(maskOptions.w>0){float m=tex2Dlod(maskDepth,float4((vpos+0.5)*maskOptions.xy,0,0)).r;if(m<0.999)clip(m-info.z*maskOptions.z);}
+    if(clipCounts.z>0.5){
+        float3 p=receiver;
+        if(clipCounts.z<1.5){
+            float2 fuv=(p.xz-floorMap.xy)*floorMap.zw;
+            clip(min(min(fuv.x,fuv.y),min(1-fuv.x,1-fuv.y)));
+            clip(tex2Dlod(floorAreaMask,float4(fuv,0,0)).r-0.5);
+        }else{
+            float2 ab=clipFaceA.zw-clipFaceA.xy;float t=dot(p.xz-clipFaceA.xy,ab)/max(dot(ab,ab),1);
+            clip(t);clip(1-t);clip(p.y-clipFaceB.x);clip(min(clipFaceB.y,clipEye.w)-p.y);
+        }
+        // seen from the camera: no block between the eye and the point (pulled 60 units toward the eye off its own surface)
+        float3 e=clipEye.xyz,q=p+normalize(e-p)*60;
+        [loop] for(int k=0;k<32;++k){if(k>=int(clipCounts.y))break;if(BlockHit(solidA[k],solidB[k],solidH[k],e,q))clip(-1);}
+    }
     float s=casterOptions.x*(1-saturate((info.y-casterOptions.y)*casterOptions.z));
     return float4(s,s*saturate(1-info.x),0,1);
 }
@@ -574,6 +703,113 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 info:TEXCOORD1):COLOR0
 float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 info:TEXCOORD1):COLOR0{
     clip(tex2D(albedo,uv).a*tint.a-options.x);
     return float4(saturate(info.x),0,0,1);
+}
+#elif defined(LEATHER)
+// fx 2026-11-11e (user 11.11: "a realistic shader of Nemesis' black leather suit, the second phase with the bare torso and the
+// leather trousers too"): Leather materials (leather.txt values, model_integration.h loadLeatherMaterials) - the usual lit
+// material (shadow map, flash light: the FX_LIGHT code below, unchanged) plus, where the albedo is dark and colourless
+// (the mask: leather; bright and colourless: buckles), a bumped normal (the folds painted into the albedo as a height, a
+// fine grain from the grain map in bind space), two Blinn-Phong lobes of the native light rows (a wide sheen and a tight
+// coat highlight) with a Schlick fresnel, and a sky-above / floor-below reflection toward grazing angles that follows the
+// scene's light level. Skin and cloth keep the plain shading.
+float4 wallSide:register(c13);
+sampler2D leatherGrain:register(s2);   // rg = slope of the grain height (0.5 = flat), b = the height
+float4 leatherEye:register(c20);       // xyz the eye in the draw's space
+float4 leatherA:register(c21);         // diffuse, specular, gloss (exponent of the wide lobe), coat (share of the tight lobe)
+float4 leatherB:register(c22);         // coat gloss (exponent), fresnel f0, rim (environment reflection), follow
+float4 leatherC:register(c23);         // folds (height of the albedo's shading, world units), grain (height), 1 / grain tile, grain gloss
+float4 leatherD:register(c24);         // mask: chroma low, chroma high, luma low, luma high
+float4 leatherE:register(c25);         // sky rgb, buckle (specular of the metal bits, x)
+float4 leatherF:register(c26);         // floor rgb, fill (sheen of a surface facing the eye)
+#ifdef FX_LIGHT
+sampler2D shadowMap:register(s1);
+float4 shadowTile:register(c14);float4 shadowBox:register(c15);float4 shadowOptions:register(c16);float4 shadowKey:register(c17);float4 flashData[2]:register(c18);
+float ShadowTap(float2 uv,float depth){return tex2Dlod(shadowMap,float4(uv,0,0)).r<depth?0.0:1.0;}
+float ShadowLit(float3 coord,float facing){
+    float2 uv=coord.xy*shadowTile.xy+shadowTile.zw;
+    if(uv.x<shadowBox.x||uv.y<shadowBox.y||uv.x>shadowBox.z||uv.y>shadowBox.w||coord.z>=1)return 1;
+    float depth=coord.z-shadowOptions.y-shadowOptions.z*(1-facing);
+    float2 t=uv*shadowOptions.w-0.5,f=frac(t),base=(floor(t)+0.5)*shadowKey.w;
+    float wx[4]={1-f.x,1,1,f.x},wy[4]={1-f.y,1,1,f.y};float sum=0;
+    [unroll] for(int j=0;j<4;++j){[unroll] for(int i=0;i<4;++i)sum+=wx[i]*wy[j]*ShadowTap(base+float2(i-1,j-1)*shadowKey.w,depth);}
+    return sum/9;
+}
+#endif
+float Luma(float3 c){return dot(c,float3(0.299,0.587,0.114));}
+float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOORD1,float3 normal:TEXCOORD2,float3 world:TEXCOORD3
+#ifdef FX_LIGHT
+    ,float3 shadowCoord:TEXCOORD4
+#endif
+    ,float3 bind:TEXCOORD5,float3 bindNormal:TEXCOORD6):COLOR0{
+    clip(depthOcclusion.x-range.x);clip(range.y-depthOcclusion.x);
+    clip(depthOcclusion.z*wallSide.x+wallSide.y);
+    float4 texel=tex2D(albedo,uv);
+    float coverage=texel.a*tint.a;
+    clip(coverage-options.x);
+    float3 base=texel.rgb*tint.rgb;
+    // the mask from the albedo itself: colourless and dark = leather, colourless and bright = a buckle
+    float luma=Luma(texel.rgb);
+    float chroma=max(texel.r,max(texel.g,texel.b))-min(texel.r,min(texel.g,texel.b));
+    float grey=1-smoothstep(leatherD.x,leatherD.y,chroma);
+    float leather=grey*(1-smoothstep(leatherD.z,leatherD.w,luma));
+    float buckle=grey*smoothstep(leatherD.w,leatherD.w+0.2,luma);
+    float mask=saturate(leather+buckle);
+    // the bump (Mikkelsen, surface gradient from screen derivatives; all the gradient work before any branch): the folds
+    // painted into the albedo and the grain map laid on the three planes of the bind space
+    float2 dux=ddx(uv),duy=ddy(uv);
+    float hx=Luma(tex2D(albedo,uv+dux).rgb),hy=Luma(tex2D(albedo,uv+duy).rgb);
+    float3 bn=abs(normalize(bindNormal));bn*=bn;bn*=bn;bn/=dot(bn,float3(1,1,1));
+    float3 gp=bind*leatherC.z,gpx=ddx(gp),gpy=ddy(gp);
+    float4 g0=tex2D(leatherGrain,gp.yz),g1=tex2D(leatherGrain,gp.zx),g2=tex2D(leatherGrain,gp.xy);
+    float2 s0=(g0.rg-0.5)*bn.x,s1=(g1.rg-0.5)*bn.y,s2=(g2.rg-0.5)*bn.z;
+    float grainHeight=g0.b*bn.x+g1.b*bn.y+g2.b*bn.z;
+    float dBs=leatherC.x*(hx-luma)+leatherC.y*192*(dot(s0,gpx.yz)+dot(s1,gpx.zx)+dot(s2,gpx.xy));
+    float dBt=leatherC.x*(hy-luma)+leatherC.y*192*(dot(s0,gpy.yz)+dot(s1,gpy.zx)+dot(s2,gpy.xy));
+    float3 n0=normalize(normal);
+    float3 dpx=ddx(world),dpy=ddy(world);
+    float3 r1=cross(dpy,n0),r2=cross(n0,dpx);float det=dot(dpx,r1);
+    float3 bumped=abs(det)*n0-sign(det)*mask*(dBs*r1+dBt*r2);
+    float3 nb=dot(bumped,bumped)>1e-20?normalize(bumped):n0;
+    nb=normalize(lerp(n0,nb,saturate(dot(nb,n0)*4+1)));   // never turned away from the surface
+    float3 result=base;
+    if(lightData[10].z>0){
+        float ao=depthOcclusion.y;
+        float3 keep=1,extra=0,v=normalize(leatherEye.xyz-world),flashGloss=0;
+        float e1=max(1,leatherA.z*(1+leatherC.w*(grainHeight*2-1))),e2=max(1,leatherB.x*(1+leatherC.w*(grainHeight*2-1)));
+#ifdef FX_LIGHT
+        if(shadowOptions.x>0){
+            float3 key=lightData[0].xyz*shadowKey.x+lightData[1].xyz*shadowKey.y+lightData[2].xyz*shadowKey.z;
+            float facing=dot(n0,key)/max(length(key),1e-4);
+            if(facing>0)keep-=shadowKey.xyz*(shadowOptions.x*(1-ShadowLit(shadowCoord,saturate(facing))));
+        }
+        if(flashData[1].w>0){
+            float3 to=flashData[0].xyz-world;float d=length(to),a=saturate(1-d*flashData[0].w);
+            extra=flashData[1].rgb*(a*a*saturate((dot(nb,to)/max(d,1)+0.3)/1.3));
+            float3 hf=normalize(to/max(d,1)+v);float nf=saturate(dot(nb,hf));
+            flashGloss=flashData[1].rgb*(a*a*saturate(dot(nb,to)/max(d,1)*4)*((1-leatherA.w)*pow(nf,e1)*(e1+8)*0.125+leatherA.w*pow(nf,e2)*(e2+8)*0.125));
+        }
+#endif
+        float3 plain=ShadeLit(n0,ao,keep,extra),lit=ShadeLit(nb,ao,keep,extra);
+        float ndv=saturate(dot(nb,v));
+        float3 spec=0;
+        [unroll] for(int i=0;i<3;++i){
+            float3 l=lightData[i].xyz;float strength=length(l);
+            if(strength>1e-4){float3 ld=l/strength,h=normalize(ld+v);float ndh=saturate(dot(nb,h));
+                float lobe=(1-leatherA.w)*pow(ndh,e1)*(e1+8)*0.125+leatherA.w*pow(ndh,e2)*(e2+8)*0.125;
+                float fh=leatherB.y+(1-leatherB.y)*pow(1-saturate(dot(v,h)),5);
+                spec+=lobe*fh*saturate(dot(nb,ld)*4)*saturate(dot(n0,ld)*4+0.5)*strength*keep[i]*float3(lightData[3][i],lightData[4][i],lightData[5][i]);}
+        }
+        spec=(spec*lightData[9].y+flashGloss*leatherB.y)*lightData[7].rgb*(0.3+0.7*ao);
+        float3 up=lightData[8].xyz,level=0.5*(Shade(up,1)+Shade(v,1));
+        float3 r=reflect(-v,nb);
+        float sky=smoothstep(-0.25,0.55,dot(r,up));
+        float3 env=lerp(leatherF.rgb,leatherE.rgb,sky)*lerp(float3(1,1,1),level,leatherB.w)*lerp(1,ao,0.8);
+        float fr=leatherB.y+(1-leatherB.y)*pow(1-ndv,5);
+        float3 sheen=level*(leatherF.w*pow(ndv,max(1,e1*0.35))*lerp(1,ao,0.8));
+        float3 gloss=(spec*leatherA.y+env*(leatherB.z*fr)+sheen)*(leather+buckle*leatherE.w);
+        result=base*lerp(plain,lit*lerp(1,leatherA.x,leather),mask)+gloss*tint.rgb;
+    }
+    return float4(result,coverage*options.z);
 }
 #else
 float4 wallSide:register(c13);   // fix 2026-11-08: x side kept (+1 room, -1 beyond the wall, 0 all), y 1 when off
@@ -635,11 +871,189 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOOR
 #endif
 )HLSL";}
 
+// ---------------------------------------------------------------- fx 2026-11-11e: volumetric slime (Nemesis' hand)
+// User 11.11: "redo the bubbling purple slime out of his right fist, now it looks too much like a flat picture - make it look
+// cool and volumetric". The slime is a real surface: a smooth union of round cones (a sphere, a drop with a tail, a strand)
+// found per pixel by sphere tracing inside a screen rectangle, with its own depth (it stands in front of and behind the HD
+// models pixel by pixel), a normal, crevice shading between merged blobs, light through its thin parts, wet highlights of the
+// native lights and a fresnel reflection. Everything is in camera space; fx_slime_sim.h makes the primitives.
+struct SlimePrim {float a[4]{},b[4]{},c[4]{};};   // a: xyz + radius, b: xyz + radius (a = b: a sphere), c: x palette (0 purple .. 1 grey-beige), y hollow (a bubble), z froth, w calm (a flat film: no lumps)
+constexpr unsigned kSlimeMaxPrims=24;
+struct SlimeBatch {
+    std::vector<SlimePrim> now,before;    // this build and the one before, same order (the in-between frame blends them)
+    float rect[4]{};                      // viewport pixels the batch can touch (both builds)
+    float bound[4]{},boundBefore[4]{};    // bounding sphere
+    float ray[4]{};                       // x/z = px * [0] + [1], y/z = py * [2] + [3] (px, py: viewport pixels)
+    float nearPlane=16,time=0,timeBefore=0,sharpness=0.055f,noise=22.f,noiseScale=1.f/260.f,opacity=1;
+    // fx 2026-11-11f: gloss; milk = how soon the body turns cloudy with depth (1 / units); shoulder of the tone curve; absorption (1 / units)
+    // fx 2026-11-11f2 (user: "can this slime be made darker?"): absorption 1 / 180 -> 1 / 130
+    float look[4]={0.7f,1.f/400.f,0.4f,1.f/130.f};
+    // froth amount, film of a bubble at its rim, height of the froth's small domes (units), brightness of the slime's own colour
+    // (not of its glints; fx_slime_sim.h DefaultTones sets it: pilot.ini nemesis_slime_brightness)
+    float look2[4]={1.f,0.8f,7.f,1.f};
+    float refraction=22.f;                // how far (target pixels) the picture behind is shifted by the surface's slope
+    float floorPlane[4]={0,0,0,1.e6f};    // dot(n, p) + w >= 0 above the floor; n = 0: no floor
+    float lightDir[3][4]{},lightColour[3][4]{},ambient[4]{},up[4]={0,-1,0,0};
+    float tones[6][4]{};                  // purple: deep, body, thin; grey-beige: deep, body, thin
+    std::uint64_t epoch=0;bool fresh=false;
+};
+// fx 2026-11-11f (user: "it looks a little like plastic ... can it be runnier, more transparent and with some foam as in the
+// original?"): the body is a liquid now. The renderer hands the shader a copy of the picture behind the batch (sceneMap); what
+// the view ray crosses inside the body is measured (five samples: solid slime in full, the inside of a bubble hardly at all) and
+// the picture shows through it, shifted by the surface's slope, tinted by absorption and clouded with depth; a bubble is a film
+// (clear in the middle, bright at its rim); froth - patches of small cells with dark seams and a glint each - lies where the
+// primitives ask for it and in the creases. Without the copy (scene.w = 0) the same is blended by alpha.
+inline const char* SlimeSource(){return R"HLSL(
+#define N SLIME_PRIMS
+float4 rayA:register(c0);
+float4 bound:register(c1);
+float4 misc:register(c2);         // x time (s), y near plane, z sharpness of the union, w noise amplitude
+float4 floorPlane:register(c3);
+float4 lightDir[3]:register(c4);  // toward each light x its strength
+float4 lightCol[3]:register(c7);
+float4 ambient:register(c10);     // rgb, w opacity
+float4 upDir:register(c11);       // xyz up, w noise tiles per unit
+float4 tones[6]:register(c12);
+float4 look:register(c18);        // x gloss (highlights x), y milk (1 / units), z shoulder of the tone curve, w absorption (1 / units)
+float4 scene:register(c19);       // xy 1 / target size, z refraction (pixels), w 1 = sceneMap holds the picture behind
+float4 look2:register(c20);       // x froth amount, y film of a bubble, z froth dome height (units), w brightness of its own colour
+float4 prims[N*3]:register(c21);
+sampler3D noiseMap:register(s0);  // r wide lumps, g small lumps, b distance to the nearest froth cell centre, a seam between cells
+sampler2D sceneMap:register(s1);
+// attr: x palette, y hollow, z froth, w calm
+float Body(float3 p,out float4 attr,out float radius){
+    float sum=0,wr=0;float4 wa=0;
+    for(int i=0;i<N;++i){
+        float4 a=prims[i*3],b=prims[i*3+1];
+        float3 pa=p-a.xyz,ba=b.xyz-a.xyz;
+        float h=saturate(dot(pa,ba)/max(dot(ba,ba),1e-3));
+        float r=lerp(a.w,b.w,h);
+        float e=exp(min(40,-misc.z*(length(pa-ba*h)-r)));
+        sum+=e;wa+=e*prims[i*3+2];wr+=e*r;
+    }
+    float inv=1/max(sum,1e-30);
+    attr=wa*inv;radius=wr*inv;
+    return -log(max(sum,1e-30))/misc.z;
+}
+// the noise rides the first (largest) primitive, so the pattern stays on the mass when the hand moves, and streams slowly;
+// a calm film (a puddle) keeps it still in the room
+// (two patterns mixed by value: mixing their places would sweep one pattern through the other where a splash meets its puddle)
+float4 Noise(float3 p,float calm){
+    float4 moving=tex3Dlod(noiseMap,float4((p-prims[0].xyz)*upDir.w+misc.x*float3(0.02,-0.07,0.03),0));
+    float4 still=tex3Dlod(noiseMap,float4(p*upDir.w,0));
+    return lerp(moving,still,saturate(calm*1.7));
+}
+float Map(float3 p){
+    float4 at;float r;float d=Body(p,at,r);
+    float4 n=Noise(p,at.w);
+    float amp=min(misc.w,r*0.24)*(1-0.9*at.w);
+    d+=(n.r-0.5)*amp*1.2+(n.g-0.5)*amp*0.3;
+    // froth: a small dome over every cell
+    float dome=1-n.b;d-=at.z*(1-at.w)*look2.z*dome*dome*saturate(r*0.06);
+    return max(d,-(dot(floorPlane.xyz,p)+floorPlane.w));
+}
+// (real loops, not unrolled copies: the largest variant has to stay under 4096 instruction slots - NVIDIA's ps_3_0 limit)
+float3 Normal(float3 p){
+    const float e=2.4;float3 g=0;
+    [loop] for(int j=0;j<4;++j){
+        float3 k=float3((j==0||j==3)?1:-1,j>=2?1:-1,(j==1||j==3)?1:-1);   // the four corners of a tetrahedron
+        g+=k*Map(p+k*e);
+    }
+    return dot(g,g)>1e-12?normalize(g):float3(0,0,-1);
+}
+struct Out {float4 colour:COLOR0;float depth:DEPTH;};
+Out main(float2 vpos:VPOS){
+    Out o;
+    float3 rd=normalize(float3(vpos.x*rayA.x+rayA.y,vpos.y*rayA.z+rayA.w,1));
+    float b=dot(bound.xyz,rd),h=b*b-dot(bound.xyz,bound.xyz)+bound.w*bound.w;
+    float s=sqrt(max(h,0)),t=max(b-s,misc.y/rd.z),tEnd=b+s,hit=0;
+    if(h>0){
+        // to the surface, then onto it (a flat film seen at a low angle shows the stop distance as rings otherwise)
+        [loop] for(int i=0;i<96;++i){
+            float d=Map(rd*t);
+            if(d<0.06){hit=1;break;}
+            t+=d*(d<0.6?0.85:0.62);
+            if(t>tEnd)break;
+        }
+    }
+    clip(hit-0.5);
+    float3 colour=0;float alpha=0,z=misc.y+1;
+    if(hit>0.5){
+        float3 p=rd*t;z=p.z;
+        float3 n=Normal(p),v=-rd;
+        float ndv=saturate(dot(n,v));
+        float4 at,a1;float radius,r1;Body(p,at,radius);
+        float occl=saturate(Body(p+n*16,a1,r1)/16);      // 1 open .. 0 deep in a crease between merged blobs
+        // what the ray crosses behind the surface (units): solid slime in full, the inside of a bubble hardly, nothing under the floor
+        // (samples at 6, 13, 29, 64, 140 units behind the surface, each standing for 1.25 x its own depth)
+        // (the floor ends the body exactly: where the ray meets it is known, so a thin film has no steps in its depth)
+        float tau=0,thick=0,deepAt=6,floorAt=(dot(floorPlane.xyz,p)+floorPlane.w)/max(1e-3,-dot(floorPlane.xyz,rd));
+        [loop] for(int j=0;j<5;++j){
+            float3 q=p+rd*deepAt;float d=Body(q,a1,r1),len=deepAt*1.25;
+            float inside=saturate(0.5-d*0.12)*saturate((floorAt-deepAt)/len+0.5);
+            thick+=inside*len;tau+=inside*len*(1-0.94*a1.y)*(1+38*a1.w);   // a film on the floor is thin but dense
+            deepAt*=2.2;
+        }
+        float3 deep=lerp(tones[0].rgb,tones[3].rgb,at.x),body=lerp(tones[1].rgb,tones[4].rgb,at.x),thin=lerp(tones[2].rgb,tones[5].rgb,at.x);
+        float4 nz=Noise(p,at.w);
+        // the froth's own fine bubbles
+        float4 nf=tex3Dlod(noiseMap,float4((p-prims[0].xyz)*upDir.w*2.3+misc.x*float3(0.02,-0.05,0.03)+0.19,0));
+        float2 wide=tex3Dlod(noiseMap,float4((p-prims[0].xyz)*upDir.w*0.41+misc.x*float3(-0.03,0.02,0.04)+0.37,0)).rg;
+        float3 light=ambient.rgb*(0.55+0.45*saturate(dot(n,upDir.xyz)*0.5+0.5)),spec=0,through=0;
+        [unroll] for(int k=0;k<3;++k){
+            float3 l=lightDir[k].xyz;float ls=length(l);
+            if(ls>1e-4){l/=ls;float nl=dot(n,l),w=saturate((nl+0.5)/1.5);
+                light+=lightCol[k].rgb*(ls*w*w);
+                through+=lightCol[k].rgb*(ls*saturate(0.3-nl*0.7));
+                float3 hv=normalize(l+v);float nh=saturate(dot(n,hv));
+                spec+=lightCol[k].rgb*(ls*saturate(nl*4+0.8)*(pow(nh,360)*6+pow(nh,70)*0.12));}
+        }
+        // a light above and behind the eye: it reads wet in flat light too
+        {float3 hv=normalize(normalize(v+upDir.xyz*0.8)+v);float nh=saturate(dot(n,hv));
+            spec+=(ambient.rgb+light*0.25)*(pow(nh,260)*1.8+pow(nh,40)*0.06);}
+        float cavity=0.35+0.65*occl;
+        float milk=1-exp(-tau*look.y*(1+2.5*at.x));     // 0 clear .. 1 cloudy (the grey-beige one is mucus: cloudy sooner)
+        float3 albedo=lerp(thin,body,saturate(0.2+milk*1.3))*(0.85+0.3*nz.g);
+        albedo=lerp(albedo,deep,0.45*saturate(milk*1.6-0.75));
+        // the cloudy body: lit from outside, a little light held inside, light passing through its thin parts
+        float3 bodyLit=albedo*(light*cavity+through*(1-milk)*0.8)+body*(ambient.rgb+light*0.2)*(0.24*milk);
+        // the picture behind, shifted by the slope of the surface and tinted by what the body absorbs
+        float3 sigma=(1.1-body/max(max(body.r,body.g),max(body.b,1e-3)))*look.w;
+        float3 clear=exp(-tau*sigma);
+        // (the shift grows with what the ray crosses, 0.4 of it as seen on screen, scene.z pixels at most: a thin film hardly
+        // moves the floor under it, a thick drop is a lens)
+        float2 uv=(vpos+0.5-n.xy*min(scene.z,thick*0.4/(rayA.x*p.z)))*scene.xy;
+        float3 behind=tex2Dlod(sceneMap,float4(uv,0,0)).rgb*scene.w;
+        // a bubble: a film, bright where it is seen edge-on
+        float film=at.y*look2.y*pow(1-ndv,1.7);
+        float3 filmCol=lerp(thin,1,0.14)*(light*0.9+ambient.rgb*0.4);   // (fx 2026-11-11f2: darker - the film and the froth are less white)
+        // froth: patches where the primitives ask for it and in the creases; small cells with dark seams and a glint each
+        float want=saturate(at.z*look2.x);
+        float patch=smoothstep(0.62-0.45*want,0.72-0.45*want,wide.r*0.75+wide.g*0.25+(1-occl)*0.25)*saturate(want*5)*(1-at.w*0.6);
+        float seam=smoothstep(0.02,0.22,nf.a),bead=1-nf.b;
+        float3 froth=lerp(thin,1,0.22)*(light*0.9+ambient.rgb*0.45)*(0.7+0.14*seam+0.16*bead*bead)*(0.55+0.45*cavity)+(light+ambient.rgb)*(0.22*pow(saturate(1-nf.b*1.45),10));
+        float frothA=patch*0.92;
+        float seen=(1-milk)*(1-film)*(1-frothA);       // how much of the picture behind is left
+        float fres=0.03+0.97*pow(1-ndv,5);
+        float3 r=reflect(rd,n);float sky=smoothstep(-0.25,0.6,dot(r,upDir.xyz));
+        float3 env=lerp(float3(0.04,0.035,0.045),float3(0.62,0.6,0.72),sky)*(ambient.rgb*1.5+light*0.3);
+        float3 own=((bodyLit*milk*(1-film)+filmCol*film)*(1-frothA)+froth*frothA)*look2.w+(spec*look.x+env*(fres*look2.w))*cavity*(1-0.6*frothA);
+        // the soft shoulder of the models' light: bright rooms do not burn it out
+        float knee=1-look.z;own=lerp(own,knee+look.z*(1-exp((knee-own)/look.z)),step(knee,own));
+        if(scene.w>0.5){colour=own+behind*clear*seen;alpha=ambient.w;}
+        else{float left=seen*dot(clear,float3(0.3,0.5,0.2));alpha=ambient.w*(1-left);colour=own/max(1-left,0.04);}
+    }
+    o.colour=float4(colour,alpha);o.depth=saturate(1-misc.y/z);
+    return o;
+}
+)HLSL";}
 class Shaders {
     // variants: 0 vertex light, 1 pixel light, 2 pixel light + shadow map + flash light (lighting round 2026-11-10),
     // 3 floor shadow caster, 4 shadow map caster
     IDirect3DVertexShader9* vertex_[5][5]{};IDirect3DPixelShader9* pixel_[5]{};bool failed_[5]{};
     IDirect3DVertexShader9* gemVertex_=nullptr;IDirect3DPixelShader9* gemPixel_=nullptr;bool gemFailed_=false;   // crystals round 2026-11-07
+    IDirect3DVertexShader9* metalVertex_=nullptr;IDirect3DPixelShader9* metalPixel_=nullptr;bool metalFailed_=false;   // door round 2026-11-11
+    IDirect3DVertexShader9* leatherVertex_[2][2]{};IDirect3DPixelShader9* leatherPixel_[2]{};bool leatherFailed_=false;   // fx 2026-11-11e: [linear, linear + pose][pixel light, + shadow map / flash]
     IDirect3DVertexDeclaration9* skin_=nullptr,*pose_=nullptr,*world_=nullptr;
     using Compile=HRESULT(WINAPI*)(LPCVOID,SIZE_T,LPCSTR,const D3D_SHADER_MACRO*,ID3DInclude*,LPCSTR,LPCSTR,UINT,UINT,ID3DBlob**,ID3DBlob**);
     HMODULE library_=nullptr;Compile compile_=nullptr;
@@ -661,7 +1075,8 @@ public:
     const std::string& lastError()const{return lastError_;}
     ~Shaders(){release();if(library_)FreeLibrary(library_);}
     void release(){for(auto& row:vertex_)for(auto& v:row)SafeRelease(v);for(auto& p:pixel_)SafeRelease(p);SafeRelease(skin_);SafeRelease(pose_);SafeRelease(world_);
-        SafeRelease(gemVertex_);SafeRelease(gemPixel_);gemFailed_=false;for(auto& f:failed_)f=false;}
+        SafeRelease(gemVertex_);SafeRelease(gemPixel_);gemFailed_=false;SafeRelease(metalVertex_);SafeRelease(metalPixel_);metalFailed_=false;for(auto& f:failed_)f=false;
+        for(auto& row:leatherVertex_)for(auto& v:row)SafeRelease(v);for(auto& p:leatherPixel_)SafeRelease(p);leatherFailed_=false;}
     static void variantMacros(std::vector<D3D_SHADER_MACRO>& macros,unsigned variant){
         if(variant==1||variant==2)macros.push_back({"PIXEL_LIGHT","1"});
         if(variant==2)macros.push_back({"FX_LIGHT","1"});
@@ -700,15 +1115,37 @@ public:
         if(code)code->Release();if(!slot&&variant>=2)failed_[variant]=true;return slot;
     }
     // lighting round 2026-11-10: small pixel shaders for pre-transformed quads (blur, composite, light sprites)
-    IDirect3DPixelShader9* quadShader(IDirect3DDevice9* d,const char* source,IDirect3DPixelShader9*& slot,bool& failed){
+    IDirect3DPixelShader9* quadShader(IDirect3DDevice9* d,const char* source,IDirect3DPixelShader9*& slot,bool& failed,const D3D_SHADER_MACRO* macros=nullptr){
         if(slot||failed)return slot;
         if(!load()){failed=true;return nullptr;}
         ID3DBlob* code=nullptr,*errors=nullptr;
-        const HRESULT hr=compile_(source,std::strlen(source),"RE3 lighting quad",nullptr,nullptr,"main","ps_3_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
+        const HRESULT hr=compile_(source,std::strlen(source),"RE3 lighting quad",macros,nullptr,"main","ps_3_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
         if(errors){lastError_.assign(static_cast<const char*>(errors->GetBufferPointer()),errors->GetBufferSize());errors->Release();}
         if(SUCCEEDED(hr)&&code)d->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&slot);
         if(code)code->Release();if(!slot)failed=true;return slot;
     }
+    // fx 2026-11-11e: one source compiled once per value of one define, on a worker thread (D3DCompile is free-threaded; the
+    // large slime shaders take a second each). state: 0 running, 1 done, -1 failed. The device thread makes the shader objects.
+    struct Background {std::atomic<int> state{0};std::vector<std::vector<std::uint8_t>> code;std::string error;};
+    std::shared_ptr<Background> compileInBackground(const char* source,const char* define,std::vector<std::string> values,const char* profile){
+        auto result=std::make_shared<Background>();
+        if(!load()){result->state=-1;result->error="d3dcompiler_47.dll unavailable";return result;}
+        const Compile compile=compile_;const std::string name=define,target=profile;
+        std::thread([result,compile,source,name,target,values]{
+            for(const auto& value:values){
+                const D3D_SHADER_MACRO macros[2]={{name.c_str(),value.c_str()},{nullptr,nullptr}};ID3DBlob* code=nullptr,*errors=nullptr;
+                // optimization level 1: the same code as level 3 here, compiled five times faster
+                const HRESULT hr=compile(source,std::strlen(source),"RE3 background shader",macros,nullptr,"main",target.c_str(),0,0,&code,&errors);
+                if(FAILED(hr)||!code){if(errors)result->error.assign(static_cast<const char*>(errors->GetBufferPointer()),errors->GetBufferSize());else result->error="compile failed";
+                    if(errors)errors->Release();if(code)code->Release();result->state=-1;return;}
+                const auto* bytes=static_cast<const std::uint8_t*>(code->GetBufferPointer());result->code.emplace_back(bytes,bytes+code->GetBufferSize());
+                if(errors)errors->Release();code->Release();
+            }
+            result->state=1;
+        }).detach();
+        return result;
+    }
+    void setLastError(const std::string& text){lastError_=text;}
     // Crystals round 2026-11-07: the GEM pair (linear skin only). False after a failed build: Gem materials then draw as plain
     // AlphaBlend materials (failed() reports it once); the rest of the GPU path is not affected.
     bool gem(IDirect3DDevice9* d,IDirect3DVertexShader9*& vertex,IDirect3DPixelShader9*& pixel){
@@ -724,6 +1161,36 @@ public:
         vertex=gemVertex_;pixel=gemPixel_;return gemVertex_&&gemPixel_;
     }
     bool gemFailed()const{return gemFailed_;}
+    // Door round 2026-11-11: the METAL pair (linear skin only). False after a failed build: Metal materials then draw as
+    // plain materials (the caller reports it once); nothing else is affected.
+    bool metal(IDirect3DDevice9* d,IDirect3DVertexShader9*& vertex,IDirect3DPixelShader9*& pixel){
+        if(!metalVertex_&&!metalFailed_){
+            std::vector<D3D_SHADER_MACRO> macros{{"VERTEX_SHADER","1"},{"LIGHT_REGISTER","c5"},{"SKIN_LINEAR","1"},{"METAL","1"},{nullptr,nullptr}};ID3DBlob* code=nullptr;
+            if(SUCCEEDED(build(macros,"vs_3_0",&code)))d->CreateVertexShader(static_cast<const DWORD*>(code->GetBufferPointer()),&metalVertex_);
+            if(code){code->Release();code=nullptr;}
+            std::vector<D3D_SHADER_MACRO> pixelMacros{{"LIGHT_REGISTER","c2"},{"METAL","1"},{nullptr,nullptr}};
+            if(metalVertex_&&SUCCEEDED(build(pixelMacros,"ps_3_0",&code)))d->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&metalPixel_);
+            if(code)code->Release();
+            if(!metalVertex_||!metalPixel_){SafeRelease(metalVertex_);SafeRelease(metalPixel_);metalFailed_=true;}
+        }
+        vertex=metalVertex_;pixel=metalPixel_;return metalVertex_&&metalPixel_;
+    }
+    // fx 2026-11-11e: the LEATHER pair of a linear skin (with or without the second pose stream); fx = with the shadow map and
+    // the flash light (variant 2), else the per-pixel light alone. False after a failed build: Leather materials then draw as
+    // plain materials (the caller reports it once).
+    bool leather(IDirect3DDevice9* d,bool pose,bool fx,IDirect3DVertexShader9*& vertex,IDirect3DPixelShader9*& pixel){
+        if(leatherFailed_)return false;
+        auto& v=leatherVertex_[pose?1:0][fx?1:0];auto& p=leatherPixel_[fx?1:0];
+        if(!v){std::vector<D3D_SHADER_MACRO> macros{{"VERTEX_SHADER","1"},{"LIGHT_REGISTER","c5"},{"SKIN_LINEAR","1"},{"PIXEL_LIGHT","1"},{"LEATHER","1"}};
+            if(pose)macros.push_back({"SKIN_POSE","1"});if(fx)macros.push_back({"FX_LIGHT","1"});macros.push_back({nullptr,nullptr});ID3DBlob* code=nullptr;
+            if(SUCCEEDED(build(macros,"vs_3_0",&code)))d->CreateVertexShader(static_cast<const DWORD*>(code->GetBufferPointer()),&v);
+            if(code)code->Release();}
+        if(v&&!p){std::vector<D3D_SHADER_MACRO> macros{{"LIGHT_REGISTER","c2"},{"PIXEL_LIGHT","1"},{"LEATHER","1"}};if(fx)macros.push_back({"FX_LIGHT","1"});macros.push_back({nullptr,nullptr});ID3DBlob* code=nullptr;
+            if(SUCCEEDED(build(macros,"ps_3_0",&code)))d->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&p);
+            if(code)code->Release();}
+        if(!v||!p){leatherFailed_=true;return false;}
+        vertex=v;pixel=p;return true;
+    }
 };
 // True when this device runs the path in hardware. The GOG wrapper creates a mixed device (flags 0x82), so nothing here
 // needs another device: the draws clear SetSoftwareVertexProcessing.
