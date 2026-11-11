@@ -278,7 +278,7 @@ public:
     void beforeReset(){
         resetPending_=true;
         if(device_){device_->SetStreamSource(0,nullptr,0,0);device_->SetDepthStencilSurface(nullptr);}
-        releaseStream();releaseDepth();renderedEpoch_=~std::uint64_t(0);
+        releaseStream();releaseDepth();releaseLighting();renderedEpoch_=~std::uint64_t(0);
     }
     void afterReset(HRESULT status){
         if(FAILED(status))return;
@@ -300,7 +300,7 @@ public:
     ULONG deviceReferences()const{if(!device_)return 0;device_->AddRef();return device_->Release();}
     bool resetDevice(IDirect3DDevice9* device){
         if(device_==device)return shader_!=nullptr&&!resetPending_;
-        releaseStream();releaseDepth();if(shader_)shader_->Release();shader_=nullptr;gpuShaders_.release();gpuSupported_=-1;
+        releaseStream();releaseDepth();releaseLighting();releaseLightingShaders();if(shader_)shader_->Release();shader_=nullptr;gpuShaders_.release();gpuSupported_=-1;
         // Different device identity: old managed textures cannot be drawn on it.
         // Old native jobs remain alive and drawSlice returns S_FALSE for them.
         liveFrames_.clear();
@@ -478,7 +478,9 @@ public:
     HRESULT drawGpu(const re3gpu::Entry* entries,std::size_t count,float weight,re3gpu::Stats& stats){
         if(resetPending_)return D3DERR_DEVICELOST;
         if(!device_||!shader_)return E_INVALIDARG;
-        auto* pixelShader=gpuShaders_.pixel(device_,gpuPixelLight);if(!pixelShader)return E_NOINTERFACE;
+        // lighting round 2026-11-10: variant 2 = per-pixel light with the actor's shadow map and the flash light
+        const unsigned variant=lightingFx&&variantReady(2)?2u:gpuPixelLight?1u:0u;
+        auto* pixelShader=gpuShaders_.pixel(device_,variant);if(!pixelShader)return E_NOINTERFACE;
         SavedState saved;HRESULT hr=saved.capture(device_);if(FAILED(hr))return hr;
         IDirect3DIndexBuffer9* savedIndices=nullptr;device_->GetIndices(&savedIndices);
         const BOOL software=device_->GetSoftwareVertexProcessing();if(software)device_->SetSoftwareVertexProcessing(FALSE);
@@ -488,6 +490,9 @@ public:
         if(!useDepth&&!depthWarning_){depthWarning_=true;log("RE3 model depth surface unavailable; painter ordering fallback\n");}
         hr=setCommon();
         if(SUCCEEDED(hr))hr=device_->SetPixelShader(pixelShader);
+        if(variant==2){   // the shadow map in s1: exact texels, the shader filters them itself
+            device_->SetTexture(1,lightingSelf?shadowAtlas_:nullptr);
+            device_->SetSamplerState(1,D3DSAMP_MINFILTER,D3DTEXF_POINT);device_->SetSamplerState(1,D3DSAMP_MAGFILTER,D3DTEXF_POINT);device_->SetSamplerState(1,D3DSAMP_MIPFILTER,D3DTEXF_NONE);}
         // the near plane is the hardware's clipper here; pre-transformed draws never needed the state
         DWORD savedClipping=TRUE;device_->GetRenderState(D3DRS_CLIPPING,&savedClipping);device_->SetRenderState(D3DRS_CLIPPING,TRUE);
         static thread_local float blended[re3gpu::kPaletteFloats];
@@ -502,7 +507,7 @@ public:
                 const std::uint64_t depthKey=(passKey?passKey:d.epoch)^(d.ownDepth?0x8000000000000000ull:0ull);   // fix 2026-11-08: Draw::ownDepth
                 if(renderedEpoch_!=depthKey){renderedEpoch_=depthKey;depthCleared_=false;++depthResets;}
                 if(useDepth&&!depthCleared_)depthCleared_=SUCCEEDED(device_->Clear(0,nullptr,D3DCLEAR_ZBUFFER,0,1,0));
-                if(d.skin!=currentSkin){currentSkin=d.skin;auto* shader=gpuShaders_.vertex(device_,d.skin,gpuPixelLight);if(!shader){hr=E_NOINTERFACE;break;}
+                if(d.skin!=currentSkin){currentSkin=d.skin;auto* shader=gpuShaders_.vertex(device_,d.skin,variant);if(!shader){hr=E_NOINTERFACE;break;}
                     hr=device_->SetVertexDeclaration(gpuShaders_.declaration(d.skin));if(SUCCEEDED(hr))hr=device_->SetVertexShader(shader);if(FAILED(hr))break;
                     if(d.skin!=re3gpu::Skin::LinearPose&&stream1){device_->SetStreamSource(1,nullptr,0,0);stream1=nullptr;}}
                 const float width=float(viewport.Width),height=float(viewport.Height);
@@ -511,7 +516,21 @@ public:
                     {d.nearPlane,d.skin==re3gpu::Skin::World?weight:1.f,0,0},{},{}};
                 for(unsigned k=0;k<2;++k)constants[1][2+k]=between?d.previousPoseFactor[k]+(d.poseFactor[k]-d.previousPoseFactor[k])*weight:d.poseFactor[k];
                 device_->SetVertexShaderConstantF(0,constants[0],2);device_->SetVertexShaderConstantF(2,d.cameraRows,3);
-                device_->SetVertexShaderConstantF(5,&d.light.rows[0][0],11);if(gpuPixelLight)device_->SetPixelShaderConstantF(2,&d.light.rows[0][0],11);
+                device_->SetVertexShaderConstantF(5,&d.light.rows[0][0],11);if(variant)device_->SetPixelShaderConstantF(2,&d.light.rows[0][0],11);
+                // the actor's shadow map of this pass (rows from the draw's space) and the flash light of the draw's build
+                float rows[3][4]{},fx[4][4]{},flash[2][4]{};
+                if(variant==2){
+                    const auto* g=d.shadow.get();
+                    if(lightingSelf&&shadowAtlas_&&g&&g->tile>=0&&g->renderedPass==lightingPass_&&g->keyLight<3){
+                        localRows(g->rows,d.origin,rows);
+                        const float atlas=float(shadowAtlasSize_),size=float(shadowTileSize_),border=2.5f/atlas;
+                        const float left=float(unsigned(g->tile)%(shadowAtlasSize_/shadowTileSize_))*size/atlas,top=float(unsigned(g->tile)/(shadowAtlasSize_/shadowTileSize_))*size/atlas;
+                        std::memcpy(fx[0],g->tileRect,16);
+                        fx[1][0]=left+border;fx[1][1]=top+border;fx[1][2]=left+size/atlas-border;fx[1][3]=top+size/atlas-border;
+                        fx[2][0]=lightingSelfStrength;fx[2][1]=lightingBias/g->depthRange;fx[2][2]=lightingSlopeBias/g->depthRange;fx[2][3]=atlas;
+                        fx[3][g->keyLight]=1;fx[3][3]=1/atlas;}
+                    if(d.flash[3]>0){for(unsigned k=0;k<3;++k){flash[0][k]=d.flash[k]-d.origin[k];flash[1][k]=d.flash[4+k];}flash[0][3]=d.flash[3];flash[1][3]=1;}
+                    device_->SetVertexShaderConstantF(21,&rows[0][0],3);device_->SetPixelShaderConstantF(14,&fx[0][0],4);device_->SetPixelShaderConstantF(18,&flash[0][0],2);}
                 if(d.skin==re3gpu::Skin::Decal){const float eye[4]={d.eye[0],d.eye[1],d.eye[2],0};device_->SetVertexShaderConstantF(17,eye,1);}
                 if(d.palette&&d.paletteRegs){const float* palette=d.palette->data();if(between){blendPalette(d,weight,blended);palette=blended;}
                     device_->SetVertexShaderConstantF(re3gpu::kPaletteRegister,palette,d.paletteRegs);}
@@ -527,14 +546,14 @@ public:
                     const void* data=isWorld?static_cast<const void*>(d.world.data()):isDecal?static_cast<const void*>(d.decal.data()):static_cast<const void*>(d.dynamic.data());
                     const std::size_t vertices=isWorld?d.world.size():isDecal?d.decal.size():d.dynamic.size();
                     hr=gpuUpload(data,std::uint32_t(vertices),first,generation,stats.bytes);if(FAILED(hr))break;mutableDraw.ringVertex=first;mutableDraw.ringGeneration=generation;}
-                bool lit=false;device_->SetVertexShaderConstantF(15,d.light.profile1,1);if(gpuPixelLight)device_->SetPixelShaderConstantF(12,d.light.profile1,1);lit=d.lit;
+                bool lit=false;device_->SetVertexShaderConstantF(15,d.light.profile1,1);if(variant)device_->SetPixelShaderConstantF(12,d.light.profile1,1);lit=d.lit;
                 auto material=[&](std::size_t m)->bool{
                     const std::uint32_t flags=d.mesh->materialFlags[m];if(((flags&AlphaBlend)!=0)!=(phase!=0))return false;
                     float colour[4];for(unsigned k=0;k<4;++k)colour[k]=d.mesh->materialColour[m*4+k]*d.tint[k];
                     device_->SetVertexShaderConstantF(16,colour,1);
                     const float options[4]={(flags&AlphaCutout)?0.5f:(0.5f/255.f),-1,1,0};device_->SetPixelShaderConstantF(0,options,1);
                     const bool wanted=d.lit&&!(flags&Unlit);
-                    if(wanted!=lit){lit=wanted;float profile[4];std::memcpy(profile,d.light.profile1,16);profile[2]=lit?1.f:0.f;device_->SetVertexShaderConstantF(15,profile,1);if(gpuPixelLight)device_->SetPixelShaderConstantF(12,profile,1);}
+                    if(wanted!=lit){lit=wanted;float profile[4];std::memcpy(profile,d.light.profile1,16);profile[2]=lit?1.f:0.f;device_->SetVertexShaderConstantF(15,profile,1);if(variant)device_->SetPixelShaderConstantF(12,profile,1);}
                     hr=device_->SetTexture(0,d.textures[m].albedo);return SUCCEEDED(hr);};
                 if(isDecal){
                     if(stream0!=gpuRing_){stream0=gpuRing_;hr=device_->SetStreamSource(0,gpuRing_,0,sizeof(re3gpu::GpuVertex));if(FAILED(hr))break;}
@@ -574,7 +593,8 @@ public:
                         if(range2.dynamicIndices&&SUCCEEDED(hr)){bindDynamic();
                             if(SUCCEEDED(hr))drawChunks(range2.firstChunk+range2.staticChunks,range2.dynamicChunks,range2.firstDynamic,range2.dynamicIndices,poseDynamic?0:INT(d.ringVertex),UINT(d.dynamic.size()));}
                     }
-                    if(gem){auto* shader=gpuShaders_.vertex(device_,currentSkin,gpuPixelLight);if(shader)device_->SetVertexShader(shader);device_->SetPixelShader(pixelShader);}
+                    if(gem){auto* shader=gpuShaders_.vertex(device_,currentSkin,variant);if(shader)device_->SetVertexShader(shader);device_->SetPixelShader(pixelShader);
+                        if(variant==2){device_->SetPixelShaderConstantF(14,&fx[0][0],4);device_->SetPixelShaderConstantF(18,&flash[0][0],2);}}   // the gem constants share c14..c18
                 }
             }
             device_->SetStreamSource(1,nullptr,0,0);
@@ -585,6 +605,313 @@ public:
         if(software)device_->SetSoftwareVertexProcessing(TRUE);
         const HRESULT restored=saved.restore(device_);++stats.flushes;
         if(SUCCEEDED(hr)&&FAILED(depthRestore))hr=depthRestore;if(SUCCEEDED(hr)&&FAILED(restored))hr=restored;
+        return hr;
+    }
+    // ---------------------------------------------------------------- lighting round 2026-11-10 (dynamic shadows, flash light)
+    // Floor shadows: every caster of the frame is drawn flattened onto its actor's floor plane into a half-size target
+    // (darkness and darkness x height, MAX blend), blurred twice (a tight edge at half size, a wide one at quarter size) and
+    // multiplied into the picture right after the room background: masks, models and effects are drawn over it afterwards.
+    // Shadow maps: one tile per actor along its key light, with the neighbours that stand toward that light.
+    struct LightVertex {float x,y,z,rhw;DWORD colour;float u,v;};
+    IDirect3DTexture9* floorTexture_[2]{},*wideTexture_[2]{},*shadowAtlas_=nullptr,*glowTexture_=nullptr;
+    IDirect3DSurface9* floorSurface_[2]{},*wideSurface_[2]{},*shadowAtlasSurface_=nullptr,*shadowAtlasDepth_=nullptr;
+    IDirect3DPixelShader9* blurShader_=nullptr,*compositeShader_=nullptr,*glowShader_=nullptr;
+    bool blurFailed_=false,compositeFailed_=false,glowFailed_=false,floorFailed_=false,atlasFailed_=false;
+    unsigned floorWidth_=0,floorHeight_=0,shadowAtlasSize_=0,shadowTileSize_=0;
+    int variantState_[5]={-1,-1,-1,-1,-1};
+    std::uint64_t lightingPass_=0;
+    void releaseLighting(){
+        for(auto& s:floorSurface_)re3gpu::SafeRelease(s);for(auto& t:floorTexture_)re3gpu::SafeRelease(t);
+        for(auto& s:wideSurface_)re3gpu::SafeRelease(s);for(auto& t:wideTexture_)re3gpu::SafeRelease(t);
+        re3gpu::SafeRelease(shadowAtlasSurface_);re3gpu::SafeRelease(shadowAtlasDepth_);re3gpu::SafeRelease(shadowAtlas_);re3gpu::SafeRelease(glowTexture_);
+        floorWidth_=floorHeight_=shadowAtlasSize_=shadowTileSize_=0;floorFailed_=atlasFailed_=false;
+    }
+    void releaseLightingShaders(){
+        re3gpu::SafeRelease(blurShader_);re3gpu::SafeRelease(compositeShader_);re3gpu::SafeRelease(glowShader_);
+        blurFailed_=compositeFailed_=glowFailed_=false;for(auto& s:variantState_)s=-1;
+    }
+    void lightingNote(const char* what,HRESULT hr){char text[400];std::snprintf(text,sizeof(text),"MODEL_LIGHTING %s hr=%08lx %.250s\n",what,static_cast<unsigned long>(hr),gpuShaders_.lastError().c_str());log(text);}
+    // Every skin's vertex shader and the pixel shader of a lighting variant (2 receive, 3 floor caster, 4 shadow map caster):
+    // built once, at the first frame that wants it; a failed build turns that feature off for the session.
+    bool variantReady(unsigned variant){
+        int& state=variantState_[variant];if(state>=0)return state>0;
+        bool okay=gpuShaders_.pixel(device_,variant)!=nullptr;
+        for(unsigned skin=0;skin<5&&okay;++skin)okay=gpuShaders_.vertex(device_,re3gpu::Skin(skin),variant)!=nullptr;
+        state=okay?1:0;
+        if(!okay){char what[64];std::snprintf(what,sizeof(what),"shader variant %u unavailable, feature off;",variant);lightingNote(what,E_FAIL);}
+        return okay;
+    }
+    bool renderTexture(unsigned width,unsigned height,D3DFORMAT format,IDirect3DTexture9*& texture,IDirect3DSurface9*& surface){
+        HRESULT hr=device_->CreateTexture(width,height,1,D3DUSAGE_RENDERTARGET,format,D3DPOOL_DEFAULT,&texture,nullptr);
+        if(SUCCEEDED(hr))hr=texture->GetSurfaceLevel(0,&surface);
+        if(FAILED(hr)){re3gpu::SafeRelease(surface);re3gpu::SafeRelease(texture);return false;}
+        return true;
+    }
+    bool ensureFloorTargets(unsigned width,unsigned height){
+        const unsigned w=(std::max)(64u,(width+1)/2),h=(std::max)(48u,(height+1)/2);
+        if(floorTexture_[0]&&floorWidth_==w&&floorHeight_==h)return true;
+        if(floorFailed_&&floorWidth_==w&&floorHeight_==h)return false;
+        for(auto& s:floorSurface_)re3gpu::SafeRelease(s);for(auto& t:floorTexture_)re3gpu::SafeRelease(t);
+        for(auto& s:wideSurface_)re3gpu::SafeRelease(s);for(auto& t:wideTexture_)re3gpu::SafeRelease(t);
+        floorWidth_=w;floorHeight_=h;bool okay=true;
+        for(unsigned i=0;i<2&&okay;++i)okay=renderTexture(w,h,D3DFMT_A8R8G8B8,floorTexture_[i],floorSurface_[i])&&renderTexture((w+1)/2,(h+1)/2,D3DFMT_A8R8G8B8,wideTexture_[i],wideSurface_[i]);
+        if(!okay){for(auto& s:floorSurface_)re3gpu::SafeRelease(s);for(auto& t:floorTexture_)re3gpu::SafeRelease(t);for(auto& s:wideSurface_)re3gpu::SafeRelease(s);for(auto& t:wideTexture_)re3gpu::SafeRelease(t);
+            floorFailed_=true;lightingNote("floor shadow targets unavailable;",E_FAIL);return false;}
+        floorFailed_=false;char text[160];std::snprintf(text,sizeof(text),"MODEL_LIGHTING floor shadow targets %ux%u + %ux%u\n",w,h,(w+1)/2,(h+1)/2);log(text);
+        return true;
+    }
+    bool ensureAtlas(unsigned tileSize){
+        tileSize=tileSize>=1024?1024u:512u;
+        if(shadowAtlas_&&shadowTileSize_==tileSize)return true;
+        if(atlasFailed_)return false;
+        re3gpu::SafeRelease(shadowAtlasSurface_);re3gpu::SafeRelease(shadowAtlasDepth_);re3gpu::SafeRelease(shadowAtlas_);
+        for(unsigned tile=tileSize;tile>=512&&!shadowAtlas_;tile/=2){const unsigned size=tile*4;
+            if(!renderTexture(size,size,D3DFMT_R32F,shadowAtlas_,shadowAtlasSurface_))continue;
+            for(D3DFORMAT format:{D3DFMT_D24X8,D3DFMT_D24S8,D3DFMT_D16})if(SUCCEEDED(device_->CreateDepthStencilSurface(size,size,format,D3DMULTISAMPLE_NONE,0,TRUE,&shadowAtlasDepth_,nullptr)))break;
+            if(!shadowAtlasDepth_){re3gpu::SafeRelease(shadowAtlasSurface_);re3gpu::SafeRelease(shadowAtlas_);continue;}
+            shadowAtlasSize_=size;shadowTileSize_=tile;}
+        if(!shadowAtlas_){atlasFailed_=true;lightingNote("shadow map (R32F target) unavailable, models are not shadowed;",E_FAIL);return false;}
+        char text[160];std::snprintf(text,sizeof(text),"MODEL_LIGHTING shadow map %ux%u, 16 tiles of %u\n",shadowAtlasSize_,shadowAtlasSize_,shadowTileSize_);log(text);
+        return true;
+    }
+    // radial light (1 - r^2)^2.4, as the flash light of the Dino Crisis 2 project
+    bool ensureGlow(){
+        if(glowFailed_)return false;
+        if(!glowShader_){static const char source[]="sampler2D light:register(s0);float4 main(float4 colour:COLOR0,float2 uv:TEXCOORD0):COLOR0{return float4(colour.rgb*tex2D(light,uv).r,1);}";
+            if(!gpuShaders_.quadShader(device_,source,glowShader_,glowFailed_)){lightingNote("light sprite shader failed;",E_FAIL);return false;}}
+        if(glowTexture_)return true;
+        const unsigned n=128;
+        if(FAILED(device_->CreateTexture(n,n,1,D3DUSAGE_DYNAMIC,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&glowTexture_,nullptr))){glowFailed_=true;return false;}
+        D3DLOCKED_RECT lock{};if(FAILED(glowTexture_->LockRect(0,&lock,nullptr,D3DLOCK_DISCARD))){re3gpu::SafeRelease(glowTexture_);glowFailed_=true;return false;}
+        for(unsigned y=0;y<n;++y){auto* row=static_cast<std::uint8_t*>(lock.pBits)+std::size_t(y)*lock.Pitch;
+            for(unsigned x=0;x<n;++x){const float dx=(x+.5f)/n*2-1,dy=(y+.5f)/n*2-1,r2=dx*dx+dy*dy;const float f=r2>=1?0.f:std::pow(1-r2,2.4f);
+                const auto v=std::uint8_t(f*255.f+.5f);row[x*4]=row[x*4+1]=row[x*4+2]=v;row[x*4+3]=255;}}
+        glowTexture_->UnlockRect(0);return true;
+    }
+    void lightQuad(float l,float t,float r,float b,float u0=0,float v0=0,float u1=1,float v1=1,DWORD colour=0xffffffffu){
+        const LightVertex v[4]={{l-.5f,t-.5f,0,1,colour,u0,v0},{r-.5f,t-.5f,0,1,colour,u1,v0},{l-.5f,b-.5f,0,1,colour,u0,v1},{r-.5f,b-.5f,0,1,colour,u1,v1}};
+        device_->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,v,sizeof(LightVertex));
+    }
+    void quadPipeline(IDirect3DPixelShader9* shader){
+        device_->SetVertexShader(nullptr);device_->SetFVF(D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX1);device_->SetPixelShader(shader);
+        device_->SetRenderState(D3DRS_ZENABLE,D3DZB_FALSE);device_->SetRenderState(D3DRS_ZWRITEENABLE,FALSE);
+    }
+    void blurPass(IDirect3DSurface9* target,IDirect3DTexture9* source,unsigned width,unsigned height,float stepU,float stepV){
+        device_->SetRenderTarget(0,target);device_->SetTexture(0,source);
+        const float step[4]={stepU,stepV,0,0};device_->SetPixelShaderConstantF(0,step,1);
+        lightQuad(0,0,float(width),float(height));
+    }
+    // The triangles of a draw for a shadow pass (variant 3 floor, 4 shadow map): every shown material, alpha tested. The
+    // caller has set the target, the blend, the pixel shader and the constants of the pass (c19..c23, pixel c14).
+    HRESULT drawCaster(const re3gpu::Draw& d,unsigned variant,float weight,float targetWidth,float targetHeight,re3gpu::Stats& stats){
+        if(!d.ready()||d.skin==re3gpu::Skin::Decal||!d.indices||!d.indices->buffer)return S_OK;
+        auto* shader=gpuShaders_.vertex(device_,d.skin,variant);if(!shader)return E_NOINTERFACE;
+        HRESULT hr=device_->SetVertexDeclaration(gpuShaders_.declaration(d.skin));if(SUCCEEDED(hr))hr=device_->SetVertexShader(shader);if(FAILED(hr))return hr;
+        const bool between=weight<1.f&&d.previous&&d.palette&&d.previous->size()==d.palette->size();
+        float constants[2][4]={{d.h/160.f,d.offsetX/160.f+2.f*d.pixelOffsetX/targetWidth-1.f,-d.h/120.f,1.f-d.offsetY/120.f-2.f*d.pixelOffsetY/targetHeight},
+            {d.nearPlane,d.skin==re3gpu::Skin::World?weight:1.f,0,0}};
+        for(unsigned k=0;k<2;++k)constants[1][2+k]=between?d.previousPoseFactor[k]+(d.poseFactor[k]-d.previousPoseFactor[k])*weight:d.poseFactor[k];
+        device_->SetVertexShaderConstantF(0,constants[0],2);device_->SetVertexShaderConstantF(2,d.cameraRows,3);
+        static thread_local float blended[re3gpu::kPaletteFloats];
+        if(d.palette&&d.paletteRegs){const float* palette=d.palette->data();if(between){blendPalette(d,weight,blended);palette=blended;}
+            device_->SetVertexShaderConstantF(re3gpu::kPaletteRegister,palette,d.paletteRegs);}
+        const bool hasDynamic=!d.dynamic.empty(),isWorld=d.skin==re3gpu::Skin::World,poseDynamic=d.skin==re3gpu::Skin::LinearPose;
+        auto& mutableDraw=const_cast<re3gpu::Draw&>(d);
+        if((hasDynamic||isWorld)&&d.ringGeneration!=gpuRingGeneration_){std::uint32_t first=0,generation=0;
+            const void* data=isWorld?static_cast<const void*>(d.world.data()):static_cast<const void*>(d.dynamic.data());
+            hr=gpuUpload(data,std::uint32_t(isWorld?d.world.size():d.dynamic.size()),first,generation,stats.bytes);if(FAILED(hr))return hr;
+            mutableDraw.ringVertex=first;mutableDraw.ringGeneration=generation;}
+        hr=device_->SetIndices(d.indices->buffer);
+        const auto& ranges=d.indices->ranges;
+        for(std::size_t m=0;m<ranges.size()&&SUCCEEDED(hr);++m){const auto& range=ranges[m];
+            if((m<64&&((d.hiddenMaterials>>m)&1u))||(!range.staticIndices&&!range.dynamicIndices)||m>=d.textures.size())continue;
+            const std::uint32_t flags=d.mesh->materialFlags[m];
+            float colour[4];for(unsigned k=0;k<4;++k)colour[k]=d.mesh->materialColour[m*4+k]*d.tint[k];
+            device_->SetVertexShaderConstantF(16,colour,1);
+            const float options[4]={(flags&(AlphaCutout|AlphaBlend))?0.5f:(8.f/255.f),-1,1,0};device_->SetPixelShaderConstantF(0,options,1);
+            hr=device_->SetTexture(0,d.textures[m].albedo);if(FAILED(hr))break;
+            if(range.staticIndices){
+                hr=device_->SetStreamSource(0,isWorld?gpuRing_:d.mesh->vertices,0,sizeof(re3gpu::GpuVertex));
+                if(poseDynamic)device_->SetStreamSource(1,d.mesh->pose,0,sizeof(re3gpu::PoseVertex));
+                if(SUCCEEDED(hr))hr=device_->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,isWorld?INT(d.ringVertex):0,0,d.mesh->vertexCount,range.firstStatic,range.staticIndices/3);
+                ++stats.draws;stats.triangles+=range.staticIndices/3;}
+            if(range.dynamicIndices&&SUCCEEDED(hr)){
+                if(poseDynamic){hr=device_->SetStreamSource(0,gpuRing_,d.ringVertex*sizeof(re3gpu::GpuVertex),sizeof(re3gpu::GpuVertex));device_->SetStreamSource(1,d.mesh->dynamicPose,0,sizeof(re3gpu::PoseVertex));}
+                else hr=device_->SetStreamSource(0,gpuRing_,0,sizeof(re3gpu::GpuVertex));
+                if(SUCCEEDED(hr))hr=device_->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,poseDynamic?0:INT(d.ringVertex),0,UINT(d.dynamic.size()),range.firstDynamic,range.dynamicIndices/3);
+                ++stats.draws;stats.triangles+=range.dynamicIndices/3;}
+        }
+        if(poseDynamic)device_->SetStreamSource(1,nullptr,0,0);
+        return hr;
+    }
+    static void localRows(const float (*rows)[4],const float* origin,float out[3][4]){
+        for(unsigned r=0;r<3;++r){for(unsigned c=0;c<3;++c)out[r][c]=rows[r][c];out[r][3]=rows[r][3]+rows[r][0]*origin[0]+rows[r][1]*origin[1]+rows[r][2]*origin[2];}
+    }
+public:
+    // lighting round 2026-11-10 switches (model_integration.h sets them from pilot.ini / the F5 menu)
+    bool lightingFx=false;      // models take the shader with the shadow map and the flash light
+    bool lightingSelf=true;     // ... and use the shadow map
+    float lightingSelfStrength=0.75f,lightingBias=7.f,lightingSlopeBias=26.f;
+    std::uint64_t lightingPasses=0,lightingCasters=0,lightingTiles=0;double lightingMs=0;
+    // Shadow maps and floor shadows of one frame, then the floor light of its muzzle flashes and the shadow composite on
+    // the current target. Called once per drawn frame right after the room background (also by the in-between frame, with
+    // its weight). The caller holds the scene open and keeps the hooks quiet. S_FALSE: nothing to draw.
+    HRESULT renderLighting(re3gpu::ShadowFrame& frame,float weight,const re3gpu::LightingConfig& config,re3gpu::Stats& stats){
+        if(resetPending_)return D3DERR_DEVICELOST;
+        if(!device_||!shader_)return E_INVALIDARG;
+        ++lightingPass_;
+        bool anyGroup=false;for(const auto& g:frame.groups)if(g&&!g->casters.empty()){anyGroup=true;break;}
+        bool wantFloor=config.floor&&anyGroup&&variantReady(3),wantSelf=config.self&&lightingFx&&anyGroup&&variantReady(4)&&variantReady(2);
+        bool wantPool=config.pool&&frame.camera&&!frame.flashes.empty()&&ensureGlow();
+        if(wantFloor&&!blurShader_&&!blurFailed_){static const char source[]=
+            "sampler2D source:register(s0);float4 tap:register(c0);\n"
+            "float4 main(float2 uv:TEXCOORD0):COLOR0{static const float w[5]={0.2270270,0.1945946,0.1216216,0.0540541,0.0162162};\n"
+            "float4 c=tex2D(source,uv)*w[0];for(int i=1;i<5;++i){c+=tex2D(source,uv+tap.xy*i)*w[i];c+=tex2D(source,uv-tap.xy*i)*w[i];}return c;}";
+            if(!gpuShaders_.quadShader(device_,source,blurShader_,blurFailed_))lightingNote("blur shader failed, floor shadows off;",E_FAIL);}
+        if(wantFloor&&!compositeShader_&&!compositeFailed_){static const char source[]=
+            "sampler2D tight:register(s0);sampler2D wide:register(s1);float4 tint:register(c0);\n"
+            "float4 main(float2 uv:TEXCOORD0):COLOR0{float2 a=tex2D(tight,uv).rg,b=tex2D(wide,uv).rg;\n"
+            // height of the lowest caster where the wide blur sees shadow: near the feet the tight edge, higher up the wide and lighter one
+            "float h=saturate(1-b.g/max(b.r,1.0/255.0));float s=lerp(a.r,b.r,smoothstep(0.2,0.95,h))*(1-0.45*smoothstep(0.3,1.0,h));\n"
+            "s=saturate(s*tint.w);return float4(lerp(float3(1,1,1),tint.rgb,s),1);}";
+            if(!gpuShaders_.quadShader(device_,source,compositeShader_,compositeFailed_))lightingNote("composite shader failed, floor shadows off;",E_FAIL);}
+        wantFloor=wantFloor&&blurShader_&&compositeShader_;
+        if(!wantFloor&&!wantSelf&&!wantPool)return S_FALSE;
+        D3DVIEWPORT9 viewport{};device_->GetViewport(&viewport);if(viewport.Width<64||viewport.Height<48)return S_FALSE;
+        wantFloor=wantFloor&&ensureFloorTargets(viewport.Width,viewport.Height);wantSelf=wantSelf&&ensureAtlas(config.tileSize);
+        if(!wantFloor&&!wantSelf&&!wantPool)return S_FALSE;
+        LARGE_INTEGER clockStart;QueryPerformanceCounter(&clockStart);
+        SavedState saved;HRESULT hr=saved.capture(device_);if(FAILED(hr))return hr;
+        IDirect3DIndexBuffer9* savedIndices=nullptr;device_->GetIndices(&savedIndices);
+        const BOOL software=device_->GetSoftwareVertexProcessing();if(software)device_->SetSoftwareVertexProcessing(FALSE);
+        IDirect3DSurface9* previousDepth=nullptr,*previousTarget=nullptr;device_->GetDepthStencilSurface(&previousDepth);device_->GetRenderTarget(0,&previousTarget);
+        RECT savedScissor{};device_->GetScissorRect(&savedScissor);
+        DWORD savedClipping=TRUE;device_->GetRenderState(D3DRS_CLIPPING,&savedClipping);
+        hr=setCommon();device_->SetRenderState(D3DRS_CLIPPING,TRUE);
+        const auto state=[&](D3DRENDERSTATETYPE s,DWORD v){device_->SetRenderState(s,v);};
+        // ---- shadow maps: depth along each actor's key light, one tile per actor
+        if(wantSelf&&SUCCEEDED(hr)){
+            device_->SetRenderTarget(0,shadowAtlasSurface_);device_->SetDepthStencilSurface(shadowAtlasDepth_);
+            device_->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xffffffffu,1,0);
+            state(D3DRS_ZENABLE,D3DZB_TRUE);state(D3DRS_ZWRITEENABLE,TRUE);state(D3DRS_ALPHABLENDENABLE,FALSE);state(D3DRS_SCISSORTESTENABLE,TRUE);
+            device_->SetPixelShader(gpuShaders_.pixel(device_,4));
+            const unsigned perRow=shadowAtlasSize_/shadowTileSize_;unsigned tile=0;const float atlas=float(shadowAtlasSize_),size=float(shadowTileSize_);
+            for(auto& gp:frame.groups){if(!gp)continue;auto& g=*gp;g.tile=-1;if(g.casters.empty()||tile>=perRow*perRow||!(g.radius>1))continue;
+                // light space: f = the way the light travels, r and u across it
+                const Vec3 f=Normalize(Vec3{-g.toLight[0],-g.toLight[1],-g.toLight[2]});
+                const Vec3 r=Normalize(Cross(std::abs(f.y)>0.95f?Vec3{1,0,0}:Vec3{0,1,0},f)),u=Cross(f,r);
+                const Vec3 c{g.centre[0],g.centre[1],g.centre[2]};const float R=g.radius,D=3*R;
+                const Vec3 axes[3]={r*(1/R),u*(1/R),f*(0.5f/D)};
+                for(unsigned k=0;k<3;++k){g.rows[k][0]=axes[k].x;g.rows[k][1]=axes[k].y;g.rows[k][2]=axes[k].z;g.rows[k][3]=-Dot(axes[k],c)+(k==2?0.5f:0.f);}
+                g.depthRange=2*D;
+                const unsigned tx=tile%perRow,ty=tile/perRow;
+                const D3DVIEWPORT9 port={tx*shadowTileSize_,ty*shadowTileSize_,shadowTileSize_,shadowTileSize_,0,1};device_->SetViewport(&port);
+                const RECT scissor={LONG(port.X),LONG(port.Y),LONG(port.X+port.Width),LONG(port.Y+port.Height)};device_->SetScissorRect(&scissor);
+                for(const auto& cp:frame.groups){if(!cp||cp->casters.empty())continue;const auto& o=*cp;
+                    if(&o!=&g){   // a neighbour standing next to the actor (the room's lights are local) and not wholly beyond it
+                        const Vec3 d{o.centre[0]-c.x,o.centre[1]-c.y,o.centre[2]-c.z};const float along=Dot(d,f),reach=0.75f*(R+o.radius);
+                        if(Dot(d,d)>reach*reach||along>0.5f*(R+o.radius))continue;}
+                    for(const auto& weak:o.casters){const auto d=weak.lock();if(!d||!d->ready())continue;
+                        float rows[3][4];localRows(g.rows,d->origin,rows);device_->SetVertexShaderConstantF(21,&rows[0][0],3);
+                        hr=drawCaster(*d,4,weight,size,size,stats);++lightingCasters;if(FAILED(hr))break;}
+                    if(FAILED(hr))break;}
+                // atlas uv of the tile's clip xy (D3D9 pixel centres: half a texel)
+                g.tileRect[0]=0.5f*size/atlas;g.tileRect[1]=-0.5f*size/atlas;g.tileRect[2]=(port.X+0.5f*size+0.5f)/atlas;g.tileRect[3]=(port.Y+0.5f*size+0.5f)/atlas;
+                g.tile=int(tile);g.renderedPass=lightingPass_;++tile;++lightingTiles;
+                if(FAILED(hr))break;}
+            state(D3DRS_SCISSORTESTENABLE,FALSE);
+        }
+        // ---- floor shadows: silhouettes on the floor plane, then the two blurs
+        bool floorDrawn=false;
+        if(wantFloor&&SUCCEEDED(hr)){
+            device_->SetRenderTarget(0,floorSurface_[0]);device_->SetDepthStencilSurface(nullptr);
+            device_->Clear(0,nullptr,D3DCLEAR_TARGET,0,1,0);
+            state(D3DRS_ZENABLE,D3DZB_FALSE);state(D3DRS_ZWRITEENABLE,FALSE);state(D3DRS_ALPHABLENDENABLE,TRUE);state(D3DRS_SRCBLEND,D3DBLEND_ONE);state(D3DRS_DESTBLEND,D3DBLEND_ONE);state(D3DRS_BLENDOP,D3DBLENDOP_MAX);
+            device_->SetPixelShader(gpuShaders_.pixel(device_,3));
+            for(const auto& gp:frame.groups){if(!gp||gp->casters.empty()||!(gp->strength>0.01f))continue;const auto& g=*gp;
+                // along the light, then (run 2: with the light above or behind the actor nothing showed round the feet) straight
+                // down at a share of the darkness: the contact shadow
+                const bool contact=config.contact>0.01f&&g.floorDir[1]>-0.97f;
+                for(unsigned pass=0;pass<(contact?2u:1u)&&SUCCEEDED(hr);++pass){
+                    const float caster[4]={(std::min)(1.f,g.strength*(pass?config.contact:1.f)),config.fadeStart,1.f/(std::max)(1.f,config.fadeEnd-config.fadeStart),0};device_->SetPixelShaderConstantF(14,caster,1);
+                    for(const auto& weak:g.casters){const auto d=weak.lock();if(!d||!d->ready())continue;
+                        const float plane[4]={pass?0.f:g.floorDir[0],pass?-1.f:g.floorDir[1],pass?0.f:g.floorDir[2],g.floorY-d->origin[1]};
+                        const float feet[4]={g.feet[0]-d->origin[0],g.feet[1]-d->origin[1],g.feet[2]-d->origin[2],1.f/(std::max)(1.f,config.referenceHeight)};
+                        device_->SetVertexShaderConstantF(19,plane,1);device_->SetVertexShaderConstantF(20,feet,1);
+                        hr=drawCaster(*d,3,weight,float(floorWidth_),float(floorHeight_),stats);++lightingCasters;floorDrawn=true;if(FAILED(hr))break;}}
+                if(FAILED(hr))break;}
+            state(D3DRS_BLENDOP,D3DBLENDOP_ADD);state(D3DRS_ALPHABLENDENABLE,FALSE);
+            if(floorDrawn&&SUCCEEDED(hr)){
+                quadPipeline(blurShader_);
+                const unsigned w=floorWidth_,h=floorHeight_,qw=(w+1)/2,qh=(h+1)/2;
+                blurPass(floorSurface_[1],floorTexture_[0],w,h,0.7f/w,0);blurPass(floorSurface_[0],floorTexture_[1],w,h,0,0.7f/h);
+                blurPass(wideSurface_[0],floorTexture_[0],qw,qh,1.f/qw,0);blurPass(wideSurface_[1],wideTexture_[0],qw,qh,0,1.f/qh);
+                blurPass(wideSurface_[0],wideTexture_[1],qw,qh,1.4f/qw,0);blurPass(wideSurface_[1],wideTexture_[0],qw,qh,0,1.4f/qh);
+                device_->SetTexture(0,nullptr);
+            }
+        }
+        // ---- back on the frame
+        device_->SetRenderTarget(0,previousTarget);device_->SetDepthStencilSurface(previousDepth);device_->SetViewport(&viewport);device_->SetScissorRect(&savedScissor);
+        if(SUCCEEDED(hr)&&(wantPool||floorDrawn)){
+            const float X=float(viewport.X),Y=float(viewport.Y),W=float(viewport.Width),H=float(viewport.Height);
+            state(D3DRS_ALPHABLENDENABLE,TRUE);state(D3DRS_BLENDOP,D3DBLENDOP_ADD);
+            if(wantPool){
+                // the floor under a muzzle flash is lit: picture x (1 + light), a grid on the floor plane round the flash
+                quadPipeline(glowShader_);device_->SetTexture(0,glowTexture_);
+                state(D3DRS_SRCBLEND,D3DBLEND_DESTCOLOR);state(D3DRS_DESTBLEND,D3DBLEND_ONE);
+                const float* cam=frame.cameraRows;const unsigned n=12;std::vector<LightVertex> grid((n+1)*(n+1)),list;
+                for(const auto& fl:frame.flashes){if(!(fl.radius>1))continue;
+                    const float above=(std::max)(60.f,fl.floorY-fl.position[1]),range=fl.radius*config.poolReach,reach=range*0.9f;bool any=false;
+                    std::vector<std::uint8_t> valid((n+1)*(n+1),0);
+                    for(unsigned j=0;j<=n;++j)for(unsigned i=0;i<=n;++i){
+                        const float dx=(float(i)/n*2-1)*reach,dz=(float(j)/n*2-1)*reach;
+                        const float wx=fl.position[0]+dx-frame.origin[0],wy=fl.floorY-frame.origin[1],wz=fl.position[2]+dz-frame.origin[2];
+                        const float cx=cam[0]*wx+cam[1]*wy+cam[2]*wz+cam[3],cy=cam[4]*wx+cam[5]*wy+cam[6]*wz+cam[7],cz=cam[8]*wx+cam[9]*wy+cam[10]*wz+cam[11];
+                        auto& v=grid[j*(n+1)+i];if(cz<64.f)continue;valid[j*(n+1)+i]=1;
+                        v.x=(frame.h*cx/cz+frame.offsetX)*W/320.f+frame.pixelOffsetX+X;v.y=(frame.h*cy/cz+frame.offsetY)*H/240.f+frame.pixelOffsetY+Y;v.z=0;v.rhw=1.f/cz;v.u=v.v=0.5f;
+                        // point light on a floor facing up: falls off with the distance and the angle
+                        const float d=std::sqrt(dx*dx+dz*dz+above*above),a=(std::max)(0.f,1-d/range),light=a*a*(above/d)*config.poolGain;
+                        auto ch=[&](float c){return DWORD((std::min)(255.f,(std::max)(0.f,c*light*255.f)));};
+                        v.colour=0xff000000u|(ch(fl.colour[0])<<16)|(ch(fl.colour[1])<<8)|ch(fl.colour[2]);}
+                    list.clear();
+                    for(unsigned j=0;j<n;++j)for(unsigned i=0;i<n;++i){const unsigned a=j*(n+1)+i,b=a+1,c2=a+n+1,d2=c2+1;
+                        if(!valid[a]||!valid[b]||!valid[c2]||!valid[d2])continue;
+                        if(!((grid[a].colour|grid[b].colour|grid[c2].colour|grid[d2].colour)&0xffffffu))continue;
+                        list.push_back(grid[a]);list.push_back(grid[b]);list.push_back(grid[c2]);list.push_back(grid[b]);list.push_back(grid[d2]);list.push_back(grid[c2]);any=true;}
+                    if(any)device_->DrawPrimitiveUP(D3DPT_TRIANGLELIST,UINT(list.size()/3),list.data(),sizeof(LightVertex));}
+            }
+            if(floorDrawn){
+                quadPipeline(compositeShader_);device_->SetTexture(0,floorTexture_[0]);device_->SetTexture(1,wideTexture_[1]);
+                const float tint[4]={config.tint[0],config.tint[1],config.tint[2],config.strength};device_->SetPixelShaderConstantF(0,tint,1);
+                state(D3DRS_SRCBLEND,D3DBLEND_DESTCOLOR);state(D3DRS_DESTBLEND,D3DBLEND_ZERO);
+                lightQuad(X,Y,X+W,Y+H);
+                device_->SetTexture(1,nullptr);
+            }
+        }
+        device_->SetStreamSource(1,nullptr,0,0);
+        device_->SetRenderState(D3DRS_CLIPPING,savedClipping);
+        if(previousTarget)previousTarget->Release();if(previousDepth)previousDepth->Release();
+        device_->SetIndices(savedIndices);if(savedIndices)savedIndices->Release();
+        if(software)device_->SetSoftwareVertexProcessing(TRUE);
+        const HRESULT restored=saved.restore(device_);
+        if(SUCCEEDED(hr)&&FAILED(restored))hr=restored;
+        LARGE_INTEGER clockEnd,frequency;QueryPerformanceCounter(&clockEnd);QueryPerformanceFrequency(&frequency);
+        lightingMs+=double(clockEnd.QuadPart-clockStart.QuadPart)*1000.0/double(frequency.QuadPart);++lightingPasses;
+        return hr;
+    }
+    // Additive light sprites (muzzle flash halo, core, afterglow) on the current target, in its pixels.
+    HRESULT drawGlow(const re3gpu::GlowQuad* quads,std::size_t count,float gain){
+        if(resetPending_)return D3DERR_DEVICELOST;
+        if(!device_||!shader_||!count)return E_INVALIDARG;
+        if(!ensureGlow())return S_FALSE;
+        SavedState saved;HRESULT hr=saved.capture(device_);if(FAILED(hr))return hr;
+        hr=setCommon();quadPipeline(glowShader_);device_->SetTexture(0,glowTexture_);
+        device_->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);device_->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_ONE);device_->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_ONE);device_->SetRenderState(D3DRS_BLENDOP,D3DBLENDOP_ADD);
+        for(std::size_t i=0;i<count;++i){const auto& q=quads[i];
+            auto ch=[&](float c){return DWORD((std::min)(255.f,(std::max)(0.f,c*gain*255.f)));};
+            lightQuad(q.x-q.half+.5f,q.y-q.half+.5f,q.x+q.half+.5f,q.y+q.half+.5f,0,0,1,1,0xff000000u|(ch(q.colour[0])<<16)|(ch(q.colour[1])<<8)|ch(q.colour[2]));}
+        const HRESULT restored=saved.restore(device_);
+        if(SUCCEEDED(hr)&&FAILED(restored))hr=restored;
         return hr;
     }
     // Round models-2026-11-03: whether a slice has AlphaBlend runs that the caller draws apart (blend=1 below, then blend=2

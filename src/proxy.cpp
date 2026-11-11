@@ -59,6 +59,7 @@ static void glockDiagnostic();
 static const void* glockCombatFor(const void* combat,int weapon); // glock18c.h: AUTO hit table for the enemy shot test
 static void glockShotDone(int weapon,const uint8_t* actor,int lifeBefore);
 static int modelStateRestoreRequest=-1; // diagnostic A/B: 1 light per-slice state restore, 0 full state block
+static int lightShadowRequest=-1,lightFlashRequest=-1;   // pilot.command light-shadows-0|1|2, light-flash-0|1 (lighting round 2026-11-10, taken at the next build)
 static int modelGpuRequestCommand=-1,modelGpuPixelRequestCommand=-1;   // pilot.command gpu-on/off, gpu-pixel/vertex (taken at the next build)
 static bool modelDetachFix=true;   // QA (pilot.command detach-off / detach-on, debug_warp): torn-off enemy parts as in 1.19 for before/after
 static bool modelKitEnabled=true;  // QA (pilot.command kit-off / kit-on, debug_warp): model-pack/kit.txt parts drawn or the whole bodies
@@ -70,7 +71,9 @@ static volatile LONG corpseTestRequest=0;  // fix round 2026-11-07: pilot.comman
 static volatile LONG muzzleTestRequest=0;  // fx 2026-11-08 muzzle: pilot.command muzzle-test / muzzle-capture / muzzle-mid (fx_muzzle.h)
 static volatile LONG enemyLifeRequest=0;   // fix 2026-11-08 (QA): pilot.command enemy-life-1 (blood_fx.h -> enemyLifeOne)
 static volatile LONG nemesisCloudTestRequest=0;   // fx 2026-11-08 nemesis-cloud: pilot.command nemesis-cloud-test (fx_nemesis_cloud.h)
+static volatile LONG nemesisPuddleRequest=0;   // r6 puddle: pilot.command nemesis-puddle-<on|off|test|native-hide|native-show|gas-off|gas-on> (fx_nemesis_cloud.h, QA)
 static volatile LONG fireTestRequest=0;    // fx 2026-11-08 fire: pilot.command fire-test (fx_fire.h)
+static volatile LONG fxTestRequest=0;      // r7 fx pages: pilot.command fx-test (fx_pages.h, QA)
 static bool f8WasDown = false;
 static volatile LONG toggleRequested=0;
 static volatile LONG fps60ToggleRequested=0;   // F7: 60 fps HD models on/off (fps60_integration.h)
@@ -78,9 +81,17 @@ static unsigned fps60CaptureSequence=0;        // diagnostic capture-fps60: real
 static WNDPROC originalWndProc=nullptr;
 static void logWindowEvent(HWND,UINT,WPARAM,LPARAM);
 #include "options_menu.h" // fx 2026-11-08 options
-static LRESULT CALLBACK pilotWndProc(HWND w,UINT msg,WPARAM wp,LPARAM lp){logWindowEvent(w,msg,wp,lp);if(msg==WM_KEYDOWN&&wp==VK_F8){if(!(lp&(1l<<30)))InterlockedIncrement(&toggleRequested);return 0;}
-  if(msg==WM_KEYDOWN&&re3options::OnKeyDown(w,wp,lp))return 0; // fx 2026-11-08 options
-  if(msg==WM_KEYDOWN&&wp==VK_F7){if(!(lp&(1l<<30)))InterlockedIncrement(&fps60ToggleRequested);return 0;}return CallWindowProcA(originalWndProc,w,msg,wp,lp);}
+#include "reload.h" // controls round 2026-11-09 reload
+#include "widescreen.h" // controls round 2026-11-09 widescreen
+namespace re3menu{bool OnWindowMessage(HWND,UINT,WPARAM,LPARAM,LRESULT&);void ReleaseDevice();void RequestOpen(const char*);} // controls round 2026-11-09 menu (mod_menu.h)
+namespace re3focus{bool OnWindowMessage(HWND,UINT,WPARAM,LPARAM,LRESULT&);} // r6 focus (focus_guard.h)
+namespace re3menu{inline uintptr_t pollReturn=0;} // r7 exit: return address of the input poll call that runs the hook (4238CB = the game loop; mod_menu.h ExitTick)
+static LRESULT CALLBACK pilotWndProc(HWND w,UINT msg,WPARAM wp,LPARAM lp){logWindowEvent(w,msg,wp,lp);
+  {LRESULT handled=0;if(re3focus::OnWindowMessage(w,msg,wp,lp,handled))return handled;} // r6 focus: device change, activation, guard timer
+  {LRESULT handled=0;if(re3menu::OnWindowMessage(w,msg,wp,lp,handled))return handled;} // controls round 2026-11-09 menu: F5/F8/F7/reload keys (pilot.ini, rebindable), menu input
+  if(msg==WM_KEYDOWN&&re3options::OnKeyDown(w,wp,lp))return 0; // fx 2026-11-08 options (legacy PSX menu key only)
+  if(msg==WM_KEYDOWN&&re3reload::OnKeyDown(wp,lp))return 0; // controls round 2026-11-09 reload (fallback: the menu owns reload_key and catches it first)
+  return CallWindowProcA(originalWndProc,w,msg,wp,lp);}
 static void pollToggle(){if(InterlockedExchange(&toggleRequested,0)&1){desiredEnabled=!desiredEnabled;logFile && (fprintf(logFile,"TOGGLE %s\n",desiredEnabled?"remastered":"original"),fflush(logFile));}enabled=desiredEnabled;}
 static size_t dumps = 0;
 static std::unordered_set<uint64_t> dumped;
@@ -110,6 +121,7 @@ static bool gpuFlushingNow();
 static void gpuTraceNote(const char* text);
 static void keepDeviceHooks();
 static void gpuFlushRect(float left,float top,float right,float bottom);
+static void lightAfterBackground(void* renderer);   // model_integration.h, lighting round 2026-11-10: shadows right after the room background
 static size_t gpuPendingCount();
 static void beforeModelDeviceReset();
 static void afterModelDeviceReset(HRESULT);
@@ -470,8 +482,8 @@ static void drawInfo(IDirect3DDevice9* d,const char* kind,UINT count){
 }
 static HRESULT STDMETHODCALLTYPE drawPrimitive(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT s,UINT n){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"primitive",t,n,nullptr,0);gpuTraceDraw();gpuFlushPending();drawInfo(d,"primitive",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,UINT)>(deviceObject(d),81)(d,t,s,n);}
 static HRESULT STDMETHODCALLTYPE drawIndexed(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,INT b,UINT m,UINT v,UINT s,UINT n){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"indexed",t,n,nullptr,0);gpuTraceDraw();gpuFlushPending();drawInfo(d,"indexed",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,INT,UINT,UINT,UINT,UINT)>(deviceObject(d),82)(d,t,b,m,v,s,n);}
-static HRESULT STDMETHODCALLTYPE drawUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT n,const void* v,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"up",t,n,v,stride);gpuTraceDraw();gpuFlushPending();drawInfo(d,"up",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,const void*,UINT)>(deviceObject(d),83)(d,t,n,v,stride);}
-static HRESULT STDMETHODCALLTYPE drawIndexedUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT m,UINT v,UINT n,const void* i,D3DFORMAT f,const void* data,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceDetail(d,"indexedup",t,n,nullptr,0);gpuTraceDraw();gpuFlushPending();drawInfo(d,"indexedup",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,UINT,UINT,const void*,D3DFORMAT,const void*,UINT)>(deviceObject(d),84)(d,t,m,v,n,i,f,data,stride);}
+static HRESULT STDMETHODCALLTYPE drawUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT n,const void* v,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);v=re3widescreen::OnDrawUP(d,t,n,v,stride,0,n*3); /* controls round 2026-11-09 widescreen */gpuTraceDetail(d,"up",t,n,v,stride);gpuTraceDraw();gpuFlushPending();drawInfo(d,"up",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,const void*,UINT)>(deviceObject(d),83)(d,t,n,v,stride);}
+static HRESULT STDMETHODCALLTYPE drawIndexedUP(IDirect3DDevice9* d,D3DPRIMITIVETYPE t,UINT m,UINT v,UINT n,const void* i,D3DFORMAT f,const void* data,UINT stride){std::lock_guard<std::recursive_mutex> guard(mutex);data=re3widescreen::OnDrawUP(d,t,n,data,stride,m,v); /* controls round 2026-11-09 widescreen */gpuTraceDetail(d,"indexedup",t,n,nullptr,0);gpuTraceDraw();gpuFlushPending();drawInfo(d,"indexedup",n);return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRIMITIVETYPE,UINT,UINT,UINT,const void*,D3DFORMAT,const void*,UINT)>(deviceObject(d),84)(d,t,m,v,n,i,f,data,stride);}
 static HRESULT STDMETHODCALLTYPE endSceneHook(IDirect3DDevice9* d){std::lock_guard<std::recursive_mutex> guard(mutex);gpuTraceNote("endscene");gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*)>(deviceObject(d),42)(d);}
 // Anything that fills pixels or changes where they land also has to wait for the models gathered before it
 static HRESULT STDMETHODCALLTYPE clearHook(IDirect3DDevice9* d,DWORD count,const D3DRECT* rects,DWORD flags,D3DCOLOR colour,float z,DWORD stencil){std::lock_guard<std::recursive_mutex> guard(mutex);
@@ -482,6 +494,7 @@ static HRESULT STDMETHODCALLTYPE colorFillHook(IDirect3DDevice9* d,IDirect3DSurf
   gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,IDirect3DSurface9*,const RECT*,D3DCOLOR)>(deviceObject(d),35)(d,surface,r,colour);}
 static HRESULT STDMETHODCALLTYPE stretchRectHook(IDirect3DDevice9* d,IDirect3DSurface9* source,const RECT* from,IDirect3DSurface9* target,const RECT* to,D3DTEXTUREFILTERTYPE filter){std::lock_guard<std::recursive_mutex> guard(mutex);
   if(gpuTraceOn){char text[96];const RECT q=to?*to:RECT{};sprintf_s(text,"stretch:%ld,%ld,%ld,%ld",q.left,q.top,q.right,q.bottom);gpuTraceEvent(text);}
+  re3widescreen::OnStretchRect(d,source,from,target,to); // controls round 2026-11-09 widescreen
   gpuFlushPending();return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,IDirect3DSurface9*,const RECT*,IDirect3DSurface9*,const RECT*,D3DTEXTUREFILTERTYPE)>(deviceObject(d),34)(d,source,from,target,to,filter);}
 static HRESULT STDMETHODCALLTYPE setRenderTargetHook(IDirect3DDevice9* d,DWORD index,IDirect3DSurface9* surface){std::lock_guard<std::recursive_mutex> guard(mutex);
   if(gpuTraceOn)gpuTraceEvent("target");
@@ -497,6 +510,7 @@ static HRESULT STDMETHODCALLTYPE setRenderStateTrace(IDirect3DDevice9* d,D3DREND
 static HRESULT STDMETHODCALLTYPE setScissorTrace(IDirect3DDevice9* d,const RECT* r){std::lock_guard<std::recursive_mutex> guard(mutex);
   if(gpuTraceOn&&r&&!gpuFlushingNow()){char text[96];sprintf_s(text,"rect:%ld,%ld,%ld,%ld",r->left,r->top,r->right,r->bottom);gpuTraceEvent(text);}
   return method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,const RECT*)>(deviceObject(d),75)(d,r);}
+#include "focus_guard.h" // r6 focus
 static fpsprobe::Rate probePresent{"present"};
 static HRESULT STDMETHODCALLTYPE present(IDirect3DDevice9* d,const RECT* s,const RECT* t,HWND h,const RGNDATA* dirty){
   const double probeStart=fpsprobe::on?fpsprobe::Now():0;
@@ -516,8 +530,9 @@ static void releasePilotDeviceResources(const char* reason);
 static HRESULT STDMETHODCALLTYPE resetDeviceHook(IDirect3DDevice9* d,D3DPRESENT_PARAMETERS* parameters){
   // Our textures live in D3DPOOL_DEFAULT: Reset fails while any exists. Caches reload on first use.
   std::lock_guard<std::recursive_mutex> guard(mutex);beforeModelDeviceReset();releasePilotDeviceResources("reset");
+  re3focus::BeforeReset(d); // r6 focus
   auto hr=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRESENT_PARAMETERS*)>(deviceObject(d),16)(d,parameters);
-  afterModelDeviceReset(hr);log("DEVICE_RESET result=%08lx",hr);return hr;
+  afterModelDeviceReset(hr);log("DEVICE_RESET result=%08lx",hr);re3focus::AfterReset(d,hr);return hr; // r6 focus
 }
 // Fix 2026-11-02 (GPU round): this Windows' d3d9 keeps the device table on the heap and rewrites its entries after
 // CreateDevice (seen: every hook gone by the first frame). The draw/EndScene/Clear hooks are what puts gathered GPU
@@ -550,9 +565,11 @@ static void hookDevice(IDirect3DDevice9* d){
    gpuTraceEvery=(std::max)(1u,(unsigned)GetPrivateProfileIntA("pilot","gpu_trace_every",15,(root+"\\pilot.ini").c_str()));
    gpuTraceMax=(unsigned)GetPrivateProfileIntA("pilot","gpu_trace_max",40,(root+"\\pilot.ini").c_str());}
   {char list[256]{};GetPrivateProfileStringA("pilot","gpu_trace_frames","",list,sizeof(list),(root+"\\pilot.ini").c_str());gpuTraceFrames.clear();for(char* p=list;*p;){char* end=nullptr;const unsigned long n=strtoul(p,&end,10);if(end==p)break;gpuTraceFrames.push_back(unsigned(n));p=*end?end+1:end;}}if(gpuTraceOn){o.hooked[57]=(void*)setRenderStateTrace;o.hooked[75]=(void*)setScissorTrace;}
+  re3focus::HookDeviceTable(o.hooked); // r6 focus: TestCooperativeLevel
   deviceHooks.clear();for(unsigned i=0;i<119;++i)if(o.hooked[i]!=o.original[i])deviceHooks.push_back({i,o.hooked[i]});
   devices.erase(d);devices.emplace(d,o);
   DWORD unused;VirtualProtect(o.hooked,119*sizeof(void*),o.protection,&unused);
+  re3focus::HookSwapChain(d); // r6 focus: Present of the swap chain
   if(fpsprobe::on&&!originalSwapPresent){IDirect3DSwapChain9* chain=nullptr;
     if(SUCCEEDED(d->GetSwapChain(0,&chain))&&chain){void** vt=*(void***)chain;originalSwapPresent=(SwapPresentFn)vt[3];DWORD prot;VirtualProtect(&vt[3],4,PAGE_READWRITE,&prot);vt[3]=(void*)swapPresent;VirtualProtect(&vt[3],4,prot,&unused);chain->Release();log("FPS_PROBE swapchain present hooked");}}
   D3DPRESENT_PARAMETERS pp{};IDirect3DSwapChain9* sc=nullptr;if(SUCCEEDED(d->GetSwapChain(0,&sc))&&sc){sc->GetPresentParameters(&pp);sc->Release();log("DEVICE_PRESENT_PARAMETERS interval=%x swap=%u buffers=%u windowed=%u refresh=%u",pp.PresentationInterval,pp.SwapEffect,pp.BackBufferCount,pp.Windowed,pp.FullScreen_RefreshRateInHz);}
@@ -578,9 +595,13 @@ static int __fastcall clearVramHook(void* renderer,void*,const re3ui::Rect16* r,
 static int __fastcall moveVramHook(void* renderer,void*,const re3ui::Rect16* r,int x,int y){auto value=originalMoveVram(renderer,r,x,y);if(uiReady&&r)uiRegistry.move(*r,x,y);return value;}
 static void(__thiscall* originalFrame)(void*)=nullptr;
 static re3exe::Base gameBase; // gameBase+<ResidentEvil3.exe RVA> = address in the running exe (exe_map.h)
+#include "mod_hooks.h" // controls round 2026-11-09
 static void __cdecl inputPollHook(){
   ((void(__cdecl*)())(gameBase+0x2cad0))();
-  if(!GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str()))return;
+  re3menu::pollReturn=reinterpret_cast<uintptr_t>(_ReturnAddress()); // r7 exit: which call site polled (game loop 4238C6 or movie player 42FB60)
+  re3modhooks::AfterInputPoll(gameBase); // controls round 2026-11-09: production hook (mod_hooks.h)
+  static const bool debugWarp=GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())!=0;
+  if(!debugWarp)return;
   glockDiagnostic();
   // Diagnostic runs skip the native movie loader through its verified flag;
   // its caller still follows the game's own failure/cleanup path. debug_movies=1 keeps the movies (movie QA).
@@ -752,6 +773,8 @@ static void diagnosticControl(){
   if(command=="pose")modelPoseRequested=true;
   if(command=="state-light"||command=="state-full"){modelStateRestoreRequest=command=="state-light";log("COMMAND %s queued",command.c_str());}
   if(command=="gpu-on"||command=="gpu-off"){modelGpuRequestCommand=command=="gpu-on";log("COMMAND %s queued",command.c_str());}
+  if(command.size()==15&&command.compare(0,14,"light-shadows-")==0&&command[14]>='0'&&command[14]<='2'){lightShadowRequest=command[14]-'0';log("COMMAND %s queued",command.c_str());}
+  if(command=="light-flash-0"||command=="light-flash-1"){lightFlashRequest=command[12]-'0';log("COMMAND %s queued",command.c_str());}
   if(command=="gpu-pixel"||command=="gpu-vertex"){modelGpuPixelRequestCommand=command=="gpu-pixel";log("COMMAND %s queued",command.c_str());}
   // QA (dxt round 2026-11-02): scenes again from .r3tx on the GPU / decoded on the CPU / from the PNGs (backgroundHook applies it)
   if((command=="pack-dxt"||command=="pack-cpu"||command=="pack-png")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
@@ -763,9 +786,13 @@ static void diagnosticControl(){
   if(command=="enemy-life-1"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&enemyLifeRequest,1);log("COMMAND %s",command.c_str());}
   if(command=="blood-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&bloodTestRequest,1);log("COMMAND %s",command.c_str());}
   if(command=="options-open"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){re3options::RequestFromCommand();log("COMMAND %s",command.c_str());} // fx 2026-11-08 options
+  if(command=="menu-open"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){re3menu::RequestOpen("command");log("COMMAND %s",command.c_str());} // controls round 2026-11-09 menu (QA)
+  if(command=="reload"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){re3reload::Request(re3reload::kCommand);log("COMMAND %s",command.c_str());} // controls round 2026-11-09 reload
   if(command=="hit-sound-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){sfxhits::requestTest();log("COMMAND %s",command.c_str());}   // fx 2026-11-08 hit-sound
   if(command=="nemesis-cloud-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&nemesisCloudTestRequest,1);log("COMMAND %s",command.c_str());}   // fx 2026-11-08 nemesis-cloud
+  if(command.rfind("nemesis-puddle-",0)==0&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){static const char* const names[]={"on","off","test","native-hide","native-show","gas-off","gas-on"};for(LONG k=0;k<7;++k)if(command.substr(15)==names[k])InterlockedExchange(&nemesisPuddleRequest,k+1);log("COMMAND %s",command.c_str());}   // r6 puddle (QA)
   if(command=="fire-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&fireTestRequest,1);log("COMMAND %s",command.c_str());}   // fx 2026-11-08 fire
+  if(command=="fx-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&fxTestRequest,1);log("COMMAND %s",command.c_str());}   // r7 fx pages
   if((command=="muzzle-test"||command=="muzzle-capture"||command=="muzzle-mid")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){InterlockedExchange(&muzzleTestRequest,command=="muzzle-test"?1:command=="muzzle-capture"?2:3);log("COMMAND %s",command.c_str());} // fx 2026-11-08 muzzle
   if((command=="kit-on"||command=="kit-off")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){modelKitEnabled=command=="kit-on";log("COMMAND %s",command.c_str());}
   if((command=="wound-test-head"||command=="wound-test-upper"||command=="wound-test-lower")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
@@ -774,8 +801,17 @@ static void diagnosticControl(){
   if(command=="resume")setDiagnosticPause(false);
   if(command=="arm-dario-pause"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str()))diagnosticFreezeDario=true;
   if(command=="at-chest"||command=="at-door"||command=="at-pickup"||command=="at-typewriter"||command=="activate-dormant-pickup"||command=="prepare-warehouse-replay"||command=="equip-m92"||command=="equip-m4")nativeDiagnosticRequest=command;
-  if((command=="glock-give"||command=="glock-flag"||command=="glock-money"||command=="glock-equip"||command=="glock-mode"||command=="glock-recoil-native"||command=="glock-recoil-soft"||command=="glock-m92")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){glockRequest=command;log("COMMAND %s queued",command.c_str());}
+  if((command=="glock-give"||command=="glock-flag"||command=="glock-money"||command=="glock-equip"||command=="glock-mode"||command=="glock-recoil-native"||command=="glock-recoil-soft"||command=="glock-m92"||command=="glock-kneel"||command=="glock-dodge")&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){glockRequest=command;log("COMMAND %s queued",command.c_str());}
   if(command=="capture")captureRequested=true;
+  // round 2 QA (09.11, debug_warp only): message 0 of the current room through the native message start 42DA10, type 0x2000
+  // (x 6, y 185, text from the room table [A5C898]+3C: what an examined object shows). Refused when the room has no
+  // table (R10D: 42DAC5 read address 0) - a type 0 pointer text is not a plain string (garbage glyphs, game hang).
+  if(command=="message-test"&&GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str())){
+    static const uint8_t start[]={0x8a,0x0d,0x68,0x74,0xa5,0x00,0xb0,0x80};
+    const auto player=(uint8_t*)(gameBase+0x65cbf4);const auto room=*(uint8_t**)(gameBase+0x65c898);
+    MEMORY_BASIC_INFORMATION mi{};const bool roomOk=room&&VirtualQuery(room,&mi,sizeof(mi))&&mi.State==MEM_COMMIT&&*(uint32_t*)(room+0x3c);
+    if(memcmp((void*)(gameBase+0x2da10),start,sizeof(start))||!roomOk||player[4]!=1||player[5]!=0||(*(uint8_t*)(gameBase+0x657468)&0x80))log("DIAGNOSTIC_MESSAGE refused (code, room table %d, player %u/%u or a message running)",int(roomOk),player[4],player[5]);
+    else{const int r=((int(__cdecl*)(int,int,int,int))(gameBase+0x2da10))(0,0x2000,0,0);log("DIAGNOSTIC_MESSAGE room message 0 started (%d) y=%d",r,*(int16_t*)(gameBase+0x657482));}}
   if(command=="capture-fps60"){fps60CaptureSequence=3;log("COMMAND capture-fps60 queued");}
   if(command=="fps60-toggle"){InterlockedIncrement(&fps60ToggleRequested);log("COMMAND fps60-toggle queued");}
   if(command=="quad-light"||command=="quad-full"){quadLightState=command=="quad-light";log("COMMAND %s (drawQuad state save)",command.c_str());}
@@ -937,11 +973,24 @@ static bool drawQuad(IDirect3DTexture9* tex,float left,float top,float right,flo
 struct UiTexture {IDirect3DTexture9* texture=nullptr;unsigned lastUsed=0;size_t bytes=0;bool missing=false;};
 static std::unordered_map<std::string,UiTexture> uiTextures;
 static std::unordered_set<std::string> uiSeen;
+// r7b (10.11.2026 evening): the budget of this cache was 128 MB. In the user's final fight (R50D) the textures in use at
+// once were ~200 MB (TEXU palette pages 16 MB each, the status screen, the effect pages): 82 reloads in that room, each a
+// PNG decode on the game thread. Now 320 MB (pilot.ini ui_cache_mb, 96..768); the textures are D3DPOOL_DEFAULT (video
+// memory). UI_CACHE lines: the budget once, then one per 16 loads, at the first eviction and per 16 evictions.
+static unsigned uiCacheLoads=0,uiCacheEvictions=0,uiCacheLoggedEvictions=0;
+static size_t uiCacheBudget(){
+  static const size_t budget=[]{const unsigned mb=(std::min)(768u,(std::max)(96u,(unsigned)GetPrivateProfileIntA("pilot","ui_cache_mb",320,(root+"\\pilot.ini").c_str())));
+    log("UI_CACHE budget=%u MB (pilot.ini ui_cache_mb; 128 MB before r7b)",mb);return size_t(mb)*1024u*1024u;}();
+  return budget;
+}
 static IDirect3DTexture9* uiTexture(const re3ui::Binding& b){
   static IDirect3DDevice9* textureDevice=nullptr;if(textureDevice!=gameDevice){for(auto& item:uiTextures)if(item.second.texture)item.second.texture->Release();uiTextures.clear();textureDevice=gameDevice;}
   auto& current=uiTextures[b.pngPath];if(current.missing)return nullptr;current.lastUsed=uiFrameSerial;
-  if(!current.texture){current.texture=loadReplacement(gameDevice,0,b.pngPath);if(!current.texture){current.missing=true;return nullptr;}D3DSURFACE_DESC desc{};current.texture->GetLevelDesc(0,&desc);current.bytes=(size_t)desc.Width*desc.Height*4;
-    for(;;){size_t total=0;UiTexture* oldest=nullptr;for(auto& entry:uiTextures){total+=entry.second.bytes;if(entry.first!=b.pngPath&&entry.second.texture&&(!oldest||entry.second.lastUsed<oldest->lastUsed))oldest=&entry.second;}if(total<=128u*1024*1024||!oldest)break;oldest->texture->Release();oldest->texture=nullptr;oldest->bytes=0;}}
+  if(!current.texture){current.texture=loadReplacement(gameDevice,0,b.pngPath);if(!current.texture){current.missing=true;return nullptr;}D3DSURFACE_DESC desc{};current.texture->GetLevelDesc(0,&desc);current.bytes=(size_t)desc.Width*desc.Height*4;size_t resident=0;
+    for(;;){size_t total=0;UiTexture* oldest=nullptr;for(auto& entry:uiTextures){total+=entry.second.bytes;if(entry.first!=b.pngPath&&entry.second.texture&&(!oldest||entry.second.lastUsed<oldest->lastUsed))oldest=&entry.second;}if(total<=uiCacheBudget()||!oldest){resident=total;break;}oldest->texture->Release();oldest->texture=nullptr;oldest->bytes=0;++uiCacheEvictions;}
+    ++uiCacheLoads;
+    if((uiCacheLoads&15u)==0||(uiCacheEvictions&&!uiCacheLoggedEvictions)||uiCacheEvictions>=uiCacheLoggedEvictions+16u){uiCacheLoggedEvictions=uiCacheEvictions;
+      log("UI_CACHE loads=%u evictions=%u resident_mb=%u textures=%u",uiCacheLoads,uiCacheEvictions,unsigned(resident>>20),unsigned(uiTextures.size()));}}
   return current.texture;
 }
 static void __fastcall rawBackgroundHook(void* renderer,void*,void* packet){
@@ -1016,6 +1065,7 @@ static void uiDiagnoseMiss(unsigned tpage,unsigned clut,float minU,float minV,fl
 namespace re3extra{namespace muzzle{static bool flashBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);}} // fx2 2026-11-08 muzzle (fx_muzzle.h)
 namespace re3extra{namespace nemesis_cloud{static bool armBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);}} // fx5 2026-11-08 nemesis-cloud (fx_nemesis_cloud.h)
 namespace re3extra{namespace fire{static bool pageBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);}} // fx5 2026-11-08 fire (fx_fire.h)
+namespace re3extra{namespace fxpages{static bool pageBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);static bool chiBinding(const uint8_t*,unsigned,unsigned,float,float,float,float,re3ui::Binding&);}} // r7 fx pages (fx_pages.h)
 static bool drawUiPacket(void* renderer,const uint8_t* p,unsigned tpage,UiPrimitive kind){
   if(!enabled||!uiReady||!gameDevice||!gogWrapper)return false;
   const uint8_t command=p[7];const unsigned count=kind==UiFlatTriangle?3:4;
@@ -1035,6 +1085,7 @@ static bool drawUiPacket(void* renderer,const uint8_t* p,unsigned tpage,UiPrimit
   if(re3extra::muzzle::flashBinding(p,tpage,clut,minU,minV,maxU,maxV,binding))resolved=true; // fx2 2026-11-08 muzzle: the native gun-flash page at 8x
   if(re3extra::nemesis_cloud::armBinding(p,tpage,clut,minU,minV,maxU,maxV,binding))resolved=true; // fx5 2026-11-08 nemesis-cloud: Nemesis' palette 2/4 sprites at 8x
   if(re3extra::fire::pageBinding(p,tpage,clut,minU,minV,maxU,maxV,binding))resolved=true; // fx5 2026-11-08 fire: the native fire banks' pages in HD
+  if(re3extra::fxpages::pageBinding(p,tpage,clut,minU,minV,maxU,maxV,binding)||re3extra::fxpages::chiBinding(p,tpage,clut,minU,minV,maxU,maxV,binding))resolved=true; // r7 fx pages: water, acid, creature blood, acid round
   // A flipped polygon (radar bracket FT4 at 45EF47: v 191..222 over a TIM at v 192) names one edge texel the GPU never
   // samples. Retry only failed polygons with the sampled texel range so such mirrors resolve; resolved draws are unchanged.
   if(!resolved&&kind!=UiSprite){float cu[4],cv[4],meanU=0,meanV=0;for(unsigned i=0;i<count;i++){meanU+=us[i]/count;meanV+=vs[i]/count;}
@@ -1101,9 +1152,11 @@ static void __fastcall backgroundHook(void* renderer,void*,void* packet){
     D3DVIEWPORT9 vp;gameDevice->GetViewport(&vp);const float sx=vp.Width/320.f,sy=vp.Height/240.f;
     int bx=*(int*)(p+12),by=*(int*)(p+16),bw=*(int*)(p+20),bh=*(int*)(p+24);if(bw<=0||bh<=0){bx=by=0;bw=320;bh=240;}
     nativeFrameRemastered=drawQuad(scene->background,bx*sx,by*sy,(bx+bw)*sx,(by+bh)*sy,0,0,1,1,false,scene->uv,scene->baseBackground,scene->composite?scene->baseUv:nullptr,scene->stateAlpha,nullptr,scene->backgroundYcocg);
+    lightAfterBackground(renderer);   // lighting round 2026-11-10
     if(frame%120==0)log("REMASTER_FRAME %s viewport=%ux%u succeeded=%u",id.c_str(),vp.Width,vp.Height,nativeFrameRemastered);return;
   }
   originalBackground(renderer,packet);
+  lightAfterBackground(renderer);   // lighting round 2026-11-10 (a room without an HD background)
 }
 static void __fastcall spriteHook(void* renderer,void*,void* packet,unsigned tpage){
   std::lock_guard<std::recursive_mutex> guard(mutex);auto p=(uint8_t*)packet;
@@ -1127,9 +1180,37 @@ static void __fastcall spriteHook(void* renderer,void*,void* packet,unsigned tpa
 #include "merce_select.h"
 #include "movie_rgb32_patch.h"
 #include "movie_sync.h"
+#include "player_movies.h"   // controls round 2026-11-09: player movie folder + picture geometry
 #include "title_costume.h"
 #include "fps60_integration.h"
 #include "glock18c.h"
+#include "mod_menu.h" // controls round 2026-11-09 menu (F5 / Start)
+static const bool re3menuWired=[]{ // controls round 2026-11-09 merge: menu -> the other modules of the round
+  re3menu::onReload=[]{re3reload::Request();};
+  re3menu::onReloadKeyChanged=[](int vk){re3reload::reloadKey=vk;};
+  re3menu::onInputSuspended=[](bool on){re3modern::SetSuspended(on);};
+  re3menu::onMenuView=[](float& top,float& rows){return re3widescreen::MenuView(top,rows);};   // round 6: the menu inside the crop window (was onMenuFrame -> the 4:3 frame)
+  re3widescreen::gFullFrameUiOpen=&re3menu::detail::modal;
+  re3widescreen::gBackgroundCount=&frame;re3widescreen::gExtraPass=&fps60Pass;   // round 2: frames without a room background -> 4:3
+  re3widescreen::gPlayerRows=[](float& top,float& bottom){const uint32_t now=re3bridge::BuildSerial();   // round 2: rows of the HD player as built
+    // round 4 (09.11 night, user log: after a death + load the text on black was cropped): no HD build at all while the game
+    // shows a black screen, so the serial stood still and the rows of the dying Jill counted as "this build" - now they
+    // also have to be younger than 200 ms
+    if(!modelPlayerRowsBuild||modelPlayerRowsBuild>now||now-modelPlayerRowsBuild>1||GetTickCount()-modelPlayerRowsTick>200)return false;top=modelPlayerRows[0];bottom=modelPlayerRows[1];return true;};   // round 2 (09.11): the whole time the menu is open = the 4:3 frame
+  re3menu::onSetControlScheme=[](int v){re3modern::SetScheme(v);};
+  re3menu::onSetModernStickRun=[](int v){re3modern::SetStickRun(v);};
+  re3menu::onSetWidescreen=[](int v){re3widescreen::SetMode(v);};
+  re3menu::onSetWidescreenSmooth=[](int v){re3widescreen::SetSmooth(v);};   // round 4: camera smoothing of the follow mode
+  re3menu::onSetWidescreenSpeed=[](int v){re3widescreen::SetSpeed(v);};     // round 5: speed limit of the follow window
+  re3menu::onSetWidescreenDelay=[](int v){re3widescreen::SetDelay(v);};     // round 5: start delay of the follow window
+  re3menu::onSetWidescreenPeek=[](int v){re3widescreen::SetPeek(v);};       // round 6: the right stick looks up / down
+  re3widescreen::gPeekStick=[](float& y){   // round 6: lRy of joystick 0; not while the menu holds the input or a game action uses that axis
+    int rx=0,ry=0;if(re3menu::InputBlocked()||re3menu::RightStickBound()||!re3modern::ReadRightStick(gameBase,rx,ry))return false;y=float(ry)/1000.f;return true;};
+  re3menu::onSetGlockKneelBudget=[](int v){glock::kneelBudget=v!=0;};
+  re3menu::onSetDodgeAlways=[](int v){glock::dodgeAlways=v!=0;};   // round 6 (test row): the dodge always succeeds against Nemesis
+  re3menu::onSetPlayerMovies=[](int v){re3playermovies::SetEnabled(v);};
+  re3widescreen::gMovieAspect=re3playermovies::ScreenAspect;   // widescreen x player movies: the movie crop follows the picture
+  return true;}();
 // Movie call trace (2026-10-23, the 5 s still first frame of opn/ins01): the renderer's movie methods +10 (frame:
 // Seek/RUN on start, Update when movie+20 == 0), +124 (Blt into the texture, resets movie+20, draw), +34 (start
 // request), +38 (GetTime) are wrapped; the first 2000 calls after MOVIE_OPEN are logged run-length compressed at
@@ -1187,7 +1268,7 @@ static int __fastcall movieHook(void* renderer,void*,const char* path){
   if(path){re3movie::NoteMovieOpen(name);movieEventCount=0;movieTraceStart=traceNow();movieTraceOn=true;}
   else{const std::string sync=re3movie::SyncReport();if(!sync.empty())log("%s duplicate_draws_skipped=%u",sync.c_str(),movieDrawsSkipped);movieDrawsSkipped=0;movieTraceOn=false;
     if(GetPrivateProfileIntA("pilot","debug_movies",0,(root+"\\pilot.ini").c_str()))logMovieTrace();else movieEventCount=0;}
-  const int result=originalMovie(renderer,path);
+  const int result=re3playermovies::Open(renderer,path,originalMovie);   // player movies 2026-11-09 (was originalMovie(renderer,path))
   moviePlaying=path&&result;
   try{size_t free2=0,big2=0;addressSpace(free2,big2);const double mb=1048576.0;
     if(path)log("MOVIE_OPEN %s result=%d va_free_mb=%.0f trimmed_mb=%.0f after_open_mb=%.0f largest_mb=%.0f->%.0f %s%s",name,result,free0/mb,free1/mb,free2/mb,big0/mb,big2/mb,trim.c_str(),
@@ -1196,7 +1277,71 @@ static int __fastcall movieHook(void* renderer,void*,const char* path){
   }catch(...){}
   return result;
 }
+// Fix 2026-11-11 (user: "the green radar in the top right corner at the end of the game is cut off in widescreen"). The
+// missile radar is one object at A35B60 (routines 52A1A8: 45ECF0 sets it up, 45F160 runs it) and its primitives live inside
+// it, two copies each (frame parity A5C870): SPRT +64 (the 96x64 screen at 200,20), SPRT +9C, FT4 +C4, SPRT +124 (the
+// label), ten SPRT +14C (200 bytes a copy: the countdown), G4 +2DC (the sweep), SPRT +334 (the dot). 45F4C0 (one caller,
+// 45F389) rewrites the sweep and the dot every frame and links all of them into the HUD table; the rest keep the rows
+// 45EDB0 gave them. The widescreen crop cuts rows off the top of the frame, so the wrapped call puts every row of the
+// frame's copy lower by what is cut (re3widescreen::HudTop, 0 in 4:3): the radar stays in the corner of what is shown.
+static void(__cdecl* originalRadarDraw)(uint8_t*)=nullptr;
+static void __cdecl radarDrawHook(uint8_t* radar){
+  if(!re3bridge::detail::Accessible(radar,0x36c,true)){originalRadarDraw(radar);return;}
+  const unsigned copy=*reinterpret_cast<const uint8_t*>(gameBase+0x65c870);const bool moving=(radar[4]&2)!=0;
+  originalRadarDraw(radar);
+  auto row=[&](size_t offset)->int16_t&{return *reinterpret_cast<int16_t*>(radar+offset);};
+  // only the layout 45EDB0 writes: the screen sprite of this copy at x 200, rows 20 + what an earlier frame added
+  if(copy>1||row(0x64+copy*20+8)!=0xc8||row(0x64+copy*20+10)<0x14||row(0x64+copy*20+10)>0x14+240)return;
+  const int16_t top=int16_t(re3widescreen::HudTop());
+  row(0x64+copy*20+10)=int16_t(0x14+top);row(0x9c+copy*20+10)=int16_t(0x19+top);row(0x124+copy*20+10)=int16_t(0x18+top);
+  {const size_t q=0xc4+copy*40;row(q+0x0a)=row(q+0x12)=int16_t(0x51+top);row(q+0x1a)=row(q+0x22)=int16_t(0x32+top);}
+  for(unsigned k=0;k<10;++k)row(0x14c+copy*200+k*20+10)=int16_t(0x22+top);
+  if(moving&&top){const size_t g=0x2dc+copy*36;for(const size_t y:{size_t(0x0a),size_t(0x12),size_t(0x1a),size_t(0x22)})row(g+y)=int16_t(row(g+y)+top);
+    row(0x334+copy*20+10)=int16_t(row(0x334+copy*20+10)+top);}
+  static int logged=-1;if(top!=logged&&(logged<0||!top||!logged)){logged=top;log("WIDESCREEN_RADAR rows +%d (the missile radar follows the crop window)",int(top));}
+}
+static void installRadarHook(){
+  if(re3exe::gRunning!=re3exe::Exe::Main)return;
+  re3bridge::detail::Patch patch;
+  if(!re3bridge::detail::BuildCallPatch(patch,gameBase+0x5f389,gameBase+0x5f4c0,reinterpret_cast<void*>(radarDrawHook))){log("WIDESCREEN_RADAR_HOOK skipped: call 45F389 signature mismatch (the radar stays where the game draws it)");return;}
+  originalRadarDraw=reinterpret_cast<void(__cdecl*)(uint8_t*)>(gameBase+0x5f4c0);
+  if(!re3bridge::detail::WritePatch(patch,true)){log("WIDESCREEN_RADAR_HOOK failed: native call kept");return;}
+  log("WIDESCREEN_RADAR_HOOK_OK call 45F389 -> 45F4C0 wrapped (radar rows follow the widescreen crop)");
+}
+// Fix 2026-11-11b (user: "the time to the explosion Carlos sees at the hospital exit is cut off at the top in widescreen,
+// like the radar was"). The countdown ([A61F5C] bit 4000000h, seconds [A61FC8], frames [A58792]) is text the gameplay task
+// writes at row 32 every frame: 42B429..42B64E, six calls of 42D330 (x, y, colour, format, ...) and five of 42D2F0 (x, y,
+// text), which both hand 42D380 a pointer to their own arguments (the formats take two numbers at most). The calls are
+// wrapped: the row is lower by what the widescreen crop cuts off the top (re3widescreen::HudTop, 0 in 4:3). ResidentEvil3.exe
+// only: RE3_MERCE.exe draws its timer with the same code, and there the crop window stops at the timer row instead
+// (widescreen.h merc), as before.
+static int countdownRows(){
+  const int top=re3widescreen::HudTop();
+  static int logged=-1;static unsigned lines=0;
+  if(top!=logged&&(logged<0||!top||!logged)&&lines<8){logged=top;++lines;log("WIDESCREEN_COUNTDOWN rows +%d (the countdown text follows the crop window)",top);}
+  return top;
+}
+static int(__cdecl* originalCountdownFormat)(int,int,int,const char*,int,int)=nullptr;
+static int __cdecl countdownFormatHook(int x,int y,int colour,const char* format,int a,int b){return originalCountdownFormat(x,y+countdownRows(),colour,format,a,b);}
+static int(__cdecl* originalCountdownText)(int,int,const char*)=nullptr;
+static int __cdecl countdownTextHook(int x,int y,const char* text){return originalCountdownText(x,y+countdownRows(),text);}
+static void installCountdownHook(){
+  if(re3exe::gRunning!=re3exe::Exe::Main)return;
+  static const uint32_t formatSites[]={0x2b47a,0x2b4c0,0x2b4fd,0x2b58a,0x2b5d0,0x2b60d},textSites[]={0x2b51f,0x2b530,0x2b62c,0x2b63d,0x2b64e};
+  re3bridge::detail::Patch patches[11];size_t count=0;
+  for(const uint32_t site:formatSites)if(!re3bridge::detail::BuildCallPatch(patches[count++],gameBase+site,gameBase+0x2d330,reinterpret_cast<void*>(countdownFormatHook))){
+    log("WIDESCREEN_COUNTDOWN_HOOK skipped: call %x signature mismatch (the countdown stays at row 32)",0x400000u+site);return;}
+  for(const uint32_t site:textSites)if(!re3bridge::detail::BuildCallPatch(patches[count++],gameBase+site,gameBase+0x2d2f0,reinterpret_cast<void*>(countdownTextHook))){
+    log("WIDESCREEN_COUNTDOWN_HOOK skipped: call %x signature mismatch (the countdown stays at row 32)",0x400000u+site);return;}
+  originalCountdownFormat=reinterpret_cast<int(__cdecl*)(int,int,int,const char*,int,int)>(gameBase+0x2d330);
+  originalCountdownText=reinterpret_cast<int(__cdecl*)(int,int,const char*)>(gameBase+0x2d2f0);
+  size_t done=0;
+  while(done<count&&re3bridge::detail::WritePatch(patches[done],true))++done;
+  if(done<count){while(done)re3bridge::detail::WritePatch(patches[--done],false);log("WIDESCREEN_COUNTDOWN_HOOK failed: native calls kept");return;}
+  log("WIDESCREEN_COUNTDOWN_HOOK_OK %u calls 42B47A..42B64E wrapped (the countdown row follows the widescreen crop)",unsigned(count));
+}
 static void installGameHooks(){
+  re3focus::Install(); // r6 focus
   gameBase=(uintptr_t)GetModuleHandleA(nullptr);auto* nt=(IMAGE_NT_HEADERS*)(gameBase+((IMAGE_DOS_HEADER*)gameBase.value)->e_lfanew);
   {uint64_t fileHash=0;const auto exe=re3exe::Detect(gameBase.value,&fileHash);   // GOG, or the Steam build in memory (exe_map.h)
     re3exe::gMissLog=[](uint32_t rva){log("EXE_MAP_MISS rva=%x not in the verified RE3_MERCE.exe map: its guard fails, feature stays native",rva);};
@@ -1230,7 +1375,8 @@ static void installGameHooks(){
     if(uiRawReady){originalRawBackground=reinterpret_cast<BackgroundFn>(*slot);DWORD prot;VirtualProtect(slot,4,PAGE_READWRITE,&prot);*slot=reinterpret_cast<void*>(rawBackgroundHook);VirtualProtect(slot,4,prot,&unused);}
     log("Native UI raw16 hook installed=%u %s",uiRawReady,error.c_str());
   }
-  if(GetPrivateProfileIntA("pilot","debug_warp",0,(root+"\\pilot.ini").c_str()))for(unsigned rva:{0x238c6u,0x2fb60u}){auto call=(uint8_t*)(gameBase+rva);if(call[0]==0xe8&&(uintptr_t)(call+5+*(int32_t*)(call+1))==gameBase+0x2cad0){DWORD prot;VirtualProtect(call,5,PAGE_EXECUTE_READWRITE,&prot);*(int32_t*)(call+1)=(int32_t)((uint8_t*)inputPollHook-(call+5));VirtualProtect(call,5,prot,&unused);FlushInstructionCache(GetCurrentProcess(),call,5);log("Diagnostic input hook installed at %x",rva);}}
+  // controls round 2026-11-09: installed always (was debug_warp only); the diagnostic part of inputPollHook stays gated
+  for(unsigned rva:{0x238c6u,0x2fb60u}){auto call=(uint8_t*)(gameBase+rva);if(call[0]==0xe8&&(uintptr_t)(call+5+*(int32_t*)(call+1))==gameBase+0x2cad0){DWORD prot;VirtualProtect(call,5,PAGE_EXECUTE_READWRITE,&prot);*(int32_t*)(call+1)=(int32_t)((uint8_t*)inputPollHook-(call+5));VirtualProtect(call,5,prot,&unused);FlushInstructionCache(GetCurrentProcess(),call,5);log("Diagnostic input hook installed at %x",rva);}}
   const unsigned gameModes[]={0x10a550,0x10a554,0x10a594,0x10a598};bool gm=true;
   for(int i=0;i<4;i++)if(*(uint32_t*)(gameBase+gameModes[i])!=(i%2?768u:1024u))gm=false;
   if(gm){for(int i=0;i<4;i++){DWORD prot;auto ptr=(void*)(gameBase+gameModes[i]);VirtualProtect(ptr,4,PAGE_READWRITE,&prot);*(uint32_t*)ptr=i%2?renderHeight:renderWidth;VirtualProtect(ptr,4,prot,&unused);}log("Native resolution filter/rank table 1024x768 -> %ux%u patched in memory",renderWidth,renderHeight);}
@@ -1244,14 +1390,19 @@ static void installGameHooks(){
   re3extra::effectTrace=GetPrivateProfileIntA("pilot","effect_trace",0,(root+"\\pilot.ini").c_str())!=0;if(re3extra::effectTrace){log("EFFECT_TRACE on");re3bridge::detail::Get().packetTrace=true;}
   if(GetPrivateProfileIntA("pilot","blood_packet_census",0,(root+"\\pilot.ini").c_str())){log("BLOOD_PACKET_CENSUS on");re3bridge::detail::Get().packetCensus=true;}
   re3extra::blood::enabled=GetPrivateProfileIntA("pilot","blood_fx",1,(root+"\\pilot.ini").c_str())!=0;
+  re3extra::blood::poolBrightness=float((std::max)(40,(std::min)(160,(int)GetPrivateProfileIntA("pilot","blood_pool_brightness",100,(root+"\\pilot.ini").c_str()))))/100.f;   // fix 2026-11-11
   re3extra::blood::debugPoolBucket=(int)GetPrivateProfileIntA("pilot","blood_debug_pool_bucket",-1,(root+"\\pilot.ini").c_str());
   re3extra::blood::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","blood_debug_slow",1,(root+"\\pilot.ini").c_str())));
   re3extra::nemesis_cloud::enabled=GetPrivateProfileIntA("pilot","nemesis_cloud_fx",1,(root+"\\pilot.ini").c_str())!=0;re3extra::nemesis_cloud::debugSlow=(std::max)(1u,(std::min)(16u,(unsigned)GetPrivateProfileIntA("pilot","nemesis_cloud_debug_slow",1,(root+"\\pilot.ini").c_str())));   // fx 2026-11-08 nemesis-cloud
   installModels();installPropModels();installExtraModels();installMerceSelect();installTitleCostume();installFps60();glock::install();
   sfxhits::install();   // fx 2026-11-08 hit-sound
+  re3widescreen::Install(gameBase,root+"\\pilot.ini",log,&moviePlaying); // controls round 2026-11-09 widescreen
+  installRadarHook();   // fix 2026-11-11
+  installCountdownHook();   // fix 2026-11-11b
   {auto slot=reinterpret_cast<void**>(gameBase+0x10aa78+0x30);
     if(*slot==reinterpret_cast<void*>(gameBase+0xf080)){originalMovie=reinterpret_cast<MovieFn>(*slot);DWORD prot;VirtualProtect(slot,4,PAGE_READWRITE,&prot);*slot=reinterpret_cast<void*>(movieHook);VirtualProtect(slot,4,prot,&unused);log("MOVIE_HOOK installed (renderer +30 = 40F080), trim below %zu MB free",(kMovieNeed>>20)+256);}
     else log("MOVIE_HOOK skipped: renderer vtable +30 signature mismatch");}
+  re3playermovies::Install(gameBase,root,[](const char* line){log("%s",line);});   // player movies 2026-11-09
   {auto table=reinterpret_cast<void**>(gameBase+0x10aa78);
     if(table[0x10/4]==reinterpret_cast<void*>(gameBase+0xaf20)&&table[0x34/4]==reinterpret_cast<void*>(gameBase+0xf0f0)&&table[0x38/4]==reinterpret_cast<void*>(gameBase+0xf100)&&table[0x124/4]==reinterpret_cast<void*>(gameBase+0xe930)){
       originalMovieFrame=(MovieFrameFn)table[0x10/4];originalMovieStart=(MovieFrameFn)table[0x34/4];originalMovieTime=(MovieTimeFn)table[0x38/4];originalMovieDraw=(MovieDrawFn)table[0x124/4];
@@ -1270,14 +1421,18 @@ static void releasePilotDeviceResources(const char* reason){
   size_t ui=0;for(auto& item:uiTextures)if(item.second.texture){item.second.texture->Release();++ui;}uiTextures.clear();
   size_t replaced=0;for(auto& entry:textures)if(entry.second.replacement){entry.second.replacement->Release();entry.second.replacement=nullptr;++replaced;}
   fps60ReleaseDevice();
+  re3menu::ReleaseDevice(); // controls round 2026-11-09 menu
+  re3widescreen::OnDeviceRelease(); // controls round 2026-11-09 widescreen
   log("DEVICE_RELEASE %s device=%p released model-assets=%zu scenes=%zu ui-textures=%zu replacements=%zu device-refs-before=%lu",reason,gameDevice,assets,sceneCount,ui,replaced,references);
 }
 static void releaseDeviceBoundResources(){releasePilotDeviceResources("rebuild");gameDevice=nullptr;}
 static HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9* d,UINT a,D3DDEVTYPE t,HWND h,DWORD flags,D3DPRESENT_PARAMETERS* p,IDirect3DDevice9** out){
   std::lock_guard<std::recursive_mutex> guard(mutex);log("CREATE_DEVICE bb=%ux%u windowed=%u flags=%08lx",p->BackBufferWidth,p->BackBufferHeight,p->Windowed,flags);
+  re3focus::BeforeCreate(gameDevice); // r6 focus
   if(gameDevice)releaseDeviceBoundResources();
   auto create=method<HRESULT(STDMETHODCALLTYPE*)(IDirect3D9*,UINT,D3DDEVTYPE,HWND,DWORD,D3DPRESENT_PARAMETERS*,IDirect3DDevice9**)>(d3ds.at(d),16);
   auto hr=create(d,a,t,h,flags,p,out);
+  hr=re3focus::CreateFallback(hr,p,true,[&](D3DPRESENT_PARAMETERS* q){return create(d,a,t,h,flags,q,out);}); // r6 focus: no retry storm right after a stand-in
   // The released device may leave exclusive mode a moment later; retry briefly while the game window is in front.
   for(unsigned retry=0;hr==D3DERR_DEVICELOST&&!p->Windowed&&retry<20;++retry){
     HWND fg=GetForegroundWindow();DWORD pid=0;if(fg)GetWindowThreadProcessId(fg,&pid);
@@ -1285,10 +1440,13 @@ static HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9* d,UINT a,D3DDEVTYPE t,
     if(pid!=GetCurrentProcessId())break;
     Sleep(50);hr=create(d,a,t,h,flags,p,out);
   }
+  hr=re3focus::CreateFallback(hr,p,false,[&](D3DPRESENT_PARAMETERS* q){return create(d,a,t,h,flags,q,out);}); // r6 focus: windowed stand-in instead of a closed game
+  re3focus::AfterCreate(SUCCEEDED(hr)?*out:nullptr,hr,p->hDeviceWindow?p->hDeviceWindow:h); // r6 focus
   if(SUCCEEDED(hr)){hookDevice(*out);HWND hwnd=p->hDeviceWindow?p->hDeviceWindow:h;if(!originalWndProc&&hwnd)originalWndProc=(WNDPROC)SetWindowLongPtrA(hwnd,GWLP_WNDPROC,(LONG_PTR)pilotWndProc);}log("CREATE_DEVICE result=%08lx",hr);return hr;
 }
 extern "C" IDirect3D9* WINAPI ProxyDirect3DCreate9(UINT sdk){
   std::lock_guard<std::recursive_mutex> guard(mutex);if(!realModule)init();
+  if(re3focus::ReleaseAtDirect3DCreate(gameDevice))releaseDeviceBoundResources(); // r6 focus: the old device must be gone before the wrapper's next Direct3D object exists
   auto f=(IDirect3D9*(WINAPI*)(UINT))GetProcAddress(realModule,"Direct3DCreate9");log("Direct3DCreate9 real=%p sdk=%u",f,sdk);if(!f)return nullptr;auto d=f(sdk);log("Direct3D9 object=%p",d);if(d){auto o=cloneTable(d,17);o.hooked[16]=(void*)createDevice;d3ds.emplace(d,o);DWORD unused;VirtualProtect(o.hooked,17*sizeof(void*),o.protection,&unused);}return d;
 }
 BOOL WINAPI DllMain(HINSTANCE h,DWORD reason,LPVOID reserved){

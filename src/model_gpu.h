@@ -207,8 +207,49 @@ inline void MakeLight(const SculptedLighting& s,LightConstants& out){
     out.profile1[0]=p.occlusionDirect;out.profile1[1]=p.shoulder;out.profile1[2]=1;
 }
 struct DrawRange {std::uint32_t firstVertex=0,vertexCount=0,material=0;};
+// ---------------------------------------------------------------- lighting round 2026-11-10 (dynamic shadows, flash light)
+// One HD actor of one build as a shadow caster and receiver. Its draws (body, kit parts, weapon, overlay) are projected
+// along floorDir onto the plane y = floorY (the floor shadow, drawn right after the room background) and rendered along
+// toLight into a tile of the shadow map (what the actor's own pixels and its neighbours' are tested against).
+struct Draw;
+struct ShadowGroup {
+    const void* actor=nullptr;
+    float toLight[3]={0,-1,0};    // unit, world (Y down): from the actor toward its key light (the strongest native light row)
+    float floorDir[3]={0,-1,0};   // the same with its elevation above the floor kept over the configured minimum
+    float strength=0;             // darkness of the floor shadow, 0..1
+    float floorY=0,feet[3]{};     // world: the floor under the actor and its root on it
+    float centre[3]{},radius=0;   // world: a sphere round the actor
+    unsigned keyLight=0;          // the row of the key light in the draws' light constants
+    std::vector<std::weak_ptr<Draw>> casters;
+    // the shadow map of the pass that drew it last (ModelRenderer::renderLighting)
+    int tile=-1;float rows[3][4]{};float tileRect[4]{};float depthRange=1;std::uint64_t renderedPass=0;
+};
+// A point light of a muzzle flash at one build (world), already scaled by its age.
+struct FlashLight {float position[3]{},radius=0,colour[3]{},floorY=0;bool fresh=false;};
+struct ShadowFrame {
+    std::uint32_t serial=0;std::vector<std::shared_ptr<ShadowGroup>> groups;std::vector<FlashLight> flashes;
+    // the camera of the build (of its first skinned draw): the floor light of a flash is placed with it
+    bool camera=false;float cameraRows[12]{},origin[3]{},h=256,offsetX=160,offsetY=120,pixelOffsetX=0,pixelOffsetY=0;
+};
+// An additive screen quad of the radial light texture (muzzle flash halo, core, afterglow), in target pixels.
+struct GlowQuad {float x=0,y=0,half=0;float colour[3]{};};
+struct LightingConfig {
+    bool floor=true,self=true,pool=true;
+    float strength=1.f,selfStrength=0.75f;   // floor shadow darkness scale; how much of the key light a shadowed model pixel loses
+    float tint[3]={0.10f,0.11f,0.15f};       // the picture under a full floor shadow is multiplied by this
+    // world scale: a character is about 3000 units tall (the muzzle of a pistol aimed straight is 2459 above the floor)
+    float fadeStart=2800.f,fadeEnd=5200.f;   // floor shadow fades with the distance from the actor's feet (world units)
+    float referenceHeight=3000.f;            // caster height at which the wide penumbra takes over
+    float bias=7.f,slopeBias=26.f;           // shadow map bias, world units
+    float poolGain=0.6f,poolReach=1.6f;      // floor light of a muzzle flash; its reach in radii of the flash light
+    float contact=0.55f;                     // a second, straight-down projection at this share of the darkness: the soft
+                                             // contact shadow under the feet whatever the light's direction (0 = none)
+    unsigned tileSize=1024;
+};
 // One model of one build, from its OT jobs to the frame that retires them.
 struct Draw {
+    std::shared_ptr<ShadowGroup> shadow;   // lighting round 2026-11-10: the actor this draw belongs to (receives its shadow map)
+    float flash[8]{};                      // the flash light of this build: xyz position (world), 1/radius; rgb colour x intensity
     std::shared_ptr<const void> owner;   // the ModelAsset: buffers and textures stay valid; dropped before a device reset
     Mesh* mesh=nullptr;std::shared_ptr<IndexSet> indices;
     Skin skin=Skin::Linear;
@@ -334,16 +375,19 @@ inline void DepthRangeWorld(const WorldVertex* v,std::size_t count,const float* 
 // ---------------------------------------------------------------- shaders
 inline const char* ShaderSource(){return R"HLSL(
 float4 lightData[11]:register(LIGHT_REGISTER);
-float3 Shade(float3 n,float ao){
+// lighting round 2026-11-10: keep = how much of each native light reaches the surface (the shadow map takes the key light
+// away), extra = light added on top (the muzzle flash). keep 1 and extra 0 give the formula of 2026-11-02.
+float3 ShadeLit(float3 n,float ao,float3 keep,float3 extra){
     n=normalize(n);
-    float3 lambert=max(0,float3(dot(lightData[0].xyz,n),dot(lightData[1].xyz,n),dot(lightData[2].xyz,n)));
+    float3 lambert=max(0,float3(dot(lightData[0].xyz,n),dot(lightData[1].xyz,n),dot(lightData[2].xyz,n)))*keep;
     float ambient=lightData[9].x*(1-lightData[9].w*(1-ao))*max(0,1+lightData[9].z*dot(n,lightData[8].xyz));
     float direct=lightData[9].y*(1-lightData[10].x*(1-ao));
-    float3 x=(lightData[6].rgb*ambient+float3(dot(lightData[3].xyz,lambert),dot(lightData[4].xyz,lambert),dot(lightData[5].xyz,lambert))*direct)*lightData[7].rgb;
+    float3 x=(lightData[6].rgb*ambient+float3(dot(lightData[3].xyz,lambert),dot(lightData[4].xyz,lambert),dot(lightData[5].xyz,lambert))*direct)*lightData[7].rgb+extra;
     float shoulder=lightData[10].y;
     if(shoulder>0){float knee=1-shoulder;x=lerp(x,knee+shoulder*(1-exp((knee-x)/shoulder)),step(knee,x));}
     return saturate(x);
 }
+float3 Shade(float3 n,float ao){return ShadeLit(n,ao,float3(1,1,1),float3(0,0,0));}
 #ifdef VERTEX_SHADER
 float4 projection:register(c0);   // clip.x = x*X + y*Z, clip.y = z*Y + w*Z
 float4 misc:register(c1);         // x near plane, y World/in-between weight, zw pose factors
@@ -351,6 +395,14 @@ float4 cameraRows[3]:register(c2);
 float4 colourTint:register(c16);  // material colour x draw tint
 float4 eyeWorld:register(c17);
 float4 wallPlane:register(c18);   // fix 2026-11-08: camera-space wall plane (Draw::wallPlane)
+// lighting round 2026-11-10 (c19..c23)
+#ifdef SHADOW_FLOOR
+float4 shadowPlane:register(c19);   // xyz toward the light (unit), w the floor's y in the draw's space
+float4 shadowFeet:register(c20);    // xyz the actor's feet in the draw's space, w 1 / reference height
+#endif
+#if defined(SHADOW_DEPTH)||defined(FX_LIGHT)
+float4 shadowRows[3]:register(c21); // the draw's space -> shadow map clip xy (-1..1) and depth (0..1) of its actor's tile
+#endif
 float4 palette[216]:register(c24);
 struct Input {
     float3 position:POSITION;float3 normal:NORMAL;float2 uv:TEXCOORD0;float4 colour:COLOR0;
@@ -369,6 +421,9 @@ struct Output {float4 position:POSITION;float4 colour:COLOR0;float2 uv:TEXCOORD0
 #endif
 #ifdef GEM
     float3 toEye:TEXCOORD3;
+#endif
+#ifdef FX_LIGHT
+    float3 world:TEXCOORD3;float3 shadowCoord:TEXCOORD4;
 #endif
 };
 #if defined(SKIN_LINEAR)
@@ -420,17 +475,35 @@ Output main(Input input){
     float3 out0=world+normal*1.5,toEye=eyeWorld.xyz-out0;float distance=length(toEye);
     world=distance>40?out0+toEye*(10/distance):out0;
 #endif
+#ifdef SHADOW_FLOOR
+    // the vertex slides along the light onto the floor plane (Y down: above the floor = smaller y); below it, it stays
+    float height=max(0,shadowPlane.w-world.y);
+    world-=shadowPlane.xyz*(height/max(0.05,-shadowPlane.y));
+    world.y=shadowPlane.w;
+#endif
     float4 h=float4(world,1);
     float3 camera=float3(dot(cameraRows[0],h),dot(cameraRows[1],h),dot(cameraRows[2],h));
     output.position=float4(projection.x*camera.x+projection.y*camera.z,projection.z*camera.y+projection.w*camera.z,camera.z-misc.x,camera.z);
     output.uv=input.uv;output.depthOcclusion=float3(camera.z,input.colour.r,dot(wallPlane.xyz,camera)+wallPlane.w);
+#ifdef SHADOW_FLOOR
+    output.depthOcclusion=float3(height*shadowFeet.w,length(world.xz-shadowFeet.xz),0);
+#endif
+#ifdef SHADOW_DEPTH
+    // orthographic along the light; what lies nearer to the light than the tile's range is flattened onto its near plane
+    float lightDepth=dot(shadowRows[2],h);
+    output.position=float4(dot(shadowRows[0],h),dot(shadowRows[1],h),clamp(lightDepth,0,1),1);
+    output.depthOcclusion=float3(lightDepth,0,0);
+#endif
+#ifdef FX_LIGHT
+    output.world=world;output.shadowCoord=float3(dot(shadowRows[0],h),dot(shadowRows[1],h),dot(shadowRows[2],h));
+#endif
     float4 colour=colourTint;
 #ifndef SKIN_DECAL
     colour.rgb*=tint;   // damage red belongs to the body, not to its wound decals
 #endif
 #if defined(PIXEL_LIGHT)||defined(GEM)
     output.normal=normal;
-#else
+#elif !defined(SHADOW_FLOOR)&&!defined(SHADOW_DEPTH)
     if(lightData[10].z>0)colour.rgb*=Shade(normal,input.colour.r);
 #endif
 #ifdef GEM
@@ -485,11 +558,51 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float2 depthOcclusion:TEXCOOR
     alpha=saturate(max(alpha,dot(spec,float3(0.333,0.333,0.334))));
     return float4(colour,alpha*coverage*options.z);
 }
+#elif defined(SHADOW_FLOOR)
+// lighting round 2026-11-10: a caster's silhouette on the floor. r = darkness, g = darkness x (1 - caster height 0..1).
+// Blended with MAX, so where several parts cover a floor point the LOWEST counts (run 3: with the highest, the head over
+// the feet under a light from above made the whole shadow "high": wide and faint). The composite takes the height back
+// from the blurred pair and widens the penumbra with it.
+float4 casterOptions:register(c14);  // x darkness of this actor's shadow, y fade start, z 1 / fade length (distance from the feet)
+float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 info:TEXCOORD1):COLOR0{
+    clip(tex2D(albedo,uv).a*tint.a-options.x);
+    float s=casterOptions.x*(1-saturate((info.y-casterOptions.y)*casterOptions.z));
+    return float4(s,s*saturate(1-info.x),0,1);
+}
+#elif defined(SHADOW_DEPTH)
+// the shadow map: depth along the light, 0 at the near plane of the actor's tile
+float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 info:TEXCOORD1):COLOR0{
+    clip(tex2D(albedo,uv).a*tint.a-options.x);
+    return float4(saturate(info.x),0,0,1);
+}
 #else
 float4 wallSide:register(c13);   // fix 2026-11-08: x side kept (+1 room, -1 beyond the wall, 0 all), y 1 when off
+#ifdef FX_LIGHT
+// lighting round 2026-11-10: the actor's shadow map takes the key light away where something stands between the pixel and
+// the light (its own body, its weapon, a neighbour); the muzzle flash of this build lights the pixel as a point light.
+sampler2D shadowMap:register(s1);
+float4 shadowTile:register(c14);     // atlas uv = coord.xy * tile.xy + tile.zw
+float4 shadowBox:register(c15);      // the tile in the atlas less a border: min uv, max uv
+float4 shadowOptions:register(c16);  // x strength (0 = no map), y bias, z slope bias (both in map depth), w atlas size
+float4 shadowKey:register(c17);      // xyz 1 for the light row the map belongs to, w 1 / atlas size
+float4 flashData[2]:register(c18);   // [0] xyz position in the draw's space, w 1 / radius; [1] rgb colour x intensity, w on
+float ShadowTap(float2 uv,float depth){return tex2Dlod(shadowMap,float4(uv,0,0)).r<depth?0.0:1.0;}
+float ShadowLit(float3 coord,float facing){
+    float2 uv=coord.xy*shadowTile.xy+shadowTile.zw;
+    if(uv.x<shadowBox.x||uv.y<shadowBox.y||uv.x>shadowBox.z||uv.y>shadowBox.w||coord.z>=1)return 1;
+    float depth=coord.z-shadowOptions.y-shadowOptions.z*(1-facing);
+    float2 t=uv*shadowOptions.w-0.5,f=frac(t),base=(floor(t)+0.5)*shadowKey.w;
+    float wx[4]={1-f.x,1,1,f.x},wy[4]={1-f.y,1,1,f.y};float sum=0;
+    [unroll] for(int j=0;j<4;++j){[unroll] for(int i=0;i<4;++i)sum+=wx[i]*wy[j]*ShadowTap(base+float2(i-1,j-1)*shadowKey.w,depth);}
+    return sum/9;
+}
+#endif
 float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOORD1
 #ifdef PIXEL_LIGHT
     ,float3 normal:TEXCOORD2
+#endif
+#ifdef FX_LIGHT
+    ,float3 world:TEXCOORD3,float3 shadowCoord:TEXCOORD4
 #endif
     ):COLOR0{
     clip(depthOcclusion.x-range.x);clip(range.y-depthOcclusion.x);
@@ -498,7 +611,22 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOOR
     float coverage=texel.a*tint.a;
     clip(coverage-options.x);
     float3 colour=tint.rgb;
-#ifdef PIXEL_LIGHT
+#ifdef FX_LIGHT
+    if(lightData[10].z>0){
+        float3 n=normalize(normal),keep=1,extra=0;
+        if(shadowOptions.x>0){
+            float3 key=lightData[0].xyz*shadowKey.x+lightData[1].xyz*shadowKey.y+lightData[2].xyz*shadowKey.z;
+            float facing=dot(n,key)/max(length(key),1e-4);
+            if(facing>0)keep-=shadowKey.xyz*(shadowOptions.x*(1-ShadowLit(shadowCoord,saturate(facing))));
+        }
+        if(flashData[1].w>0){
+            // wrapped: the flash is a small bright volume right at the hands, plain Lambert leaves black terminators there
+            float3 to=flashData[0].xyz-world;float d=length(to),a=saturate(1-d*flashData[0].w);
+            extra=flashData[1].rgb*(a*a*saturate((dot(n,to)/max(d,1)+0.3)/1.3));
+        }
+        colour*=ShadeLit(n,depthOcclusion.y,keep,extra);
+    }
+#elif defined(PIXEL_LIGHT)
     if(lightData[10].z>0)colour*=Shade(normal,depthOcclusion.y);
 #endif
     return float4(texel.rgb*colour,coverage*options.z);
@@ -508,7 +636,9 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOOR
 )HLSL";}
 
 class Shaders {
-    IDirect3DVertexShader9* vertex_[5][2]{};IDirect3DPixelShader9* pixel_[2]{};
+    // variants: 0 vertex light, 1 pixel light, 2 pixel light + shadow map + flash light (lighting round 2026-11-10),
+    // 3 floor shadow caster, 4 shadow map caster
+    IDirect3DVertexShader9* vertex_[5][5]{};IDirect3DPixelShader9* pixel_[5]{};bool failed_[5]{};
     IDirect3DVertexShader9* gemVertex_=nullptr;IDirect3DPixelShader9* gemPixel_=nullptr;bool gemFailed_=false;   // crystals round 2026-11-07
     IDirect3DVertexDeclaration9* skin_=nullptr,*pose_=nullptr,*world_=nullptr;
     using Compile=HRESULT(WINAPI*)(LPCVOID,SIZE_T,LPCSTR,const D3D_SHADER_MACRO*,ID3DInclude*,LPCSTR,LPCSTR,UINT,UINT,ID3DBlob**,ID3DBlob**);
@@ -531,7 +661,15 @@ public:
     const std::string& lastError()const{return lastError_;}
     ~Shaders(){release();if(library_)FreeLibrary(library_);}
     void release(){for(auto& row:vertex_)for(auto& v:row)SafeRelease(v);for(auto& p:pixel_)SafeRelease(p);SafeRelease(skin_);SafeRelease(pose_);SafeRelease(world_);
-        SafeRelease(gemVertex_);SafeRelease(gemPixel_);gemFailed_=false;}
+        SafeRelease(gemVertex_);SafeRelease(gemPixel_);gemFailed_=false;for(auto& f:failed_)f=false;}
+    static void variantMacros(std::vector<D3D_SHADER_MACRO>& macros,unsigned variant){
+        if(variant==1||variant==2)macros.push_back({"PIXEL_LIGHT","1"});
+        if(variant==2)macros.push_back({"FX_LIGHT","1"});
+        if(variant==3)macros.push_back({"SHADOW_FLOOR","1"});
+        if(variant==4)macros.push_back({"SHADOW_DEPTH","1"});
+    }
+    // a variant whose shaders did not build is not tried again on this device (lighting variants: the caller falls back)
+    bool variantFailed(unsigned variant)const{return variant<5&&failed_[variant];}
     HRESULT declarations(IDirect3DDevice9* d){
         if(skin_)return S_OK;
         const D3DVERTEXELEMENT9 skin[]={{0,0,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_POSITION,0},{0,12,D3DDECLTYPE_FLOAT3,0,D3DDECLUSAGE_NORMAL,0},{0,24,D3DDECLTYPE_FLOAT2,0,D3DDECLUSAGE_TEXCOORD,0},
@@ -544,20 +682,32 @@ public:
         HRESULT hr=d->CreateVertexDeclaration(skin,&skin_);if(SUCCEEDED(hr))hr=d->CreateVertexDeclaration(pose,&pose_);if(SUCCEEDED(hr))hr=d->CreateVertexDeclaration(world,&world_);return hr;
     }
     IDirect3DVertexDeclaration9* declaration(Skin skin)const{return skin==Skin::LinearPose?pose_:skin==Skin::World?world_:skin_;}
-    IDirect3DVertexShader9* vertex(IDirect3DDevice9* d,Skin skin,bool pixelLight){
-        auto& slot=vertex_[unsigned(skin)][pixelLight];if(slot)return slot;
-        std::vector<D3D_SHADER_MACRO> macros{{"VERTEX_SHADER","1"},{"LIGHT_REGISTER","c5"}};if(pixelLight)macros.push_back({"PIXEL_LIGHT","1"});
+    IDirect3DVertexShader9* vertex(IDirect3DDevice9* d,Skin skin,unsigned variant){
+        if(variant>4||failed_[variant])return nullptr;
+        auto& slot=vertex_[unsigned(skin)][variant];if(slot)return slot;
+        std::vector<D3D_SHADER_MACRO> macros{{"VERTEX_SHADER","1"},{"LIGHT_REGISTER","c5"}};variantMacros(macros,variant);
         if(skin==Skin::Affine)macros.push_back({"SKIN_AFFINE","1"});else if(skin==Skin::World)macros.push_back({"SKIN_WORLD","1"});else macros.push_back({"SKIN_LINEAR","1"});
         if(skin==Skin::LinearPose)macros.push_back({"SKIN_POSE","1"});if(skin==Skin::Decal)macros.push_back({"SKIN_DECAL","1"});
         macros.push_back({nullptr,nullptr});ID3DBlob* code=nullptr;
         if(SUCCEEDED(build(macros,"vs_3_0",&code)))d->CreateVertexShader(static_cast<const DWORD*>(code->GetBufferPointer()),&slot);
-        if(code)code->Release();return slot;
+        if(code)code->Release();if(!slot&&variant>=2)failed_[variant]=true;return slot;
     }
-    IDirect3DPixelShader9* pixel(IDirect3DDevice9* d,bool pixelLight){
-        auto& slot=pixel_[pixelLight];if(slot)return slot;
-        std::vector<D3D_SHADER_MACRO> macros{{"LIGHT_REGISTER","c2"}};if(pixelLight)macros.push_back({"PIXEL_LIGHT","1"});macros.push_back({nullptr,nullptr});ID3DBlob* code=nullptr;
+    IDirect3DPixelShader9* pixel(IDirect3DDevice9* d,unsigned variant){
+        if(variant>4||failed_[variant])return nullptr;
+        auto& slot=pixel_[variant];if(slot)return slot;
+        std::vector<D3D_SHADER_MACRO> macros{{"LIGHT_REGISTER","c2"}};variantMacros(macros,variant);macros.push_back({nullptr,nullptr});ID3DBlob* code=nullptr;
         if(SUCCEEDED(build(macros,"ps_3_0",&code)))d->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&slot);
-        if(code)code->Release();return slot;
+        if(code)code->Release();if(!slot&&variant>=2)failed_[variant]=true;return slot;
+    }
+    // lighting round 2026-11-10: small pixel shaders for pre-transformed quads (blur, composite, light sprites)
+    IDirect3DPixelShader9* quadShader(IDirect3DDevice9* d,const char* source,IDirect3DPixelShader9*& slot,bool& failed){
+        if(slot||failed)return slot;
+        if(!load()){failed=true;return nullptr;}
+        ID3DBlob* code=nullptr,*errors=nullptr;
+        const HRESULT hr=compile_(source,std::strlen(source),"RE3 lighting quad",nullptr,nullptr,"main","ps_3_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
+        if(errors){lastError_.assign(static_cast<const char*>(errors->GetBufferPointer()),errors->GetBufferSize());errors->Release();}
+        if(SUCCEEDED(hr)&&code)d->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()),&slot);
+        if(code)code->Release();if(!slot)failed=true;return slot;
     }
     // Crystals round 2026-11-07: the GEM pair (linear skin only). False after a failed build: Gem materials then draw as plain
     // AlphaBlend materials (failed() reports it once); the rest of the GPU path is not affected.

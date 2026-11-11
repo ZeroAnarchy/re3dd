@@ -110,6 +110,17 @@ static std::unordered_map<std::uintptr_t,std::size_t> siteAt;   // return addres
 static std::uint32_t tick=0,room=~0u,seedState=0x2545f491u;
 static std::uint64_t flashes=0,puffsMade=0,hiddenEffects=0,collapsedPackets=0,spawnLines=0,flashQuads=0,flashSkipped=0,pinnedPackets=0;
 static double drawMs=0;static unsigned drawFrames=0;
+// lighting round 2026-11-10 (user: flashes with volume light as in the Dino Crisis 2 project): the native flash stays; over
+// it, at the same place and depth, a halo (soft additive light, 3.4 x the flash) and a hot core while the flash shows (3
+// ticks) and an afterglow that lives 5.5 ticks and grows a little; the same shot is a point light on the HD models and on
+// the floor (model_integration.h lightAddFlash). size = the flash in world units, radius / power = its light.
+struct GlowStyle{float size,radius,power;};
+static const GlowStyle kGlow[kGuns]={
+    /*pistol  */{380,5500,0.85f},/*rifle   */{400,5800,0.80f},/*shotgun */{560,7500,1.15f},/*magnum  */{520,7200,1.10f},
+    /*gatling */{440,6200,0.85f},/*launcher*/{500,7000,1.00f},/*rocket  */{680,8500,1.20f}};   // radii: a character is ~3000 tall
+struct Glow{Vec3 at{};std::uint8_t gun=0;std::uint32_t born=0;};
+static std::vector<Glow> glows;
+static std::uint64_t glowJobs=0;
 inline float rnd(){seedState=seedState*1664525u+1013904223u;return float((seedState>>8)&0xffff)/65535.f;}
 inline float rnd(float a,float b){return a+(b-a)*rnd();}
 
@@ -224,6 +235,18 @@ static void onSpawn(bool port,int kind,int key,const void* hand,const std::int16
                 if(c.z>1.f){sx=(c.x*projection.h/c.z+projection.offsetX)*8.f;sy=(c.y*projection.h/c.z+projection.offsetY)*8.f;depth=c.z;}}
             log("MUZZLE_TEST burst %s armed=%d tick=%u screen=%.0f,%.0f depth=%.0f",burstLabel.c_str(),burstArmed,tick,sx,sy,depth);}
         if(site->role==Flash&&lightTraceShots<12){++lightTraceShots;lightTraceBorn=tick+1;lightTraceActor=actorOfHand(hand);}
+        // lighting round 2026-11-10: the flash as a light, at the native flash centre of the shot (fixed from then on)
+        if(site->role==Flash&&lightFlashOn&&active()){
+            Vec3 centre{};bool known=false;
+            if(pooled){centre={float(read<std::int32_t>(effect,0x48)),float(read<std::int32_t>(effect,0x4c)),float(read<std::int32_t>(effect,0x50))};known=true;}
+            else if(hand&&accessible(hand,32)&&used&&accessible(used,6)){centre=re3model::TransformPoint(re3model::FromNativeMatrix(read<re3bridge::Matrix32>(hand)),{float(used[0]),float(used[1]),float(used[2])});known=true;}
+            if(known){const auto* shooter=actorOfHand(hand);const GlowStyle& g=kGlow[site->gun];
+                const float floorY=shooter&&accessible(shooter,0x40)?float(read<std::int32_t>(shooter,0x38)):centre.y+1300.f;
+                lightAddFlash(centre,g.radius,g.power,floorY,tick+1);
+                if(glows.size()>=24)glows.erase(glows.begin());
+                glows.push_back({centre,site->gun,tick+1});
+                static unsigned lines=0;if(lines<6){++lines;log("LIGHT_FLASH gun=%s at=%.0f,%.0f,%.0f floor=%.0f radius=%.0f power=%.2f shooter=%p",kGunNames[site->gun],centre.x,centre.y,centre.z,floorY,g.radius,g.power,shooter);}}
+        }
         if(!enabled||!installed)return;
         // the flash parts stay native (HD texture page, flashBinding); their first build is remembered for fps60
         if(site->role==Flash||site->role==Spike)noteFlashPart(effect,site->role==Flash);
@@ -400,6 +423,35 @@ static void draw(const std::string& tag){
     drawMs+=modelClockMs()-start;++drawFrames;
 }
 
+// lighting round 2026-11-10: the light sprites of the live flashes, as jobs in the ordering table at the flash's depth. Three
+// depth layers (far 40 %, at the flash 35 %, near 25 %): where the sprite meets a model, the edge is three soft steps.
+static void drawGlows(){
+    glows.erase(std::remove_if(glows.begin(),glows.end(),[](const Glow& g){return tick>=g.born&&tick-g.born>6;}),glows.end());
+    if(glows.empty()||!lightFlashOn||!active())return;
+    re3model::Projection pr;if(!snapshotProjection(pr))return;
+    const auto chooseTable=reinterpret_cast<ChooseTable>(gameBase+0x5adc0);
+    static const float kShow[3]={1.f,0.85f,0.5f};static const int kLayer[3]={4,0,-4};static const float kWeight[3]={0.40f,0.35f,0.25f};
+    for(const auto& g:glows){if(tick<g.born)continue;
+        const unsigned age=tick-g.born;
+        const auto c=re3model::TransformPoint(pr.camera,g.at);if(c.z<300.f||c.z>32000.f)continue;
+        const float sx=(c.x*pr.h/c.z+pr.offsetX)*pr.scaleX+pr.pixelOffsetX,sy=(c.y*pr.h/c.z+pr.offsetY)*pr.scaleY+pr.pixelOffsetY;
+        const float S=kGlow[g.gun].size*pr.h/c.z*pr.scaleX,gain=lightFlashGain;
+        auto quads=std::make_shared<std::vector<re3gpu::GlowQuad>>();
+        if(age<3){const float e=kShow[age]*gain;
+            quads->push_back({sx,sy,1.7f*S,{0.50f*e,0.33f*e,0.15f*e}});      // halo
+            quads->push_back({sx,sy,0.62f*S,{0.70f*e,0.62f*e,0.42f*e}});}    // hot core
+        const float t=float(age)/5.5f;
+        if(t<1.f){const float e=0.34f*(1.f-t)*(1.f-t)*gain;quads->push_back({sx,sy,(1.3f+0.025f*float(age))*S,{1.0f*e,0.66f*e,0.30f*e}});}   // afterglow
+        if(quads->empty())continue;
+        const std::int32_t position[3]={std::int32_t(g.at.x),std::int32_t(g.at.y),std::int32_t(g.at.z)};
+        auto* table=chooseTable(position);if(!table||!accessible(table,1024*4,true))continue;
+        const int bucket=int(c.z)>>5;std::vector<re3bridge::BucketJob> jobs;
+        for(unsigned l=0;l<3;++l){auto job=std::make_shared<ModelJob>();job->glow=quads;job->glowGain=kWeight[l];job->glowFresh=age==0;job->name="muzzle-glow";
+            jobs.push_back({std::uint16_t((std::min)(1023,(std::max)(1,bucket+kLayer[l]))),reinterpret_cast<std::uintptr_t>(job.get()),job});}
+        if(re3bridge::EnqueueBatch(table,1024,jobs))++glowJobs;else once("muzzle-glow-enqueue","flash light sprites skipped for one ordering table");
+    }
+}
+
 // ---------------------------------------------------------------- QA (debug_warp): pilot.command muzzle-test / muzzle-capture / muzzle-mid
 // muzzle-test: the next gun of the list into the equipped inventory slot (99 rounds), loaded as the inventory EQUIP does
 // (452620 + 452310, like diagnostic equip-m4), and a capture burst at its next flash; muzzle-capture: only the burst;
@@ -445,11 +497,11 @@ static void update(){
     const std::uint32_t now=(std::uint32_t(read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa6)))<<16)|read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa8));
     if(now!=room){if(room!=~0u&&(flashes||puffsMade))log("MUZZLE_CLEAR room=%x shots=%llu puffs=%llu hidden=%llu collapsed=%llu flash_quads=%llu flash_new_skipped=%llu flash_pinned=%llu draw_ms=%.3f/frame",now,(unsigned long long)flashes,(unsigned long long)puffsMade,
             (unsigned long long)hiddenEffects,(unsigned long long)collapsedPackets,(unsigned long long)flashQuads,(unsigned long long)flashSkipped,(unsigned long long)pinnedPackets,drawFrames?drawMs/drawFrames:0.0);
-        room=now;puffs.clear();hidden.clear();flashFx.clear();newPackets.clear();}
+        room=now;puffs.clear();hidden.clear();flashFx.clear();newPackets.clear();glows.clear();}
     ++tick;
     const std::string tag=debugWarp?runTests():std::string();
     if(lightTraceActor&&tick-lightTraceBorn<=8){const unsigned age=tick-lightTraceBorn;if(age==0||age==1||age==2||age==4||age==8)log("MUZZLE_LIGHT shot=%u age=%u actor=%p light=%06x",lightTraceShots,age,lightTraceActor,lightOf(lightTraceActor)&0xffffffu);}
-    if(!enabled){puffs.clear();if(!tag.empty()&&active()&&pack())draw(tag);return;}
+    if(!enabled){puffs.clear();if(!tag.empty()&&active()&&pack())draw(tag);drawGlows();return;}
     packReady=active()&&bool(pack());
     // smoke: pushed out along the barrel, slowed by the air, rising, slowly turning
     if(tick%debugSlow==0)for(auto& p:puffs){p.vel=p.vel*0.86f;p.vel.y=(std::max)(-7.f,p.vel.y-0.45f);p.pos=p.pos+p.vel;}
@@ -459,6 +511,7 @@ static void update(){
     if(tick%900==0&&(flashes||puffsMade)){log("MUZZLE_STATS shots=%llu puffs=%llu live_puffs=%zu hidden=%llu collapsed=%llu flash_quads=%llu flash_new_skipped=%llu flash_pinned=%llu draw_ms=%.3f/frame",(unsigned long long)flashes,(unsigned long long)puffsMade,puffs.size(),
         (unsigned long long)hiddenEffects,(unsigned long long)collapsedPackets,(unsigned long long)flashQuads,(unsigned long long)flashSkipped,(unsigned long long)pinnedPackets,drawFrames?drawMs/drawFrames:0.0);}
     if(active())draw(tag);
+    drawGlows();   // lighting round 2026-11-10
 }
 
 // ---------------------------------------------------------------- install

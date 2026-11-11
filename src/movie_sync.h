@@ -17,6 +17,8 @@
 // wait is skipped by zeroing its last-Update time (player+0x502A0) before each native call. All offsets are verified
 // by code signature at install; any other dshow.dll keeps the native behaviour (log MOVIE_SYNC skipped).
 // Per movie, SyncReport() gives the MOVIE_SYNC log line (frames, skipped, held, lateness, gaps between game frames).
+// Controls round 2026-11-09 (player movies): the frame rate is the movie's own (dshow player+0x174/+0x178, the rate its
+// Update waits for, 0x100C47AE; verified by code bytes, else 30) - a player's 24/25/60 fps file keeps its speed.
 //
 // Stalls (QA 2026-10-23, DLL cab91b83: one 4-5 s gap between two game frames right after the start of opn and ins01,
 // nothing logged in it; black picture with the sound running, then the picture raced to catch up): a watch thread sees
@@ -38,7 +40,7 @@ using UpdateFn = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, HANDLE, void*, DWORD_
 using PositionFn = MMRESULT(WINAPI*)(HWAVEOUT, LPMMTIME, UINT);
 constexpr uint32_t kImageSize = 0x20A6000, kUpdateRva = 0xC2950, kSlotRva = 0xA92D30;
 constexpr uint32_t kIndex = 0x50284, kEnd = 0x5028C, kLastQpc = 0x502A0, kWave = 0x21C, kPause = 0x198, kEvents = 0x220;
-constexpr double kFps = 30.0, kRate = 44100.0;
+constexpr double kFps = 30.0, kRate = 44100.0;  // kFps: the game's frame rate (gap statistics); movie timing uses State::fps
 // code bytes that hold every offset used here ("??" = any byte)
 struct Signature { uint32_t rva; const char* bytes; };
 constexpr Signature kSignatures[] = {
@@ -60,6 +62,7 @@ struct State {
   unsigned calls = 0, shown = 0, skipped = 0, held = 0, starved = 0, lateEvents = 0, slowFrames = 0, restarts = 0; LONG lastIndex = 0;
   double maxLate = 0, maxGap = 0, excess = 0, endOffset = 0; bool sound = false, soundStarted = false, soundLost = false, active = false;
   unsigned stalls = 0; double stalled = 0, firstFrameWait = 0;
+  double fps = kFps;  // the movie's frame rate (player movies 2026-11-09)
   char name[64] = "-";
 };
 using WaveFn = MMRESULT(WINAPI*)(HWAVEOUT);
@@ -81,6 +84,7 @@ struct Watch {
   CRITICAL_SECTION lock; bool ready = false;  // lock initialised (InstallSync)
 };
 inline UpdateFn original = nullptr;
+inline bool fpsFields = false;  // player+0x174/+0x178 = frame rate num/den (code bytes verified at install)
 inline PositionFn position = nullptr;
 inline WaveFn pauseWave = nullptr, restartWave = nullptr;
 inline SinkFn sink = nullptr;
@@ -313,6 +317,10 @@ inline HRESULT Step(void* sample, DWORD flags, HANDLE event, void* apc, DWORD_PT
       watch.thread = GetCurrentThreadId();
       watch.handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, watch.thread);
     }
+    if (fpsFields) {  // player movies 2026-11-09: the stream's own frame rate (5..120 fps), else 30
+      const LONG num = Field(player, 0x174), den = Field(player, 0x178);
+      if (num > 0 && den > 0 && double(num) / den >= 5.0 && double(num) / den <= 120.0) s.fps = double(num) / den;
+    }
     watch.wave = *reinterpret_cast<HWAVEOUT volatile*>(player + kWave);
     watch.startMs = NowMs(); watch.firstVideoMs = -1; watch.flips = 0; watch.lastIndex = -1;
     InterlockedExchange(&watch.samples, 0); watch.active = 1;
@@ -331,7 +339,7 @@ inline HRESULT Step(void* sample, DWORD flags, HANDLE event, void* apc, DWORD_PT
   }
   ++s.calls;
   HRESULT hr = S_OK;
-  double clock = Clock(s, now), due = s.shown / kFps;
+  double clock = Clock(s, now), due = s.shown / s.fps;
   if (s.shown && clock < due) {  // ahead of the sound: wait like dshow did, at most 40 ms
     const double until = now + 0.040;
     while ((clock = Clock(s, now = Seconds())) < due && now < until) { if (due - clock > 0.003) Sleep(1); else SwitchToThread(); }
@@ -339,14 +347,14 @@ inline HRESULT Step(void* sample, DWORD flags, HANDLE event, void* apc, DWORD_PT
   }
   const double late = clock - due;
   if (late > s.maxLate) s.maxLate = late;
-  if (late >= 2 / kFps) {  // behind: consume the late frames, at most 25 ms per game frame
+  if (late >= 2 / s.fps) {  // behind: consume the late frames, at most 25 ms per game frame
     ++s.lateEvents;
     const double budget = Seconds() + 0.025;
-    while (Clock(s, Seconds()) - s.shown / kFps >= 2 / kFps && Seconds() < budget && Take(s, budget, hr)) ++s.skipped;
+    while (Clock(s, Seconds()) - s.shown / s.fps >= 2 / s.fps && Seconds() < budget && Take(s, budget, hr)) ++s.skipped;
   }
   if (!Take(s, Seconds() + 0.030, hr)) ++s.starved;
   s.lastCall = Seconds();
-  s.endOffset = Clock(s, s.lastCall) - (s.shown - 1) / kFps;
+  s.endOffset = Clock(s, s.lastCall) - (s.shown - 1) / s.fps;
   return hr;
 }
 inline HRESULT STDMETHODCALLTYPE Update(void* sample, DWORD flags, HANDLE event, void* apc, DWORD_PTR data) {
@@ -377,6 +385,8 @@ inline const char* InstallSync(void (*log)(const char*) = nullptr) {
   restartWave = winmm ? reinterpret_cast<WaveFn>(GetProcAddress(winmm, "waveOutRestart")) : nullptr;
   if (!pauseWave || !restartWave) pauseWave = restartWave = nullptr;
   sink = log;
+  fpsFields = Matches(base + 0xC43CB, "8b 01 89 87 74 01 00 00 8b 41 04 8b 8f 34 01 00 00 89 87 78") &&
+              Matches(base + 0xC47AE, "66 0f 6e 8e 74 01 00 00 66 0f 6e 86 78 01 00 00");
   original = reinterpret_cast<UpdateFn>(*slot);
   DWORD old = 0, unused = 0;
   if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return "skipped: VirtualProtect failed";
@@ -385,7 +395,8 @@ inline const char* InstallSync(void (*log)(const char*) = nullptr) {
   *slot = reinterpret_cast<void*>(&Update);
   VirtualProtect(slot, sizeof(void*), old, &unused);
   if (HANDLE t = CreateThread(nullptr, 64 * 1024, WatchThread, nullptr, 0, nullptr)) CloseHandle(t);
-  return position ? "installed (clock: movie sound, stall watch)" : "installed (clock: wall time, no waveOutGetPosition)";
+  return position ? (fpsFields ? "installed (clock: movie sound, stall watch, movie frame rate)" : "installed (clock: movie sound, stall watch, 30 fps)")
+                  : "installed (clock: wall time, no waveOutGetPosition)";
 }
 inline bool SyncInstalled() { return sync_detail::original != nullptr; }
 // Movie open (before the native open): the next Update starts a new movie.
@@ -403,10 +414,10 @@ inline std::string SyncReport() {
   if (!s.active) return {};
   s.active = false;
   char line[512];
-  sprintf_s(line, "MOVIE_SYNC %s clock=%s frames=%u calls=%u skipped=%u held=%u starved=%u late_events=%u max_late_ms=%.0f end_offset_ms=%.0f "
+  sprintf_s(line, "MOVIE_SYNC %s fps=%.3f clock=%s frames=%u calls=%u skipped=%u held=%u starved=%u late_events=%u max_late_ms=%.0f end_offset_ms=%.0f "
             "first_update_ms=%.0f max_gap_ms=%.0f slow_frames=%u native_lag_ms=%.0f restarts=%u stalls=%u stalled_ms=%.0f "
             "decoder_first_frame_ms=%ld decoder_flips_6s=%ld first_frame_wait_ms=%.0f",
-            s.name, s.soundLost ? "sound-lost" : s.sound ? "sound" : "wall", s.shown, s.calls, s.skipped, s.held, s.starved, s.lateEvents,
+            s.name, s.fps, s.soundLost ? "sound-lost" : s.sound ? "sound" : "wall", s.shown, s.calls, s.skipped, s.held, s.starved, s.lateEvents,
             s.maxLate * 1000, s.endOffset * 1000, s.opened ? (s.start - s.opened) * 1000 : -1.0, s.maxGap * 1000, s.slowFrames, s.excess * 1000,
             s.restarts, s.stalls, s.stalled * 1000, w.firstVideoMs, w.flips, s.firstFrameWait * 1000);
   return line;

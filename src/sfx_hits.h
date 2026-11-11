@@ -78,6 +78,9 @@ inline void placeSound(re3model::Vec3 at, float& pan, float& distanceDb, float& 
 }
 inline bool heavyTarget(unsigned model) { return (model >= 0x34 && model <= 0x3b) || model == 0x30 || model == 0x33 || model == 0x32; }
 inline bool noFleshTarget(unsigned model) { return model == 0x3e || model == 0x3f; }   // helicopters (metal)
+// fix 2026-11-11: Nemesis' tentacles (EM37 / EM3B second form, EM39 final form) are actors of their own that hang off his
+// arm in the air: not bodies for the shots at a downed enemy, and not what a blood stain falls from
+inline bool appendageTarget(unsigned model) { return model == 0x37 || model == 0x39 || model == 0x3b; }
 inline bool automatic(int weapon) { return weapon == 0x0b || weapon == 0x0e || weapon == 0x0f || (weapon == 0x03 && glockEquippedItem() == 0x54); }   // Glock AUTO = item 54 on M92F 03
 // -1 = no flesh sound for this weapon (knife, grenade/rocket/mine launchers)
 inline int weaponKind(int weapon) {

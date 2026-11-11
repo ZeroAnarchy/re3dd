@@ -39,9 +39,11 @@ inline volatile LONG pcRequest = 0;        // PC OPTION window
 inline HWND keyWindow = nullptr;           // window that received the key
 inline int optionsKey = -1, legacyKey = -1;   // -1 = not read yet
 
+// controls round 2026-11-09: options_key now opens the 3DD menu (mod_menu.h); the PC window opens from its row
+// "Game settings window", or from options_key when the menu is off (pilot.ini menu=0 / checks failed): pcRequest.
 inline bool OnKeyDown(HWND w, WPARAM wp, LPARAM lp) {
+    (void)w;
     const bool repeat = (lp & (1l << 30)) != 0;
-    if (optionsKey > 0 && wp == static_cast<WPARAM>(optionsKey)) { if (!repeat) { keyWindow = w; InterlockedExchange(&pcRequest, 1); } return true; }
     if (legacyKey > 0 && wp == static_cast<WPARAM>(legacyKey)) { if (!repeat) InterlockedExchange(&keyRequest, 1); return true; }
     return false;
 }
@@ -112,7 +114,7 @@ struct Runtime {
             ready = mainExe && VerifyConsumer(base);
             legacyKey = ready ? static_cast<int>(GetPrivateProfileIntA("pilot", "options_legacy_key", 0, ini.c_str())) : 0;
             optionsKey = mainExe ? static_cast<int>(GetPrivateProfileIntA("pilot", "options_key", VK_F5, ini.c_str())) : 0;   // Mercenaries: keys stay free
-            log("OPTIONS_MENU pc_key=%02x (Setting Up window, WM_COMMAND 40002) legacy_ready=%u legacy_key=%02x (option.bin via controller A587A1)",
+            log("OPTIONS_MENU options_key=%02x -> 3DD menu (Setting Up window via its row / menu=0, WM_COMMAND 40002) legacy_ready=%u legacy_key=%02x (option.bin via controller A587A1)",
                 optionsKey, ready, legacyKey);
         }
         if (InterlockedExchange(&pcRequest, 0)) {

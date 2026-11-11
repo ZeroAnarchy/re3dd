@@ -2,7 +2,8 @@
 # Resident Evil 3DD Mod: removes the mod from the game folder (run <game>\3DD-Mod\Uninstall.cmd).
 # Deletes the files listed in 3DD-Mod\installed-files.sha256 and what d3d9.dll wrote itself (runtime.log, captures,
 # crash dumps), restores Width/Height in bio3.ini from 3DD-Mod\bio3.ini.original (other settings and saves stay as they
-# are) and a d3d9.dll that was there before the mod, then deletes 3DD-Mod.
+# are) and a d3d9.dll that was there before the mod, then deletes 3DD-Mod. The 3DD-Movies folder goes only when it is
+# empty: movie files the player put there are kept.
 $ErrorActionPreference = 'Stop'
 $iniKeys = 'Width', 'Height'
 $isRu = (Get-UICulture).TwoLetterISOLanguageName -in @('ru', 'uk', 'be', 'kk')
@@ -60,7 +61,7 @@ try {
       if (-not (Get-ChildItem -LiteralPath $dir -Force)) { Remove-Item -LiteralPath $dir -Force }
     }
   }
-  foreach ($top in 'pack', 'model-pack', 'ui-pack') {
+  foreach ($top in 'pack', 'model-pack', 'ui-pack', '3DD-Movies') {   # 3DD-Movies: the player's own movies stay (controls round 2026-11-09)
     $dir = Join-Path $GamePath $top
     if (Test-Path -LiteralPath $dir -PathType Container) {
       Get-ChildItem -LiteralPath $dir -Directory -Recurse | Sort-Object { $_.FullName.Length } -Descending | Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force) } | Remove-Item -Force

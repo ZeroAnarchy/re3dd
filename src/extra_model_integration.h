@@ -588,6 +588,7 @@ namespace nemesis_cloud{inline bool owns(const void* effect);inline void onShado
 #include "blood_fx.h"
 #include "fx_nemesis_cloud.h"   // fx 2026-11-08 nemesis-cloud
 #include "fx_fire.h"   // fx 2026-11-08 fire
+#include "fx_pages.h"  // r7 fx pages (10.11.2026)
 #include "fx_muzzle.h" // fx 2026-11-08 muzzle
 inline void __cdecl effectLoopHook(){
     originalEffectLoop();
@@ -597,6 +598,7 @@ inline void __cdecl effectLoopHook(){
     try{blood::update();}catch(...){once("blood-update-exception","HD blood skipped this frame");}
     try{nemesis_cloud::update();}catch(...){once("nemesis-cloud-update-exception","HD Nemesis cloud skipped this frame");}   // fx 2026-11-08 nemesis-cloud
     try{fire::update();}catch(...){once("fire-update-exception","HD fire skipped this frame");}   // fx 2026-11-08 fire
+    try{fxpages::update();}catch(...){}   // r7 fx pages
     try{muzzle::update();}catch(...){once("muzzle-update-exception","HD muzzle FX skipped this frame");} // fx 2026-11-08 muzzle
 }
 
@@ -626,4 +628,5 @@ static void installExtraModels(){
     installed=true;blood::install();nemesis_cloud::install();/* fx 2026-11-08 nemesis-cloud */log("MODEL_EXTRA_INSTALL_OK doors: any DO2 from props.txt (%zu door keys) + CORE02 cases (pistol/nickel/rifle/shell/blue shell/magnum/gatling, resting max %zu); original simulation retained",
         re3prop::table.doors.size(),kMaxResting);
     fire::install();   // fx 2026-11-08 fire
+    fxpages::install();   // r7 fx pages
 }

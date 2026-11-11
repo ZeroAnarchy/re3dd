@@ -24,6 +24,7 @@ constexpr unsigned kPools=4,kSplatMaterial=4,kConeMaterial=5,kPuffMaterial=6,kDr
 constexpr std::size_t kMaxSplats=160,kMaxDrops=220,kMaxBursts=40,kMaxPools=24;
 static bool enabled=true;            // pilot.ini blood_fx
 static unsigned debugSlow=1;         // pilot.ini blood_debug_slow (QA captures): sprays and droplets N times slower
+static float poolBrightness=1.f;      // fix 2026-11-11: pilot.ini blood_pool_brightness 40..160 % / F5 menu (red pools and floor stains)
 static int debugPoolBucket=-1;       // pilot.ini blood_debug_pool_bucket (QA): pools in this one OT bucket
 static const std::uint8_t debugShadowKey[4]{};
 static bool shadowHooked=false;
@@ -107,6 +108,8 @@ static ShadowUpdate originalShadow=nullptr;
 inline void __cdecl shadowHook(void* shadow,int y,int angle,int flags){
     originalShadow(shadow,y,angle,flags);
     std::lock_guard<std::recursive_mutex> guard(mutex);
+    // lighting round 2026-11-10: the black blob of an actor with an HD shadow is not drawn (model_integration.h)
+    try{if(active()&&accessible(shadow,0x20,true)){auto* s=static_cast<std::uint8_t*>(shadow);if(lightPlainShadow(read<std::uint32_t>(s,0x1c)))lightOnNativeShadow(s,actorOfShadow(s));}}catch(...){}
     if(!enabled||!active())return;
     try{poolFromShadow(static_cast<std::uint8_t*>(shadow));}catch(...){once("blood-pool-exception","pool bookkeeping failed; native shadow kept");}
     try{nemesis_cloud::onShadow(shadow);}catch(...){}   // fx 2026-11-08 nemesis-cloud: the downed Nemesis' purple stain
@@ -174,10 +177,11 @@ inline bool pendingHdHit(const Vec3& at,float radius){
         const float dx=float(read<std::int32_t>(h.actor,0x34))-at.x,dz=float(read<std::int32_t>(h.actor,0x3c))-at.z;if(dx*dx+dz*dz<radius*radius)return true;}
     return false;
 }
-// the actor (enemies, then the player) nearest to a point on the floor plane
+// the actor (enemies, then the player) nearest to a point on the floor plane; fix 2026-11-11: not Nemesis' tentacles
+// (actors of their own in the air - the stains of a tentacle blow took their y for the floor, see actorFloorY)
 inline const std::uint8_t* nearestActor(const Vec3& at){
     const std::uint8_t* best=nullptr;float bestDistance=3000.f*3000.f;
-    auto visit=[&](const std::uint8_t* actor){if(!accessible(actor,0x40))return;const float dx=float(read<std::int32_t>(actor,0x34))-at.x,dz=float(read<std::int32_t>(actor,0x3c))-at.z;
+    auto visit=[&](const std::uint8_t* actor){if(!accessible(actor,0x4c)||sfxhits::appendageTarget(read<std::uint8_t>(actor,0x4a)))return;const float dx=float(read<std::int32_t>(actor,0x34))-at.x,dz=float(read<std::int32_t>(actor,0x3c))-at.z;
         if(dx*dx+dz*dz<bestDistance){bestDistance=dx*dx+dz*dz;best=actor;}};
     const auto end=read<std::uintptr_t>(reinterpret_cast<void*>(gameBase+0x65ce6c));
     for(std::uintptr_t a=gameBase+0x65cdcc;a<end&&a<gameBase+0x65cdcc+48*4;a+=4)visit(read<const std::uint8_t*>(reinterpret_cast<void*>(a)));
@@ -198,7 +202,7 @@ inline void replaceNativeSpray(const Vec3& at){
     Vec3 dir{at.x-shooter.x,0,at.z-shooter.z};if(re3model::Dot(dir,dir)<1.f)dir={0,0,1};dir=re3model::Normalize(dir);
     const auto* actor=nearestActor(at);
     re3wound::ShotBlood s;s.actor=nullptr;s.entry=at;s.direction=dir;s.normal=dir*-1.f;s.hasExit=false;s.weapon=0;s.colour=0xffb4aca4u;
-    s.floorY=actor?float(read<std::int32_t>(actor,0x38)):shooter.y;
+    s.floorY=actorFloorY(actor?actor:player);   // fix 2026-11-11: the floor under it, not its own y
     if(actor){const auto found=actorRuntime.find(const_cast<std::uint8_t*>(actor));if(found!=actorRuntime.end())s.colour=found->second.bloodLightView;}
     re3wound::shotBlood.push_back(s);++nativeReplaced;   // turned into the spray by spawnFromShots of this same update
     if(nativeReplaced<=8)log("BLOOD_NATIVE_REPLACED at=%.0f,%.0f,%.0f actor=%p floor=%.0f (native hit blood with no HD wound near it)",at.x,at.y,at.z,actor,s.floorY);
@@ -283,7 +287,7 @@ inline std::uint32_t lifted(std::uint32_t argb,unsigned low){std::uint32_t out=a
 inline std::uint32_t scaled(std::uint32_t argb,float k){std::uint32_t out=argb&0xff000000u;for(unsigned s=0;s<24;s+=8)out|=std::uint32_t((std::min)(255.f,float((argb>>s)&255u)*k+.5f))<<s;return out;}
 // pools and floor splats: 0.7 of the native light on the floor, at least 0x5c (07.11 v1: at least 0x90 on a lifted red
 // texture read as bright cherry red — "too bright", user QA 07.11)
-inline std::uint32_t poolTint(std::uint32_t argb){return lifted(scaled(argb,0.7f),0x5c);}
+inline std::uint32_t poolTint(std::uint32_t argb){return lifted(scaled(argb,0.7f*poolBrightness),unsigned(92.f*poolBrightness+.5f));}   // fix 2026-11-11: x the user's brightness
 inline std::uint32_t withAlpha(std::uint32_t argb,float alpha){return (argb&0xffffffu)|(std::uint32_t((std::min)(1.f,(std::max)(0.f,alpha))*255.f+.5f)<<24);}
 inline void gridCell(unsigned index,unsigned cols,unsigned rows,float out[4]){const unsigned c=index%cols,r=index/cols;
     // half a texel of the 2048/1024 sheets in so neighbours never bleed under bilinear filtering
@@ -327,7 +331,11 @@ inline void drawBlood(){
         const float c=std::cos(sp.angle),s=std::sin(sp.angle),half=sp.size*0.5f;const Vec3 ax{c,0,s},az{-s,0,c};
         Vec3 corner[4];float uv[8];const float tx[4]={0,1,1,0},ty[4]={0,0,1,1};
         for(unsigned k=0;k<4;++k){corner[k]=sp.pos+ax*((tx[k]-0.5f)*2*half)+az*((ty[k]-0.5f)*2*half);uv[k*2]=cell[0]+(cell[2]-cell[0])*tx[k];uv[k*2+1]=cell[1]+(cell[3]-cell[1])*ty[k];}
-        quad(item,corner,uv,withAlpha(poolTint(sp.colour),0.97f));{const auto cz=re3model::TransformPoint(cam,sp.pos);item.bucket=int((std::max)(1.f,cz.z+60.f))>>5;}items.push_back(std::move(item));
+        quad(item,corner,uv,withAlpha(poolTint(sp.colour),0.97f));
+        // fix 2026-11-11: sorted by its far edge (was the centre + 60): whatever stands on the far half is drawn after it
+        {const auto cz=re3model::TransformPoint(cam,sp.pos);const float reach=half*(std::fabs(cam.m[8]*ax.x+cam.m[10]*ax.z)+std::fabs(cam.m[8]*az.x+cam.m[10]*az.z));
+            item.bucket=int((std::max)(1.f,cz.z+(std::max)(60.f,reach+40.f)))>>5;}
+        items.push_back(std::move(item));
     }
     for(const auto& b:bursts){
         Item item;item.material=b.material;item.anchor=b.pos;const unsigned cellIndex=(tick-b.born)/debugSlow;float cell[4];gridCell(cellIndex,4,4,cell);

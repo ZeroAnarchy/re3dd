@@ -1,16 +1,16 @@
 # Resident Evil 3DD Mod: source of d3d9.dll
 
 This repository holds the source code of `files\d3d9.dll`, the only compiled file in
-[Resident Evil 3DD Mod](https://www.nexusmods.com/residentevil3nemesis/mods/136) 1.21 and its Lite
+[Resident Evil 3DD Mod](https://www.nexusmods.com/residentevil3nemesis/mods/136) 1.50 and its Lite
 edition (the same file), a fan remaster of the GOG and Steam releases of Resident Evil 3 (1999).
 
 Everything else in the mod archive is data (PNG images, `.r3mesh` / `.r3face` model files,
 JSON and text tables, one `.vag` sound, WAV hit sounds) or plain-text scripts. The installer scripts and the
 DLL's config file are in `package/`, byte for byte as they are in the archive.
 
-| File in the 1.21 release | Size | SHA-256 |
+| File in the 1.50 release | Size | SHA-256 |
 |---|---|---|
-| `files\d3d9.dll` | 1,571,840 bytes | `0a324cc0b556b73f1118c3bf5b981f97d324b24c5d7cf4fb4b1984eaf28cc824` |
+| `files\d3d9.dll` | 1,942,528 bytes | `7260a1de0675abe425bafd83a3963de37aad33df89284feb69f2f02cdb83c9b9` |
 
 ## What the DLL does
 
@@ -42,12 +42,27 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
   native shadow stain, hit sprays, exit wounds), plays bullet hit sounds through DirectSound
   (`src/sfx_hits.h`, `model-pack\hit-sounds\hits.txt`), draws the game's own fire, muzzle flash
   and Nemesis gas sprites from sharper redrawn texture pages (`src/fx_fire.h`, `src/fx_muzzle.h`,
-  `src/fx_nemesis_cloud.h`), and opens the game's PC settings window with F5
-  (`src/options_menu.h`). Each has its own switch in `pilot.ini` (`blood_fx`, `hit_sounds`,
+  `src/fx_nemesis_cloud.h`), and opened the game's PC settings window with F5
+  (`src/options_menu.h`; since 1.50 that window is a row of the mod's menu). Each has its own switch in `pilot.ini` (`blood_fx`, `hit_sounds`,
   `fire_fx`, `muzzle_fx`, `nemesis_cloud_fx`, `options_key`).
+- Since 1.50 F5 (or Start on a gamepad) opens the mod's own menu (`src/mod_menu.h`, `src/mod_menu_ui.h`,
+  `src/mod_menu_exit.h`): all options of `pilot.ini` with descriptions, rebinding of the game's
+  keyboard and gamepad actions (written to `bio3.ini` as the game's own settings window does,
+  `src/mod_input.h`) and of the mod's keys, the game's PC settings window, exit to the title
+  screen or the desktop. One hook after the game's input poll (`src/mod_hooks.h`) runs the menu,
+  a manual reload (`src/reload.h`) and the optional modern, camera-relative controls
+  (`src/controls_modern.h`). `src/widescreen.h` crops the picture to 16:9 (centred or following
+  the player, with a right-stick look) while keeping text, menus and scenes whole;
+  `src/player_movies.h` plays the player's own movie files from a `3DD-Movies` folder instead of
+  the game's movies; `src/fx_pages.h` gives water, acid and creature blood sprites sharper texture
+  pages; `src/focus_guard.h` keeps the GOG DirectDraw wrapper from rebuilding the display on
+  device-change messages (a hang after focus changes). The experimental lighting (dynamic
+  shadows of the HD models on the floor and on the models, light of muzzle flashes) lives in
+  `src/model_gpu.h`, `src/model_integration.h` and `src/fx_muzzle.h`.
 - It does not use the network, start processes or touch the registry. It writes only inside the
-  game folder: `runtime.log`, `crash-dumps\*.dmp` after a crash, and a `captures\` folder that
-  stays empty unless a QA capture is switched on in `pilot.ini`.
+  game folder: `runtime.log`, `crash-dumps\*.dmp` after a crash, a `captures\` folder that
+  stays empty unless a QA capture is switched on in `pilot.ini`, and `pilot.ini` / `bio3.ini`
+  when settings are changed in its menu.
 
 ## Building
 
@@ -73,7 +88,7 @@ unit; it includes the other headers. `src\d3d9.def` exports `Direct3DCreate9`.
 
 These sources rebuilt with MSVC 19.51.36252 in the folder the release was built in give a
 file that differs from the released `d3d9.dll` only in the link timestamp (in the PE header
-and in the debug directory). Built from a different folder path, the size stays 1,571,840
+and in the debug directory). Built from a different folder path, the size stays 1,942,528
 bytes, but the compiler lays the code out in a different order, so the bytes and the hash
 differ.
 

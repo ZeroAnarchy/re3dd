@@ -43,6 +43,30 @@
 // block) -> model-pack/fx-nemesis-cloud/native-arm-p5.png / -p9.png (models/fx-2026-11-08/nemesis-cloud/make_arm_texture.py:
 // a computed smooth-label vectorisation of the native indices, no generation). pilot.ini nemesis_cloud_arm=0 (default) that,
 // =1 the round-2..4 HD gas on them. The downing gas / stain (round 1) is unchanged. Blood never turns them red (owns()).
+// r6 puddle 2026-11-09 (round 6, user: "in the HD mode we removed the purple puddle under Nemesis' body after his death, bring
+// it back (just generate a crisper variant of the original puddle; the purple smoke stays too, it looks cool)").
+// The original puddle (runs qa/ctl-2026-11-09/harness/runs/*puddle-orig*, F8): the downed Nemesis' SHADOW. His death routine
+// (4AE750 for EM34.., the same code at 4A5010; state actor+5: 0 = life -1, timer +E2 = 120; 1 = every frame the colour words
+// shadow+1C/+44 lose 1 of R and of B down to 0x10 and gain 1 of G up to 0xAF, and while the timer runs the half extents
+// +4/+6 grow by 5) turns the black shadow blob (808080, half extents 800x900) into the purple stain (10AF10, 1400x1500) in
+// 120 frames = 4 s; it stays until the room is left. The shadow is drawn by 457200: one FT4 (code 2E) on the floor, corners
+// centre +- RotY(angle) x (w, 0, h), texture = the common 28x30 texel shadow blob (tpage D9: 8 bit, SUBTRACTIVE B - F; clut
+// 78C0; u 98..126, v 225..255), OT slot (otz + 0x20) >> 3. Measured in the quad's own space (F8 with / without the stain,
+// qa/ctl-2026-11-09/round6/puddle/tools/analyze_delta.py): a round disc that takes green out of whatever was drawn before
+// it - the floor, floor objects of the background, the far parts of his own body - by texel x colour / 0x80: an even
+// texel level of 0.163 out to 0.7 of the half extent, then a soft fall to nothing at 1.0 (dG 57, dR/dB 8 of 255 at 10AF10).
+// Here: the stain stays hidden as in round 1 and, with the gas, the HD puddle is drawn at its place: one quad on the floor
+// with the stain's own centre, angle, half extents and colour word of every frame (so it grows and turns from shadow-dark
+// to purple exactly as the native one), the same subtractive blend (ModelJob options nativeSemiTransparent + abr 2: dst -
+// tint x coverage), coverage from model-pack/fx-nemesis-cloud/puddle.png (material 2; Codex image_gen from the captured
+// original: the same blob with a crisp liquid edge, a little denser in the middle and thinner at the rim), tint = colour
+// word / 0x80 x puddle.txt 'strength' (0.191: the puddle's median coverage 0.85 gives the native level 0.163), quad =
+// native quad x 'scale' (the puddle's edge where the native blob is at half level, 0.85 of the half extent). One OT bucket
+// (centre + 'depth', as the blood pools), R20F window wall rule as the gas; the HD body is never tinted (depth test); it
+// fades in over 'fade_frames' and out when the stain is gone. pilot.ini nemesis_puddle_fx=1 (default; 0 = gas only); it follows
+// nemesis_cloud_fx / F5 "HD Nemesis gas" (off = native stain) and F8 (native). QA (debug_warp): pilot.command
+// nemesis-puddle-on/-off (live), -test (a free enemy shadow entry plays the stain: any floor, HD and F8), -native-hide/-show
+// (F8 without the native stain: difference captures), -gas-off/-on (no stain gas: difference captures).
 namespace nemesis_cloud {
 using re3model::Vec3;
 static bool enabled=true;            // pilot.ini nemesis_cloud_fx
@@ -221,7 +245,9 @@ inline void scanEffects(){
     }
 }
 // ---------------------------------------------------------------- the downed Nemesis' purple stain (his shadow)
-struct Stain{const std::uint8_t* actor=nullptr;std::uint8_t* shadow=nullptr;Vec3 centre{};float size=0;std::uint32_t born=0,grownAt=0,seen=0;bool logged=false;};
+struct Stain{const std::uint8_t* actor=nullptr;std::uint8_t* shadow=nullptr;Vec3 centre{};float size=0;std::uint32_t born=0,grownAt=0,seen=0;bool logged=false;
+    float w=0,h=0,angle=0;std::uint32_t native=0x808080u;bool test=false;std::uint8_t logs=0;};   // r6 puddle: half extents +4/+6, angle +10, colour word +1C of this frame
+static bool puddleGasOff=false;   // r6 puddle QA: pilot.command nemesis-puddle-gas-off / -gas-on
 static std::vector<Stain> stains;
 static std::uint64_t stainsHidden=0;
 inline bool purpleStain(const std::uint8_t* shadow){
@@ -245,6 +271,7 @@ inline void onShadow(void* shadowPointer){
     if(shadow[0xe]&4){shadow[0xe]=std::uint8_t(shadow[0xe]&~4u);++stainsHidden;}
     if(!known){if(stains.size()>=4)stains.erase(stains.begin());stains.push_back({});known=&stains.back();known->actor=actor;known->shadow=shadow;known->born=tick;known->grownAt=tick;}
     known->centre={float(read<std::int16_t>(shadow,8)),float(read<std::int16_t>(shadow,0xa)),float(read<std::int16_t>(shadow,0xc))};
+    known->w=float(read<std::int16_t>(shadow,4));known->h=float(read<std::int16_t>(shadow,6));known->angle=float(read<std::int16_t>(shadow,0x10))*6.2831853f/4096.f;known->native=read<std::uint32_t>(shadow,0x1c)&0xffffffu;   // r6 puddle
     const float size=float((std::max)(read<std::int16_t>(shadow,4),read<std::int16_t>(shadow,6)));
     if(size>known->size+0.5f){known->size=size;known->grownAt=tick;}
     known->seen=tick;
@@ -257,7 +284,7 @@ inline void stainGas(){
         const std::uint32_t light=lightOf(it->actor);
         // while it spreads: ~10 puffs a second seeping out of the body; then a thin haze, rarer over half a minute
         const float rate=growing?0.34f:(std::max)(0.05f,0.14f-0.09f*float(tick-it->grownAt)/900.f);
-        if(rnd()<rate){
+        if(rnd()<rate&&!puddleGasOff){   // r6 puddle QA: gas-off
             const float a=rnd()*6.2831853f,r=radius*std::sqrt(rnd())*(growing?(std::min)(1.f,0.35f+float(age)/60.f):1.f);
             const Vec3 at{it->centre.x+std::cos(a)*r,it->centre.y-rnd(60.f,240.f),it->centre.z+std::sin(a)*r};
             emit(growing?Seep:Haze,at,it->centre,light,0,0);
@@ -383,6 +410,183 @@ inline void draw(){
     }
 }
 
+// ---------------------------------------------------------------- r6 puddle: the HD purple puddle at the downed Nemesis' stain
+constexpr unsigned kPuddleMaterial=2;   // model-pack/fx-nemesis-cloud materials: 0 cloud, 1 arm, 2 puddle (puddle.png + puddle-stp.png)
+// puddle.txt: strength = the native blob's texel level (0..1) that alpha 1 of puddle.png stands for; scale = quad half extents
+// / native half extents; fade_frames = fade-in after the stain is first seen; depth = OT bucket of the centre + this (camera
+// z units, farther); lift = above the stain's height (world Y is down); grid = quads per side
+struct PuddleConfig{float strength=0.191f,scale=0.97f,lift=3.f,depth=120.f;unsigned fade=8,grid=6;bool loaded=false;};
+static PuddleConfig puddleConfig;
+static bool puddlePack=false,puddleNativeHide=false;
+static int puddleLive=-1;   // QA pilot.command nemesis-puddle-on / -off: overrides pilot.ini for this session
+static std::uint64_t puddleDrawn=0;static double puddlePerfSum=0,puddlePerfMax=0;static unsigned puddlePerfFrames=0;
+struct PuddleTest{bool on=false;std::uint8_t* shadow=nullptr;std::uint8_t saved[0x68]{};std::int16_t at[3]{},angle=0;std::uint32_t start=0;};
+static PuddleTest puddleTest;
+inline bool puddleOn(){
+    static int value=-1;
+    if(value<0){value=GetPrivateProfileIntA("pilot","nemesis_puddle_fx",1,(root+"\\pilot.ini").c_str())!=0?1:0;
+        log(value?"NEMESIS_PUDDLE on (pilot.ini nemesis_puddle_fx=1): HD purple puddle at the downed Nemesis' stain, with the gas; follows nemesis_cloud_fx and F8":
+            "NEMESIS_PUDDLE off (pilot.ini nemesis_puddle_fx=0): the stain hidden, gas only");}
+    return puddleLive>=0?puddleLive!=0:value!=0;
+}
+inline void loadPuddleConfig(){
+    if(puddleConfig.loaded)return;puddleConfig.loaded=true;
+    std::ifstream file(root+"/model-pack/fx-nemesis-cloud/puddle.txt");std::string line;
+    while(std::getline(file,line)){std::istringstream in(line);std::string key;if(!(in>>key)||key[0]=='#')continue;
+        if(key=="strength")in>>puddleConfig.strength;else if(key=="scale")in>>puddleConfig.scale;else if(key=="lift")in>>puddleConfig.lift;
+        else if(key=="depth")in>>puddleConfig.depth;else if(key=="fade_frames")in>>puddleConfig.fade;else if(key=="grid")in>>puddleConfig.grid;}
+    puddleConfig.strength=(std::max)(0.05f,(std::min)(1.f,puddleConfig.strength));puddleConfig.scale=(std::max)(0.25f,(std::min)(2.f,puddleConfig.scale));
+    puddleConfig.fade=(std::max)(1u,(std::min)(120u,puddleConfig.fade));puddleConfig.grid=(std::max)(1u,(std::min)(12u,puddleConfig.grid));
+    puddleConfig.depth=(std::max)(-2000.f,(std::min)(2000.f,puddleConfig.depth));
+    log("NEMESIS_PUDDLE_CONFIG strength=%.3f scale=%.3f lift=%.1f depth=%.0f fade_frames=%u grid=%u",puddleConfig.strength,puddleConfig.scale,puddleConfig.lift,puddleConfig.depth,puddleConfig.fade,puddleConfig.grid);
+}
+// what the stain subtracts where puddle.png is fully covered: texel x colour / 0x80 (PSX texture modulation), per channel
+inline std::uint32_t puddleTint(std::uint32_t native){
+    std::uint32_t out=0;
+    for(unsigned k=0;k<3;++k){const float c=float((native>>(k*8))&255u)/128.f*puddleConfig.strength;   // native word: R low byte, then G, B
+        out|=std::uint32_t((std::min)(255.f,c*255.f+.5f))<<(16-k*8);}                                  // D3DCOLOR: R << 16, G << 8, B
+    return out;
+}
+inline void drawPuddles(){
+    if(stains.empty()||!puddlePack||!puddleOn())return;
+    auto asset=pack();if(!asset||asset->textures.size()<=kPuddleMaterial||asset->mesh.materials.size()<=kPuddleMaterial||!modelRenderer.resetDevice(gameDevice))return;
+    loadPuddleConfig();
+    const auto gte=read<const void*>(reinterpret_cast<void*>(gameBase+0x1349c8));if(!accessible(gte,0x100))return;
+    re3bridge::ActorContext context;context.camera=read<re3bridge::Matrix32>(reinterpret_cast<void*>(gameBase+0x11c398));
+    std::memcpy(context.gte.data(),gte,context.gte.size());
+    auto base=actorProjection(context);
+    if(!re3model::SetNativeProjectionRegisters(base,context.gte.data(),context.gte.size()))return;
+    base.shade=nullptr;base.shadeContext=nullptr;
+    const auto& cam=base.camera;
+    const WallSplitRule* wall=nullptr;   // R20F window walls, as the gas
+    if(wallSplitOn()){const std::uint16_t stage=read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa6)),rm=read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa8)),camera=read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661faa));
+        for(const auto& r:kWallSplit)if(r.stage==stage&&r.room==rm&&r.camera==camera)wall=&r;}
+    re3model::Mesh materials;materials.materials.push_back(asset->mesh.materials[kPuddleMaterial]);materials.materials[0].flags=re3model::AlphaBlend|re3model::TwoSided;
+    const std::vector<re3model::MaterialTextures> puddleTextures{asset->textures[kPuddleMaterial]};
+    const auto chooseTable=reinterpret_cast<ChooseTable>(gameBase+0x5adc0);
+    for(auto& st:stains){
+        if(st.w<8.f||st.h<8.f)continue;
+        // nothing in the frame it is first seen (born = the tick before this update's: age 1), then a short fade-in from 0
+        // and out over a second once the stain is no longer reported (he gets up again, the shadow turns back): no pop
+        const std::uint32_t age=tick-st.born,gone=tick-st.seen;
+        const float fade=(age<2?0.f:(std::min)(1.f,float(age-1)/float(puddleConfig.fade)))*(gone<3?1.f:(std::max)(0.f,1.f-float(gone-2)/30.f));if(fade<0.01f)continue;
+        const auto centre=re3model::TransformPoint(cam,st.centre);if(centre.z<256.f||centre.z>32767.f)continue;
+        const std::uint32_t argb=blood::withAlpha(puddleTint(st.native),fade);
+        // the native quad: centre + RotY(angle) x (+-w, 0, +-h)
+        const float c=std::cos(st.angle),s=std::sin(st.angle),hw=st.w*puddleConfig.scale,hh=st.h*puddleConfig.scale;
+        const Vec3 ax{c,0,-s},az{s,0,c},origin{st.centre.x,st.centre.y-puddleConfig.lift,st.centre.z};
+        blood::Item item;item.anchor=st.centre;const unsigned n=puddleConfig.grid;
+        for(unsigned j=0;j<n;++j)for(unsigned i=0;i<n;++i){Vec3 corner[4];float uv[8];const unsigned ci[4]={i,i+1,i+1,i},cj[4]={j,j,j+1,j+1};
+            for(unsigned k=0;k<4;++k){const float u=float(ci[k])/float(n),v=float(cj[k])/float(n);corner[k]=origin+ax*((u-0.5f)*2*hw)+az*((v-0.5f)*2*hh);uv[k*2]=u;uv[k*2+1]=v;}
+            blood::quad(item,corner,uv,argb);}
+        int bucket=int((std::max)(1.f,centre.z+puddleConfig.depth))>>5;
+        if(wall){const float side=wall->normal[0]*st.centre.x+wall->normal[1]*st.centre.y+wall->normal[2]*st.centre.z+wall->offset+float(wallSplitShift());
+            bucket=side>=0?(std::min)(bucket,int(wall->frontMax)):int(wall->beyond);}
+        std::uint16_t fixed=std::uint16_t((std::min)(1023,(std::max)(1,bucket)));
+        const std::int32_t position[3]={std::int32_t(st.centre.x),std::int32_t(st.centre.y),std::int32_t(st.centre.z)};
+        auto* table=chooseTable(position);if(!table||!accessible(table,1024*4,true))continue;
+        re3model::Mesh mesh;mesh.vertices.resize(item.vertices.size());mesh.indices=item.indices;
+        re3model::Material m=materials.materials[0];m.firstIndex=0;m.indexCount=std::uint32_t(item.indices.size());mesh.materials.push_back(m);
+        auto projection=base;projection.vertexTint=&item.tint;projection.depth=blood::fixedBucket;projection.depthContext=&fixed;
+        re3model::FrameGeometry geometry;std::string error;
+        if(!re3model::PrepareFrame(mesh,item.vertices,projection,geometry,&error)||geometry.vertices.empty())continue;
+        HRESULT hr;auto gpu=modelRenderer.upload(materials,std::move(geometry),puddleTextures,true,&hr);if(!gpu){once("nemesis-puddle-upload","HD Nemesis puddle upload failed this frame");continue;}
+        std::vector<re3bridge::BucketJob> jobs;jobs.reserve(gpu->slices.size());
+        for(std::size_t k=0;k<gpu->slices.size();++k){auto job=std::make_shared<ModelJob>();job->geometry=gpu;job->slice=k;job->name="fx-nemesis-puddle";
+            job->options.nativeSemiTransparent=true;job->options.abr=2;   // the native stain's blend: B - F (tpage D9)
+            jobs.push_back({gpu->slices[k].bucket,reinterpret_cast<std::uintptr_t>(job.get()),job});}
+        if(!re3bridge::EnqueueBatch(table,1024,jobs)){once("nemesis-puddle-enqueue","HD Nemesis puddle skipped for one ordering table");continue;}
+        ++puddleDrawn;
+        // twice per stain: first frame drawn and once grown (corners in the game's 320x240 screen space, for the QA sheets)
+        const bool grown=tick-st.grownAt>=12;
+        static unsigned drawLines=0;   // at most 16 lines a session
+        if((st.logs==0||(st.logs==1&&grown))&&drawLines<16){++drawLines;++st.logs;if(grown)st.logs=2;
+            float sx[4],sy[4];const float tx[4]={-1,1,1,-1},tz[4]={-1,-1,1,1};
+            for(unsigned k=0;k<4;++k){const auto p=re3model::TransformPoint(cam,origin+ax*(tx[k]*hw)+az*(tz[k]*hh));const float z=(std::max)(1.f,p.z);sx[k]=p.x*base.h/z+base.offsetX;sy[k]=p.y*base.h/z+base.offsetY;}
+            log("NEMESIS_PUDDLE_DRAW shadow=%p%s age=%u at=%.0f,%.0f,%.0f half=%.0fx%.0f angle=%.3f native=%06x tint=%06x alpha=%.2f bucket=%u camera_z=%.0f screen=%.1f,%.1f centre corners=%.1f,%.1f %.1f,%.1f %.1f,%.1f %.1f,%.1f (320x240)",
+                st.shadow,st.test?" TEST":"",age,st.centre.x,st.centre.y,st.centre.z,hw,hh,st.angle,st.native,argb&0xffffffu,fade,unsigned(fixed),centre.z,
+                centre.x*base.h/centre.z+base.offsetX,centre.y*base.h/centre.z+base.offsetY,sx[0],sy[0],sx[1],sy[1],sx[2],sy[2],sx[3],sy[3]);}
+    }
+}
+// QA: pilot.command nemesis-puddle-test - a free entry of the 50 enemy shadows (A5D0F8, 0x68 bytes each, drawn by 457200) plays
+// the downed Nemesis' stain in front of the player: what 4AE79F writes into his shadow every frame (colour 808080 ->
+// 10AF10, half extents 800x900 -> 1400x1500 in 120 frames), with the shadow blob's own packet fields (code 2E, uv
+// 98..126 x 225..255, clut 78C0, tpage D9). F8: the game itself draws it (the original stain on this floor); HD: hidden
+// like his, gas and puddle over it. 40 s, or until the command comes again / the room changes; the entry is put back.
+// (Never the player's own shadow: the five player-type shadows at A5D06C are 0x1C bytes with a pointer to their packets.)
+inline bool puddleSlotUsed(const std::uint8_t* slot){
+    const auto end=read<std::uintptr_t>(reinterpret_cast<void*>(gameBase+0x65ce6c));
+    for(std::uintptr_t a=gameBase+0x65cdcc;a<end&&a<gameBase+0x65cdcc+48*4;a+=4){const auto* actor=read<const std::uint8_t*>(reinterpret_cast<void*>(a));
+        if(accessible(actor,0x164)&&read<const std::uint8_t*>(actor,0x160)==slot)return true;}
+    return false;
+}
+inline void puddleTestEnd(const char* why,bool restore=true){
+    if(!puddleTest.on)return;puddleTest.on=false;auto* s=puddleTest.shadow;
+    if(restore&&accessible(s,0x68,true)&&!puddleSlotUsed(s))std::memcpy(s,puddleTest.saved,0x68);   // not when an actor of a new room has it
+    stains.erase(std::remove_if(stains.begin(),stains.end(),[](const Stain& st){return st.test;}),stains.end());
+    log("NEMESIS_PUDDLE_TEST end (%s): shadow entry %p %s",why,s,restore?"put back":"left to the game");
+}
+inline void puddleTestStart(){
+    const auto* player=reinterpret_cast<const std::uint8_t*>(gameBase+0x65cbf4);
+    auto* base=reinterpret_cast<std::uint8_t*>(gameBase+0x65d0f8);
+    if(!accessible(player,0x164)||!accessible(base,50*0x68,true)){log("NEMESIS_PUDDLE_TEST refused (player or shadow array not readable)");return;}
+    std::uint8_t* slot=nullptr;
+    for(int k=49;k>=0&&!slot;--k){auto* s=base+k*0x68;if(!s[0xe]&&!puddleSlotUsed(s))slot=s;}
+    if(!slot){log("NEMESIS_PUDDLE_TEST refused (no free enemy shadow entry)");return;}
+    static int ahead=-1;if(ahead<0)ahead=(std::max)(0,(std::min)(4000,int(GetPrivateProfileIntA("pilot","nemesis_puddle_debug_ahead",1300,(root+"\\pilot.ini").c_str()))));
+    const float yaw=float(read<std::int16_t>(player,0x6e))*6.2831853f/4096.f;
+    const float x=float(read<std::int32_t>(player,0x34))+std::sin(yaw)*float(ahead),z=float(read<std::int32_t>(player,0x3c))+std::cos(yaw)*float(ahead);
+    puddleTest.on=true;puddleTest.shadow=slot;std::memcpy(puddleTest.saved,slot,0x68);puddleTest.start=tick;
+    puddleTest.at[0]=std::int16_t((std::max)(-32000.f,(std::min)(32000.f,x)));puddleTest.at[1]=std::int16_t(read<std::int32_t>(player,0x38));puddleTest.at[2]=std::int16_t((std::max)(-32000.f,(std::min)(32000.f,z)));
+    puddleTest.angle=read<std::int16_t>(player,0x6e);
+    log("NEMESIS_PUDDLE_TEST start: enemy shadow entry %u (%p) plays the downed Nemesis' stain at %d,%d,%d (%d ahead of the player), 800x900 -> 1400x1500, 808080 -> 10AF10 in 120 frames, 40 s",
+        unsigned((slot-base)/0x68),slot,int(puddleTest.at[0]),int(puddleTest.at[1]),int(puddleTest.at[2]),ahead);
+}
+inline void puddleTestStep(){
+    if(!puddleTest.on)return;
+    const auto* player=reinterpret_cast<const std::uint8_t*>(gameBase+0x65cbf4);
+    auto* shadow=puddleTest.shadow;
+    const std::uint32_t n=tick-puddleTest.start;
+    if(!accessible(shadow,0x68,true)||!accessible(player,0x164)){puddleTestEnd("memory gone",false);return;}
+    if(puddleSlotUsed(shadow)){puddleTestEnd("the game took the entry",false);return;}
+    if(!enabled||n>1200){puddleTestEnd(n>1200?"40 s":"nemesis_cloud_fx off");return;}
+    const unsigned rb=0x80u-(std::min)(n,0x70u),g=0x80u+(std::min)(n,0x2fu);const std::uint32_t colour=rb|(g<<8)|(rb<<16);
+    const std::int16_t size[2]={std::int16_t(800+5*int((std::min)(n,120u))),std::int16_t(900+5*int((std::min)(n,120u)))};
+    const bool hd=active()&&packOk;
+    // the entry as 457130 leaves an enemy's: offset 0, half extents, world position, flags (1 = in use, 4 = draw), angle,
+    // position pointer (for the OT choice 45ADC0), two FT4 packets (double buffer)
+    const std::int16_t head[7]={0,0,size[0],size[1],puddleTest.at[0],puddleTest.at[1],puddleTest.at[2]};std::memcpy(shadow,head,14);
+    shadow[0xe]=std::uint8_t((hd||puddleNativeHide)?1u:5u);shadow[0xf]=0;
+    std::memcpy(shadow+0x10,&puddleTest.angle,2);shadow[0x12]=shadow[0x13]=0;
+    const std::uint32_t position=std::uint32_t(reinterpret_cast<std::uintptr_t>(player+0x34));std::memcpy(shadow+0x14,&position,4);
+    for(unsigned k=0;k<2;++k){auto* q=shadow+0x18+k*0x28;const std::uint32_t words[4]={0x78c0e162u,0x00d9e17eu,0x0000ff62u,0x0000ff7eu},code=0x2e000000u|colour;
+        std::memcpy(q+4,&code,4);for(unsigned c=0;c<4;++c)std::memcpy(q+0xc+c*8,&words[c],4);}
+    if(!hd)return;   // F8: the game draws the entry (the original stain)
+    Stain* known=nullptr;for(auto& st:stains)if(st.shadow==shadow){known=&st;break;}
+    if(!known){if(stains.size()>=4)stains.erase(stains.begin());stains.push_back({});known=&stains.back();known->actor=player;known->shadow=shadow;known->born=tick;known->grownAt=tick;known->test=true;known->logged=true;}
+    known->centre={float(puddleTest.at[0]),float(puddleTest.at[1]),float(puddleTest.at[2])};
+    known->w=float(size[0]);known->h=float(size[1]);known->angle=float(puddleTest.angle)*6.2831853f/4096.f;known->native=colour;
+    const float larger=float((std::max)(size[0],size[1]));if(larger>known->size+0.5f){known->size=larger;known->grownAt=tick;}
+    known->seen=tick;
+}
+// QA: pilot.ini nemesis_puddle_debug_fps60=1 (debug_warp): the capture-fps60 sequence (real, in-between, real frame) on the
+// first update with a new stain (age 1: nothing drawn yet) and 4 and 24 ticks later (files captures\frame-fps60-*.tga, moved by the QA driver)
+inline void puddleFps60Captures(){
+    static int on=-1;
+    if(on<0){const std::string ini=root+"\\pilot.ini";on=GetPrivateProfileIntA("pilot","debug_warp",0,ini.c_str())&&GetPrivateProfileIntA("pilot","nemesis_puddle_debug_fps60",0,ini.c_str())?1:0;}
+    if(!on)return;
+    for(const auto& st:stains){const std::uint32_t age=tick-st.born;
+        if(age==1||age==5||age==25){::fps60CaptureSequence=3;log("NEMESIS_PUDDLE_FPS60 capture-fps60 (real / in-between / real) at stain age %u, half %.0fx%.0f native %06x",age,st.w,st.h,st.native);}}
+}
+inline void puddleRequests(){
+    const LONG request=InterlockedExchange(&::nemesisPuddleRequest,0);if(!request)return;
+    if(request==1)puddleLive=1;else if(request==2)puddleLive=0;
+    else if(request==4)puddleNativeHide=true;else if(request==5)puddleNativeHide=false;
+    else if(request==6){puddleGasOff=true;puffs.clear();}else if(request==7)puddleGasOff=false;
+    else if(request==3){if(puddleTest.on)puddleTestEnd("command");else puddleTestStart();}
+    log("NEMESIS_PUDDLE_QA request=%ld puddle=%d native_hide=%d gas_off=%d test=%d",long(request),int(puddleOn()),int(puddleNativeHide),int(puddleGasOff),int(puddleTest.on));
+}
+
 // ---------------------------------------------------------------- QA: pilot.command nemesis-cloud-test (debug_warp)
 // a downing-like emission in front of the player for 4.3 s (the native downing's length), any room
 static std::uint32_t testUntil=0;static Vec3 testAt{};
@@ -486,11 +690,13 @@ inline void diagnose(){
 inline void update(){
     const std::uint32_t now=(std::uint32_t(read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa6)))<<16)|read<std::uint16_t>(reinterpret_cast<void*>(gameBase+0x661fa8));
     if(now!=room){
-        if(room!=~0u&&(spawned||nativeSeen||armSeen))log("NEMESIS_CLOUD_CLEAR room=%x native=%llu puffs=%llu hidden_packets=%llu stain_frames_hidden=%llu arm_native=%llu arm_puffs=%llu",now,(unsigned long long)nativeSeen,(unsigned long long)spawned,(unsigned long long)hidden,(unsigned long long)stainsHidden,(unsigned long long)armSeen,(unsigned long long)armSpawned);
+        if(room!=~0u&&(spawned||nativeSeen||armSeen))log("NEMESIS_CLOUD_CLEAR room=%x native=%llu puffs=%llu hidden_packets=%llu stain_frames_hidden=%llu arm_native=%llu arm_puffs=%llu puddle_frames=%llu",now,(unsigned long long)nativeSeen,(unsigned long long)spawned,(unsigned long long)hidden,(unsigned long long)stainsHidden,(unsigned long long)armSeen,(unsigned long long)armSpawned,(unsigned long long)puddleDrawn);
+        puddleTestEnd("room change");   // r6 puddle QA
         room=now;puffs.clear();seen.clear();stains.clear();textureCount=0;testUntil=0;
     }
     ++tick;
     try{diagnose();}catch(...){once("nemesis-cloud-diagnose","QA diagnostics skipped");}
+    try{puddleRequests();puddleTestStep();}catch(...){once("nemesis-puddle-qa","puddle QA step skipped");}   // r6 puddle QA (pilot.command nemesis-puddle-*)
     if(!enabled)return;
     nemesisHere=false;nemesisDown=false;std::uint8_t* downed[4]{};unsigned downedCount=0;
     {const auto end=read<std::uintptr_t>(reinterpret_cast<void*>(gameBase+0x65ce6c));
@@ -500,17 +706,28 @@ inline void update(){
             if(read<std::int16_t>(actor,0xcc)<=0){nemesisDown=true;if(downedCount<4)downed[downedCount++]=read<std::uint8_t*>(actor,0x160);}}}
     // F8 (original): the purple stain is drawn again (a downed body's shadow may no longer be updated by 457130: flag 4
     // would stay off)
-    if(!active()){puffs.clear();for(const auto& st:stains)if(accessible(st.shadow,0x68,true)&&purpleStain(st.shadow))st.shadow[0xe]=std::uint8_t(st.shadow[0xe]|4u);stains.clear();return;}
-    {const auto asset=pack();packOk=bool(asset);armPack=packOk&&asset->mesh.materials.size()>=2&&asset->textures.size()>=2;}if(!packOk)return;
+    if(!active()){puffs.clear();for(const auto& st:stains)if(!st.test&&accessible(st.shadow,0x68,true)&&purpleStain(st.shadow))st.shadow[0xe]=std::uint8_t(st.shadow[0xe]|4u);stains.clear();
+        if(puddleNativeHide)for(unsigned k=0;k<downedCount;++k)if(accessible(downed[k],0x68,true)&&purpleStain(downed[k]))downed[k][0xe]=std::uint8_t(downed[k][0xe]&~4u);   // r6 puddle QA: F8 without the stain
+        return;}
+    {const auto asset=pack();packOk=bool(asset);armPack=packOk&&asset->mesh.materials.size()>=2&&asset->textures.size()>=2;
+        // r6 puddle: material 2 with its stp map (the subtractive pass needs one)
+        puddlePack=packOk&&asset->mesh.materials.size()>kPuddleMaterial&&asset->textures.size()>kPuddleMaterial&&asset->textures[kPuddleMaterial].albedo&&asset->textures[kPuddleMaterial].stp;
+        if(packOk&&!puddlePack&&puddleOn())once("nemesis-puddle-pack","HD Nemesis puddle unavailable (model-pack/fx-nemesis-cloud material 2: puddle.png + puddle-stp.png): gas only");}
+    if(!packOk)return;
     armActive=false;   // fx2: set by scanEffects while a sprite of the living Nemesis lives (the copy filter hides its texture then)
     test();
     if(nemesisHere)scanEffects();
     for(unsigned k=0;k<downedCount;++k)if(downed[k])onShadow(downed[k]);
+    puddleFps60Captures();   // r6 puddle QA
     stainGas();
     step();
     if(!puffs.empty()){LARGE_INTEGER f,a,b;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&a);draw();QueryPerformanceCounter(&b);
         const double ms=double(b.QuadPart-a.QuadPart)*1000.0/double(f.QuadPart);perfSum+=ms;perfMax=(std::max)(perfMax,ms);++perfFrames;perfQuads+=unsigned(puffs.size());
         if(perfFrames==150){log("NEMESIS_CLOUD_PERF frames=150 draw_avg_ms=%.3f draw_max_ms=%.3f puffs_avg=%.1f",perfSum/150.0,perfMax,double(perfQuads)/150.0);perfSum=perfMax=0;perfFrames=perfQuads=0;}}
+    // r6 puddle: after the gas (the OT prepends: in one bucket the puddle is then drawn before the gas put there)
+    if(!stains.empty()&&puddlePack&&puddleOn()){LARGE_INTEGER f,a,b;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&a);const std::uint64_t before=puddleDrawn;drawPuddles();QueryPerformanceCounter(&b);
+        if(puddleDrawn!=before){const double ms=double(b.QuadPart-a.QuadPart)*1000.0/double(f.QuadPart);puddlePerfSum+=ms;puddlePerfMax=(std::max)(puddlePerfMax,ms);
+            if(++puddlePerfFrames==300){static unsigned lines=0;if(lines<4){++lines;log("NEMESIS_PUDDLE_PERF frames=300 draw_avg_ms=%.3f draw_max_ms=%.3f",puddlePerfSum/300.0,puddlePerfMax);}puddlePerfSum=puddlePerfMax=0;puddlePerfFrames=0;}}}
 }
 inline void install(){
     if(!enabled){log("NEMESIS_CLOUD disabled by pilot.ini nemesis_cloud_fx=0 (Nemesis' palette 2/4 sprites and stain native; blood_fx leaves them alone)");return;}

@@ -136,7 +136,7 @@ static void fps60DrawNotice(){
     if(!texture)texture=fps60TextTexture(fps60Enabled?"60 FPS":"30 FPS");
     if(!texture)return;
     D3DVIEWPORT9 vp{};gameDevice->GetViewport(&vp);
-    const float h=vp.Height*0.07f,w=h*4,x1=vp.X+vp.Width-h*0.4f,x0=x1-w,y0=vp.Y+h*0.3f,y1=y0+h,shadow=(std::max)(2.f,h*0.03f);
+    const float h=vp.Height*0.07f,w=h*4,x1=vp.X+vp.Width-h*0.4f,x0=x1-w,y0=vp.Y+h*0.3f+[&]{float t,b;return re3widescreen::CropWindow(t,b)?t*vp.Height:0.f;}()/* controls round 2026-11-09 widescreen: inside the crop */,y1=y0+h,shadow=(std::max)(2.f,h*0.03f);
     auto quad=[&](float dx,float dy,DWORD color){ScreenVertex v[4]={{x0+dx-.5f,y0+dy-.5f,0,1,color,0,0},{x1+dx-.5f,y0+dy-.5f,0,1,color,1,0},{x0+dx-.5f,y1+dy-.5f,0,1,color,0,1},{x1+dx-.5f,y1+dy-.5f,0,1,color,1,1}};
         drawQuad(texture,0,0,0,0,0,0,0,0,true,nullptr,nullptr,nullptr,nullptr,v);};
     quad(shadow,shadow,0xff000000u);quad(0,0,0xffffffffu);

@@ -466,12 +466,240 @@ static void holdStance(uint8_t* player, uint8_t* parts, bool capture) {
     std::memcpy(pelvis + 0x14, pelvisNow, sizeof(pelvisNow));
     std::memcpy(player + 0x34, &stanceX, 4); std::memcpy(player + 0x3c, &stanceZ, 4); std::memcpy(player + 0x1a4, stanceChannel, sizeof(stanceChannel));
 }
+// Kneeling shots after the roll dodge (controls round 2026-11-09, Nexus report on 1.20: "with the roll dodge the Glock
+// doesn't shoot nearly as fast"). The dodge is player routine 1 sub-routine 7 (52A278[7] = 460FF0); its roll variants
+// (clips 13/14 of the PLD set, +C7 & 0x20) end in firearm state 8 = kneel (52A508[8] = 464F50) when 52A450[weapon] & 0x80
+// (handguns 02 03 0D 11 12), the others in state 6 (blend into the aim, then state 1 as usual). Kneel: entry clip 0D,
+// then the 1-frame kneel aim 0F with a budget of 15 shots at player+E3; held fire with a round left -> state 9
+// (465130, budget - 1) = kneeling shot: PLW clip 0E (13 frames, player+F0/F4 bank via 437040 -> 437110, blend counter 0),
+// the shot function 52A3AC[weapon] (465E30, a round at frame +C9 == 0) every tick, at the clip end state 8 sub-state 2
+// again (0x208 at 465182). The Glock restart only knew the standing shot state 2, so in the kneel it fired the native
+// way: one round per 13 + 1 ticks (~2/s) instead of one per autoFrames. Clip 0E frame 0 = the kneel aim 0F exactly;
+// frame 1 turns the hands 24/47 degrees, lifts the root 16 units and carries root speed (-13,0,-4) (Carlos PL08W03 the
+// same shape), so a restarted kneel shot gets the same soft recoil and held stance as the standing one. Each restart
+// spends the native budget +E3 like a native kneeling shot (15 rounds, then she stands up via state A and fires on
+// standing; pilot.ini glock_kneel_budget=0: restarts do not spend it, a burst stays kneeling to its end). Code signature
+// checked once (kneelReady); on a mismatch the kneel stays native.
+// Round 2 (09.11, user: "she rolls and quickly fires singles from the knee while fire is held; the Glock should do the
+// same, as effective and without bugs"): native state 8 starts a kneeling shot whenever fire is HELD (464FD0), one per
+// clip (13 + 1 ticks). MANUAL used to swallow a held trigger after its first round (the single-shot latch, also in
+// state 8), so fire held through the roll gave no kneeling shots at all and a held trigger stopped after one. In the
+// kneel the latch is off: a held trigger repeats a single every kneelHoldFrames ticks (pilot.ini glock_kneel_hold_frames,
+// 14 = the native M92F rhythm), taps still fire as fast as autoFrames; AUTO keeps its burst rate.
+static constexpr unsigned kKneelBudget = 0xe3;
+static bool kneelReady = false, kneelBudget = true;
+static unsigned kneelHoldFrames = 5;
+inline bool shotState(uint8_t s) { return s == 2 || (kneelReady && s == 9); }   // standing shot 2, kneeling shot 9
+inline bool aimState(uint8_t s) { return s == 1 || (kneelReady && s == 8); }    // standing aim 1, kneel 8
+static bool codeIs(uint32_t rva, std::initializer_list<uint8_t> bytes) {
+    const auto at = reinterpret_cast<const uint8_t*>(gameBase + rva);
+    return Accessible(at, bytes.size()) && std::equal(bytes.begin(), bytes.end(), at);
+}
+static void checkKneel() {
+    const auto states = reinterpret_cast<const uintptr_t*>(gameBase + 0x12a508);   // 52A508: firearm states by player+6
+    kneelReady = Accessible(states, 11 * 4) && states[2] == gameBase + 0x64860 && states[8] == gameBase + 0x64f50 &&
+        states[9] == gameBase + 0x65130 &&
+        codeIs(0x64feb, {0x66, 0xc7, 0x46, 0x06, 0x09, 0x00, 0xfe, 0xc8, 0x88, 0x86, 0xe3, 0x00, 0x00, 0x00}) &&   // [6]=9, E3-1
+        codeIs(0x65144, {0xc7, 0x86, 0xc8, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0xc6, 0x46, 0x07, 0x01}) &&   // clip 0E, [7]=1
+        codeIs(0x65182, {0x66, 0xc7, 0x46, 0x06, 0x08, 0x02});   // clip end -> kneel 8/2
+    if (!kneelReady) log("GLOCK_KNEEL firearm states 8/9 signature mismatch: kneeling shots after the roll dodge stay native");
+}
+
+// ---------------------------------------------------------------- r6 dodge (round 6, 2026-11-09): TEST switch, not for release
+// User: "can it be set so that this mechanic (the roll dodge) always triggers with Nemesis, to reproduce and watch it".
+// pilot.ini glock_dodge_always=1 (0 by default; the F5 menu flips dodgeAlways live): every attack of Nemesis that opens a
+// dodge window is dodged by the game's own code, as if the player had pressed in time. Facts (ResidentEvil3.exe):
+//  - Frame order 42B8F0..42B9D3: every enemy routine A5E508[model] runs, then the player 45FB70 (call 42B9C2), then
+//    player+0 &= 0x3FFFFFFF (42B9CC). An attack with a dodge window calls 452C00(attack point, attacker position,
+//    {position, box, yaw, kind}, target) on its window frames (animation frame flag [[+E4]+1] & 4, or a range of +C9);
+//    target inside the box: +0 |= 0x80000000, +170 = attacker position, +16C = attack point, +C7 = kind (452CBB). So the
+//    flag lives for the one frame in which the box check passed, and the player's code of that same frame tests it:
+//      movement handlers 52A238[0 1 2 3 4 A E F] (46002E 46044A 4606B2 46095D 460DF2 461B08 461EA1 462184): aim held
+//        (65C864 & 0x100 / 0x400), a weapon in hand (+46), life +CC > 0x14 -> +4 = 0x20701 (routine 1, dodge 7, state 2;
+//        from the run 0x701);
+//      aim routine 5: state 0 (464370, first 5 frames of the raise, no button, 4644CE), state 1 (464640: fire held and
+//        a round left 4DEC10(0), 464791); no check in the shot 2, lowering 3, empty 4, reload 5, kneel 8/9/A;
+//      Easy mode (65C880 & 0x100) only: 463C60 enters the dodge by itself in aim states <= 5 while +12D == 0, on every
+//        5th tick with a random draw (463CCC: +4 = 0x20701, then 52A278[7]). No luck or difficulty anywhere else.
+//  - Kind +C7 (dodge 460FF0, state 2): low nibble = direction order from 529D50 - 0/1/2 a step (clips E/F/10), 3 the push
+//    (clip 11), 5/6/7 = 0/1/2 as a ROLL (461129: clips 13/14); bit 0x20 turns the side steps F/10 into 13/14 too (46136A);
+//    bits 0xC0 pick the reference direction. Only clips 13/14 end in the kneel (46155E: +4 = 0x80501).
+//    Nemesis draws the kind at random on every window frame: EM34/35 (4A6A30) state 5 kinds 0..3 and state 6 kind 1
+//    (never a roll), state 7 0x40/42/43 or 0x62 (1 of 4), state 17 kind 3 or 6/7 (2 of 8), state 18 kind 1/3; EM36/3A
+//    (49CAD0) state 5 kind 1, state 10 kind 1/6, state 12 0/5, state 15 3/6, state 18 1/3; EM38 (470220) state 5 0x67,
+//    states 6/9 0x42, state 14 0x40; tentacle EM39 0x43. No 452C00 call = no dodge at all (the rocket).
+// What the switch does, in the hook of the player call 42B9C2 (after the enemies, before the player's code of the frame):
+//  - feeds the check that is about to run: the aim bit for the movement handlers, the fire bit for aim state 1 with a
+//    round left (65C864, for this one call); in the other aim states <= 5 with +12D == 0 (shot in progress - a Glock AUTO
+//    burst never leaves it -, lowering, empty, reload) it enters the dodge the way the game's own Easy-mode auto dodge
+//    does (463CCC: +4 = 0x20701, here set before the player's routine runs). Life <= 0x14, no weapon, kneeling, hit: native.
+//  - glock_dodge_always_roll=1 (default): the kind the attack registered becomes its roll variant (0/1/2 -> 5/6/7, the
+//    push 3 -> 7), because the roll is what the user wants to watch and the game draws it at random. 0 = native kinds.
+//  - only attacks of Nemesis (models 34..3B = the enemy that owns +170); glock_dodge_always=2: every enemy.
+//  - glock_dodge_always_kneel=1 (default 0, NOT a rule of the game): the same entry also out of the kneel 8/9/A, where
+//    the game has no dodge at all (QA 09.11: 8 of 29 windows came while Jill knelt after a roll, 3 of them hit her).
+//  - glock_dodge_always_wide=N (default 0, NOT a rule of the game): on a window frame of Nemesis' animation (frame
+//    function byte [[enemy+E4]+1] & 4 - what his attack states test before they call 452C00) with Jill within N units
+//    (1 = 3000) the flag, +170, +16C and kind 0 are set here although his dodge box (EM34: 500..2500 ahead, +-1000
+//    sideways, 52DED0) does not hold her. QA 09.11: 2 hits landed with no flagged frame at all and 2 with the first
+//    flagged frame = the frame of the hit (the enemy's hit test runs before the player's code).
+// Everything after the entry - direction, clip, invulnerability, the kneel and its budget - is native code. Main exe only.
+static bool dodgeAlways = false;      // pilot.ini glock_dodge_always (0 by default)
+static bool dodgeAnyEnemy = false, dodgeRoll = true, dodgeKneel = false, dodgeReady = false;
+static int dodgeWide = 0;             // pilot.ini glock_dodge_always_wide: 0 or the range in units
+static bool dodgeFeed = false;        // this tick's fire bit is the switch's: the MANUAL single-shot latch must not swallow it
+using PlayerMainFn = void(__cdecl*)(uint8_t*);
+static PlayerMainFn playerMainOriginal = nullptr;
+inline bool nemesisModel(uint8_t m) { return m >= 0x34 && m <= 0x3b; }
+// the enemy whose attack set the flag: +170 points into it (enemy+0x34 at every Nemesis call of 452C00) or into its parts
+static const uint8_t* dodgeAttacker(const uint8_t* player) {
+    const uintptr_t at = Read<uint32_t>(player, 0x170);
+    const uintptr_t first = gameBase + 0x65cdc8, end = Read<uint32_t>(gameObject(0x65ce6c));   // 42B91E: pointers up to [A5CE6C]
+    if (!at || end < first || end > first + 41 * 4) return nullptr;
+    for (uintptr_t p = first; p < end; p += 4) {
+        const auto enemy = reinterpret_cast<const uint8_t*>(uintptr_t(Read<uint32_t>(reinterpret_cast<const void*>(p))));
+        if (!enemy || enemy == player || !Accessible(enemy, 0x200)) continue;
+        const uintptr_t e = reinterpret_cast<uintptr_t>(enemy), parts = Read<uint32_t>(enemy, 0x108);
+        if ((at >= e && at < e + 0x200) || (parts && at >= parts && at < parts + size_t(enemy[8]) * kPartStride)) return enemy;
+    }
+    return nullptr;
+}
+// glock_dodge_always_wide: a living Nemesis on a dodge-window frame of his attack animation, within the range
+static const uint8_t* wideAttacker(const uint8_t* player) {
+    const uintptr_t first = gameBase + 0x65cdc8, end = Read<uint32_t>(gameObject(0x65ce6c));
+    if (end < first || end > first + 41 * 4) return nullptr;
+    for (uintptr_t p = first; p < end; p += 4) {
+        const auto enemy = reinterpret_cast<const uint8_t*>(uintptr_t(Read<uint32_t>(reinterpret_cast<const void*>(p))));
+        if (!enemy || enemy == player || !Accessible(enemy, 0x200) || !nemesisModel(enemy[0x4a]) || !(enemy[0] & 1) || enemy[4] != 1 || Read<int16_t>(enemy, 0xcc) <= 0) continue;
+        const auto entry = reinterpret_cast<const uint8_t*>(uintptr_t(Read<uint32_t>(enemy, 0xe4)));   // animation frame {keyframe, function}
+        if (!Accessible(entry, 2) || !(entry[1] & 4)) continue;
+        const double dx = double(Read<int32_t>(enemy, 0x34)) - Read<int32_t>(player, 0x34), dz = double(Read<int32_t>(enemy, 0x3c)) - Read<int32_t>(player, 0x3c);
+        if (dx * dx + dz * dz <= double(dodgeWide) * dodgeWide) return enemy;
+    }
+    return nullptr;
+}
+static void __cdecl playerMainHook(uint8_t* player) {
+    if (player != gameObject(0x65cbf4)) { playerMainOriginal(player); return; }
+    struct Auto { bool on = false, wide = false; uint32_t n = 0, tick = 0, enemyRoutine = 0; uint8_t kind = 0, kindNow = 0, model = 0, enemyClip = 0, enemyFrame = 0, from[3] = {}, weapon = 0, item = 0; int life = 0; const char* via = ""; };
+    static Auto pending;
+    static uint32_t tick = 0, windows = 0, autos = 0, windowLines = 0, noteLines = 0, endLines = 0, notedWindow = 0, lastFlagTick = 0, frames = 0;
+    static uint8_t kinds[8]; static unsigned kindCount = 0; static bool open = false;
+    ++tick;
+    bool wide = false;
+    if (dodgeAlways && dodgeWide && dodgeReady && player[4] == 1 && !(Read<uint32_t>(player) & 0x80000000u)) {
+        if (const uint8_t* enemy = wideAttacker(player)) {   // what 452CBB writes when the box holds the target; kind 0 = step back / to a side
+            const uint32_t parts = Read<uint32_t>(enemy, 0x108), origin = uint32_t(reinterpret_cast<uintptr_t>(enemy + 0x34));
+            *reinterpret_cast<uint32_t*>(player) |= 0x80000000u; *reinterpret_cast<uint32_t*>(player + 0x170) = origin;
+            *reinterpret_cast<uint32_t*>(player + 0x16c) = parts && enemy[8] > 8 && Accessible(reinterpret_cast<const void*>(uintptr_t(parts) + 0x634), 12) ? parts + 0x634 : origin;
+            player[0xc7] = 0; wide = true;
+        }
+    }
+    const bool debug = debugWarp(), flag = (Read<uint32_t>(player) & 0x80000000u) != 0;
+    const bool wasDodge = player[4] == 1 && player[5] == 7;
+    const uint8_t* attacker = flag ? dodgeAttacker(player) : nullptr;
+    const uint8_t model = attacker ? attacker[0x4a] : 0, kind = player[0xc7];
+    const int life = Read<int16_t>(player, 0xcc);
+    if (flag) {
+        if (!open) {
+            ++windows; frames = 0; kindCount = 0;
+            if (debug && windowLines < 400) {
+                ++windowLines;
+                log("GLOCK_DODGE_WINDOW %u tick=%u gap=%u kind=%02x enemy=%02x routine=%08x clip=%02x frame=%u jill=%u/%u/%u life=%d switch=%u%s",
+                    windows, tick, lastFlagTick ? tick - lastFlagTick : 0, kind, model, attacker ? Read<uint32_t>(attacker, 4) : 0, attacker ? attacker[0xc8] : 0,
+                    attacker ? attacker[0xc9] : 0, player[4], player[5], player[6], life, unsigned(dodgeAlways), wide ? " wide (set by the switch, not by the game)" : "");
+            }
+        }
+        ++frames; lastFlagTick = tick;
+        if (std::find(kinds, kinds + kindCount, kind) == kinds + kindCount && kindCount < 8) kinds[kindCount++] = kind;
+    } else if (open && debug && windowLines < 400) {
+        char text[40] = ""; size_t used = 0;
+        for (unsigned i = 0; i < kindCount && used + 4 < sizeof(text); ++i) used += size_t(std::snprintf(text + used, sizeof(text) - used, "%s%02x", i ? " " : "", kinds[i]));
+        log("GLOCK_DODGE_WINDOW_END %u tick=%u frames=%u kinds=%s jill=%u/%u/%u life=%d", windows, tick, frames, text, player[4], player[5], player[6], life);
+    }
+    open = flag;
+    int via = 0; uint32_t added = 0; uint8_t kindNow = kind;
+    const auto held = reinterpret_cast<uint32_t*>(gameBase + 0x65c864);
+    if (flag && dodgeAlways && dodgeReady && player[4] == 1 && (dodgeAnyEnemy || nemesisModel(model))) {
+        if (dodgeRoll) {   // also while the run-stop states 0/1 of the dodge play: the attack keeps rewriting +C7
+            const uint8_t low = kind & 0x0f;
+            if (low <= 2) kindNow = uint8_t(kind + 5); else if (low == 3) kindNow = uint8_t((kind & 0xf0) | 7);
+            player[0xc7] = kindNow;
+        }
+        const uint8_t sub = player[5], weapon = player[0x46]; const char* why = nullptr;
+        if (wasDodge) {}
+        else if (life <= 0x14) why = "life <= 20: the game allows no dodge";
+        else if (!weapon) why = "no weapon in hand";
+        else if (sub == 0 || sub == 1 || sub == 2 || sub == 3 || sub == 4 || sub == 10 || sub == 14 || sub == 15) via = 1;
+        else if (sub == 5 && player[6] <= 5 && !player[0x12d]) {
+            const bool generic = weapon < 0x18 && (weapon == 3 || Read<uint32_t>(gameObject(0x12a35c + weapon * 4)) == uint32_t(gameBase + 0x64340));
+            const bool round = reinterpret_cast<uint16_t(__cdecl*)(int)>(gameBase + 0xdec10)(0) != 0xffff;
+            via = player[6] == 1 && generic && round ? 2 : 3;
+        } else if (sub == 5 && dodgeKneel && player[6] >= 8 && player[6] <= 10 && !player[0x12d]) via = 4;   // not native
+        else why = "no dodge from this state";
+        if (via == 1 && !(*held & 0x500)) { *held |= 0x100; added = 0x100; }
+        if (via == 2) { dodgeFeed = true; if (!(*held & 0x40)) { *held |= 0x40; added = 0x40; } }
+        if (via) {
+            pending = Auto{}; pending.on = true; pending.n = ++autos; pending.tick = tick; pending.kind = kind; pending.kindNow = kindNow; pending.model = model;
+            pending.enemyRoutine = attacker ? Read<uint32_t>(attacker, 4) : 0; pending.enemyClip = attacker ? attacker[0xc8] : 0; pending.enemyFrame = attacker ? attacker[0xc9] : 0;
+            pending.from[0] = player[5]; pending.from[1] = player[6]; pending.from[2] = player[7]; pending.weapon = weapon; pending.item = equipped(); pending.life = life;
+            pending.via = via == 1 ? (added ? "aim fed" : "aim held") : via == 2 ? (added ? "fire fed" : "fire held") : via == 3 ? "auto entry 463CCC" : "auto entry out of the kneel (not native)";
+            pending.wide = wide;
+            if (via >= 3) *reinterpret_cast<uint32_t*>(player + 4) = 0x20701;   // routine 1, dodge 7, state 2
+        } else if (why && debug && notedWindow != windows && noteLines < 120) { ++noteLines; notedWindow = windows; log("GLOCK_DODGE_ALWAYS skipped: %s (jill=%u/%u/%u +12D=%02x weapon=%02x life=%d kind=%02x enemy=%02x)", why, player[4], sub, player[6], player[0x12d], weapon, life, kind, model); }
+    }
+    playerMainOriginal(player);
+    dodgeFeed = false;
+    if (added) *held &= ~added;
+    const bool nowDodge = player[4] == 1 && player[5] == 7;
+    if (via && !nowDodge) {
+        --autos; pending.on = false;
+        if (debug && noteLines < 120) { ++noteLines; log("GLOCK_DODGE_ALWAYS fed (%s) but the game did not dodge: jill 1/%u/%u -> %u/%u/%u", pending.via, pending.from[0], pending.from[1], player[4], player[5], player[6]); }
+    }
+    // one line per automatic dodge, once its clip is chosen (state 3; a dodge out of the run plays states 0/1 first)
+    if (pending.on && (!nowDodge || player[6] == 3)) {
+        const uint8_t clip = player[0xc8]; pending.on = false;
+        if (pending.n <= (debug ? 400u : 60u))
+            log("GLOCK_DODGE_ALWAYS %u tick=%u kind=%02x%s enemy=%02x routine=%08x clip=%02x frame=%u via=%s%s jill=1/%u/%u weapon=%02x item=%02x life=%d -> %s (clip %02x)",
+                pending.n, pending.tick, pending.kindNow, pending.kindNow != pending.kind ? " (roll variant)" : "", pending.model, pending.enemyRoutine, pending.enemyClip, pending.enemyFrame,
+                pending.via, pending.wide ? ", wide window" : "", pending.from[0], pending.from[1], pending.weapon, pending.item, pending.life,
+                !nowDodge ? "dodge ended early" : clip == 0x13 || clip == 0x14 ? "ROLL" : clip == 0x11 ? "push" : "step", clip);
+    }
+    if (debug && endLines < 400) {
+        if (!via && !wasDodge && nowDodge) { ++endLines; log("GLOCK_DODGE player's own dodge: tick=%u kind=%02x enemy=%02x life=%d", tick, player[0xc7], model, life); }
+        if (wasDodge && !nowDodge) { ++endLines; log("GLOCK_DODGE_END tick=%u +4=%08x (%s) weapon=%02x item=%02x", tick, Read<uint32_t>(player, 4), player[5] == 5 && player[6] == 8 ? "kneel" : player[5] == 5 ? "aim" : "other", player[0x46], equipped()); }
+    }
+}
+static void installDodgeAlways(int ini) {
+    dodgeAlways = ini != 0; dodgeAnyEnemy = ini == 2;
+    if (re3exe::gRunning != re3exe::Exe::Main) { if (ini) log("GLOCK_DODGE_ALWAYS off: main game only"); dodgeAlways = false; return; }
+    const auto routines = reinterpret_cast<const uint32_t*>(gameBase + 0x12a218), handlers = reinterpret_cast<const uint32_t*>(gameBase + 0x12a238),
+        steps = reinterpret_cast<const uint32_t*>(gameBase + 0x12a278);
+    static const uint8_t kindTable[32] = {1, 2, 3, 0, 2, 1, 3, 0, 3, 1, 2, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 7, 8, 0, 7, 6, 8, 0, 8, 6, 7, 0};
+    const bool ok = Accessible(routines, 0x80) && routines[1] == uint32_t(gameBase + 0x5fec0) && handlers[0] == uint32_t(gameBase + 0x5ff50) &&
+        handlers[5] == uint32_t(gameBase + 0x5ea0) && handlers[7] == uint32_t(gameBase + 0x5ea0) && steps[5] == uint32_t(gameBase + 0x63c60) &&
+        steps[7] == uint32_t(gameBase + 0x60ff0) && Accessible(gameObject(0x129d50), 32) && !std::memcmp(gameObject(0x129d50), kindTable, 32) &&
+        codeIs(0x52cbb, {0x8b, 0x07, 0x8b, 0x4c, 0x24, 0x4c, 0x0d, 0x00, 0x00, 0x00, 0x80, 0x89, 0x8f, 0x70, 0x01, 0x00, 0x00}) &&   // flag, +170
+        codeIs(0x2b9c7, {0x8b, 0x07, 0x83, 0xc4, 0x04, 0x25, 0xff, 0xff, 0xff, 0x3f, 0x89, 0x07}) &&                               // flag cleared after the player
+        codeIs(0x6002e, {0x66, 0x83, 0xb8, 0xcc, 0x00, 0x00, 0x00, 0x14, 0x7e, 0x07, 0xc7, 0x40, 0x04, 0x01, 0x07, 0x02, 0x00}) && // idle: life, 0x20701
+        codeIs(0x64791, {0xf7, 0x06, 0x00, 0x00, 0x00, 0x80}) && codeIs(0x647b9, {0xc7, 0x46, 0x04, 0x01, 0x07, 0x02, 0x00}) &&    // aim state 1
+        codeIs(0x63ccc, {0xc7, 0x46, 0x04, 0x01, 0x07, 0x02, 0x00, 0x8a, 0x56, 0x05}) &&                                           // Easy auto dodge entry
+        codeIs(0x61129, {0x3c, 0x04, 0x76, 0x09, 0x3c, 0x08, 0x73, 0x05, 0xba, 0x08, 0x00, 0x00, 0x00}) &&                         // kinds 5..7: roll clips
+        codeIs(0x6136a, {0xf6, 0x86, 0xc7, 0x00, 0x00, 0x00, 0x20}) && codeIs(0x6155e, {0xc7, 0x46, 0x04, 0x01, 0x05, 0x08, 0x00}); // roll bit, kneel
+    const size_t from = patches.size();
+    if (!ok || !callPatch(0x2b9c2, 0x5fb70, reinterpret_cast<void*>(playerMainHook))) { patches.resize(from); log("GLOCK_DODGE_ALWAYS off: code signature mismatch"); dodgeAlways = false; return; }
+    playerMainOriginal = reinterpret_cast<PlayerMainFn>(gameBase + 0x5fb70);
+    if (!writeFrom(from)) { log("GLOCK_DODGE_ALWAYS off: hook failed"); dodgeAlways = false; return; }
+    dodgeReady = true;
+    log("GLOCK_DODGE_ALWAYS installed: switch %s (pilot.ini glock_dodge_always=%d, %s), roll variant %s (glock_dodge_always_roll), out of the kneel %s (glock_dodge_always_kneel), wide window %d (glock_dodge_always_wide, 0 = the box of the game)",
+        dodgeAlways ? "ON" : "off", ini, dodgeAnyEnemy ? "every enemy" : "Nemesis only", dodgeRoll ? "forced" : "native", dodgeKneel ? "yes (not native)" : "no (native)", dodgeWide);
+}
+
 using PlayerEndFn = void(__cdecl*)(uint8_t*, int);
 static PlayerEndFn playerEndOriginal = nullptr;
 static void __cdecl playerEndHook(uint8_t* player, int yaw) {
     playerEndOriginal(player, yaw);
-    // routine 1/5 = weapon in hand, state 2 = shot: only a Glock shot that captured its stance
-    if (!stanceValid || player != gameObject(0x65cbf4) || player[4] != 1 || player[5] != 5 || player[6] != 2 || !equipped()) return;
+    // routine 1/5 = weapon in hand, state 2 = shot (9 = kneeling shot): only a Glock shot that captured its stance
+    if (!stanceValid || player != gameObject(0x65cbf4) || player[4] != 1 || player[5] != 5 || !shotState(player[6]) || !equipped()) return;
     uint8_t* parts = Read<uint8_t*>(player, 0x108);
     if (player[8] >= kParts && Accessible(parts, kParts * kPartStride, true)) holdStance(player, parts, false);
 }
@@ -504,7 +732,8 @@ static void softenRecoil(uint8_t* player, bool newRound, bool burstStart) {
 // Both modes restart the shot animation (sub-state 0 next frame = a round) once autoFrames of it have played: AUTO while
 // fire is held, MANUAL for each new pull - a pull during the animation is kept until then, so tapping fires as fast as
 // the taps but never faster than AUTO. Both use the soft recoil and the held stance of an AUTO round (1.11; before, MANUAL
-// played the whole native M92F kick and took the next pull only back in the aim state).
+// played the whole native M92F kick and took the next pull only back in the aim state). The same holds for the kneeling
+// shot 9 after the roll dodge (2026-11-09, see kneelReady): restarts there also spend the kneel budget +E3.
 static bool latched = false, owed = false;   // single: this pull already fired / a pull waiting for the next round
 static void __cdecl weaponStateHook(uint8_t* player, uint32_t a2, uint32_t a3, uint32_t held) {
     if (player == gameObject(0x65cbf4)) syncShotSound();
@@ -513,17 +742,26 @@ static void __cdecl weaponStateHook(uint8_t* player, uint32_t a2, uint32_t a3, u
     const bool fire = (held & 0x40) != 0;
     if (!fire) latched = false;
     const uint8_t before = player[6];
-    if (item == kSingle && before == 2 && fire && !latched) { owed = true; latched = true; }   // a new pull during the shot
+    const bool shooting = shotState(before);
+    if (item == kSingle && shooting && fire && !latched) { owed = true; latched = true; }   // a new pull during the shot
     static uint32_t shots = 0; ++stateTick;
-    if (before == 2 && player[7] == 0 && shots++ < (debugWarp() ? 400u : 48u)) log("GLOCK_SHOT item=%02x tick=%u", item, stateTick);   // the shot animation starts: a round this tick
-    const bool restart = before == 2 && player[7] == 0;
-    weaponStateOriginal(player, a2, a3, item == kSingle && latched && before == 1 ? held & ~0x40u : held);
-    if (player[6] == 2 && before != 2) { latched = true; owed = false; }   // a shot started: single mode needs a new pull
-    if (player[6] != 2 && owed) { latched = owed = false; }   // the shot ended before the pull was served: the aim state takes it
-    if (player[6] == 2) softenRecoil(player, restart || before != 2, before != 2); else aimValid = stanceValid = false;
-    if ((item == kAuto ? fire : owed) && player[6] == 2 && player[7] == 1 && (held & 0x500) && player[0xc9] >= autoFrames) {
+    if (shooting && player[7] == 0 && shots++ < (debugWarp() ? 400u : 48u))   // the shot animation starts: a round this tick
+        log("GLOCK_SHOT item=%02x tick=%u%s", item, stateTick, before == 9 ? " kneel" : "");
+    const bool restart = shooting && player[7] == 0;
+    weaponStateOriginal(player, a2, a3, item == kSingle && latched && before == 1 && !dodgeFeed ? held & ~0x40u : held);   // kneel 8: held fire = native; r6 dodge: the switch's fire bit passes
+    const uint8_t now = player[6];
+    if (shotState(now) && !shooting) { latched = true; owed = false; }   // a shot started: single mode needs a new pull
+    if (!shotState(now) && owed) { latched = owed = false; }   // the shot ended before the pull was served: the aim state takes it
+    if (shotState(now)) softenRecoil(player, restart || !shooting, !shooting); else aimValid = stanceValid = false;
+    const bool kneel = now == 9;   // shotState(9) only with kneelReady
+    const bool kneelRepeat = item == kSingle && kneel && fire && player[0xc9] >= kneelHoldFrames;   // MANUAL held in the kneel
+    if ((item == kAuto ? fire : owed || kneelRepeat) && shotState(now) && player[7] == 1 && (held & 0x500) && player[0xc9] >= autoFrames &&
+        (!kneel || !kneelBudget || player[kKneelBudget])) {
         const uint16_t left = reinterpret_cast<uint16_t(__cdecl*)(int)>(gameBase + 0xdec10)(0);
-        if (left != 0xffff) player[7] = 0;   // next frame starts the shot animation again: the next round
+        if (left != 0xffff) {   // next frame starts the shot animation again: the next round
+            player[7] = 0;
+            if (kneel && kneelBudget && player[kKneelBudget]) --player[kKneelBudget];   // as 464FF1 does for every native kneeling shot
+        }
         owed = false;
     }
 }
@@ -590,8 +828,8 @@ static void installItems() {
     ok = ok && callPatch(0x2a724, 0x264e0, reinterpret_cast<void*>(soundReadHook)) && callPatch(0x5fccc, 0x578b0, reinterpret_cast<void*>(playerEndHook));
     if (!ok) { patches.resize(from); log("GLOCK_ITEMS hooks skipped: signature mismatch, no Glock"); return; }
     soundReadOriginal = reinterpret_cast<SoundReadFn>(gameBase + 0x264e0); playerEndOriginal = reinterpret_cast<PlayerEndFn>(gameBase + 0x578b0);
-    buildAutoCombat();
-    nameOriginal = reinterpret_cast<NameFn>(gameBase + 0x2f290); checkMessageOriginal = reinterpret_cast<MessageFn>(gameBase + 0x2da10);
+    buildAutoCombat(); checkKneel();
+    nameOriginal =reinterpret_cast<NameFn>(gameBase + 0x2f290); checkMessageOriginal = reinterpret_cast<MessageFn>(gameBase + 0x2da10);
     readOriginal = reinterpret_cast<ReadFn>(gameBase + 0x265a0); slotIconOriginal = reinterpret_cast<IconFn>(gameBase + 0xdcce0);
     boxIconOriginal = reinterpret_cast<IconFn>(gameBase + 0xdcd50); weaponInitOriginal = reinterpret_cast<PlayerFn>(gameBase + 0x52620);
     weaponLoadOriginal = reinterpret_cast<PlayerFn>(gameBase + 0x52310); weaponResumeOriginal = reinterpret_cast<PlayerFn>(gameBase + 0x52690); weaponStateOriginal = reinterpret_cast<WeaponStateFn>(gameBase + 0x64340);
@@ -602,9 +840,10 @@ static void installItems() {
         patches.resize(from); log("GLOCK_ITEMS attribute write failed: restored"); return;
     }
     itemsInstalled = true;
-    log("GLOCK_ITEMS installed: items %02x/%02x, %u rounds, combine rows %zu+4, reload rows %zu+2, auto every %u frames, pictures %s/%s, shot sound %s, AUTO recoil %u/%u/%u%% sway %u",
+    log("GLOCK_ITEMS installed: items %02x/%02x, %u rounds, combine rows %zu+4, reload rows %zu+2, auto every %u frames, pictures %s/%s, shot sound %s, AUTO recoil %u/%u/%u%% sway %u, kneel shots %s",
         kSingle, kAuto, kRounds, n, r, autoFrames, itemiRecord.empty() ? "MISSING" : "icon", itemgRecord.empty() ? "MISSING" : "examine",
-        shotVag.empty() ? "MISSING (M92F shot)" : "shot.vag", kickPercent, handPercent, tailPercent, swayAngle);
+        shotVag.empty() ? "MISSING (M92F shot)" : "shot.vag", kickPercent, handPercent, tailPercent, swayAngle, !kneelReady ? "native" : kneelBudget ? "Glock rate (15-round kneel budget)" : "Glock rate (burst keeps the kneel)");
+    if (kneelReady) log("GLOCK_KNEEL MANUAL: fire held in the kneel repeats a single every %u ticks (native M92F 14), taps every %u+; AUTO every %u", kneelHoldFrames, autoFrames, autoFrames);
 }
 
 // ---------------------------------------------------------------- diagnostics (debug_warp, game thread)
@@ -642,6 +881,53 @@ static void diagnostic() {
         log("GLOCK_DIAGNOSTIC equip slot %d item %02x", slot, inv[slot * 4]);
     }
     if (command == "glock-mode") switchMode(inv, slot);
+    if (command == "glock-kneel") {   // QA (2026-11-09): the kneel a roll dodge ends in (46155E: routine 1/5, firearm state 8/0)
+        uint8_t* player = gameObject(0x65cbf4);
+        if (!kneelReady || !equipped() || player[4] != 1 || player[5] != 5 || player[6] != 1) {
+            log("GLOCK_DIAGNOSTIC kneel rejected: needs the Glock aimed (routine %u/%u state %u), kneel %s", player[4], player[5], player[6], kneelReady ? "ready" : "native");
+            return;
+        }
+        // QA 2026-11-09 (game runs): the dodge also sets the attacker the kneel turns to (461111: +15C = +170; state 8 reads
+        // [+15C]+0/+8 at 4650B7 -> access violation when it is empty) and the 15-shot kneel budget (460AED)
+        // no attack in progress (+170 empty): a point 2000 units straight ahead (yaw +6E, step (cos, -sin) as 455E90), x/y/z
+        static int32_t ahead[3];
+        uint32_t attacker = *reinterpret_cast<const uint32_t*>(player + 0x170);
+        if (!attacker) {
+            const double a = double(*reinterpret_cast<const uint16_t*>(player + 0x6e) & 0xfff) * 2.0 * 3.14159265358979 / 4096.0;
+            ahead[0] = *reinterpret_cast<const int32_t*>(player + 0x34) + int32_t(2000.0 * std::cos(a));
+            ahead[1] = *reinterpret_cast<const int32_t*>(player + 0x38);
+            ahead[2] = *reinterpret_cast<const int32_t*>(player + 0x3c) - int32_t(2000.0 * std::sin(a));
+            attacker = uint32_t(reinterpret_cast<uintptr_t>(ahead));
+        }
+        *reinterpret_cast<uint32_t*>(player + 0x15c) = attacker;
+        player[6] = 8; player[7] = 0;
+        player[kKneelBudget] = 15;
+        log("GLOCK_DIAGNOSTIC kneel: firearm state 8 as after the roll dodge, budget 15");
+    }
+    if (command == "glock-dodge") {
+        // QA round 2 (09.11): the REAL roll dodge. In a game run the dodge flag ([player] & 0x80000000, set by an enemy's
+        // attack check 452C00 and consumed in the same frame) never reaches the input poll, and zombie grabs (kind 0x43)
+        // are dodged with the push clip 11, not the roll. So set what 452C00 sets for a roll attack (kind 0x67 = the
+        // attack registered at 471BE9; +170 attacker position, +16C attack point: a point 1500 ahead) and enter the dodge
+        // the way the idle/aim checks do (46002E / 4644E3: +4 = 0x20701 = routine 1, dodge 7, state 2). Everything after
+        // that - the roll clip, the kneel (state 8 for a handgun at 46155E), its budget and attacker - is native code.
+        uint8_t* player = gameObject(0x65cbf4);
+        const bool idle = player[4] == 1 && player[5] == 0, aimed = player[4] == 1 && player[5] == 5 && player[6] == 1;
+        if (!equipped() || !(idle || aimed)) {
+            log("GLOCK_DIAGNOSTIC dodge rejected: needs the Glock equipped and Jill idle or aimed (routine %u/%u state %u)", player[4], player[5], player[6]);
+            return;
+        }
+        static int32_t point[3];
+        const double a = double(*reinterpret_cast<const uint16_t*>(player + 0x6e) & 0xfff) * 2.0 * 3.14159265358979 / 4096.0;
+        point[0] = *reinterpret_cast<const int32_t*>(player + 0x34) + int32_t(1500.0 * std::cos(a));
+        point[1] = *reinterpret_cast<const int32_t*>(player + 0x38);
+        point[2] = *reinterpret_cast<const int32_t*>(player + 0x3c) - int32_t(1500.0 * std::sin(a));
+        const uint32_t at = uint32_t(reinterpret_cast<uintptr_t>(point));
+        *reinterpret_cast<uint32_t*>(player + 0x16c) = at; *reinterpret_cast<uint32_t*>(player + 0x170) = at;
+        player[0xc7] = 0x67; *reinterpret_cast<uint32_t*>(player) |= 0x80000000u;
+        *reinterpret_cast<uint32_t*>(player + 4) = 0x20701;
+        log("GLOCK_DIAGNOSTIC dodge: routine 1/7 state 2 (roll kind 67) from %s, weapon %02x item %02x", idle ? "idle" : "aim", player[0x46], equipped());
+    }
     if (command == "glock-m92") {   // the Glock slot becomes a loaded M92F, equipped like 45DD20: the shot sound must go back
         uint8_t* player = gameObject(0x65cbf4); const uint8_t m92[4] = {3, 15, 0x01, 0x00};
         std::memcpy(inv + slot * 4, m92, 4); inv[0x128] = uint8_t(slot); inv[0x129] = 3; player[0x46] = 3;
@@ -666,6 +952,13 @@ static void install() {
     tailPercent = (std::min)(100u, unsigned(GetPrivateProfileIntA("pilot", "glock_auto_kick_tail", int(tailPercent), ini.c_str())));
     swayAngle = (std::min)(64u, unsigned(GetPrivateProfileIntA("pilot", "glock_auto_sway", int(swayAngle), ini.c_str())));
     swayPart = (std::min)(kUpperLast, unsigned(GetPrivateProfileIntA("pilot", "glock_auto_sway_part", int(swayPart), ini.c_str())));
+    kneelBudget = GetPrivateProfileIntA("pilot", "glock_kneel_budget", 1, ini.c_str()) != 0;
+    kneelHoldFrames = (std::max)(2u, (std::min)(14u, unsigned(GetPrivateProfileIntA("pilot", "glock_kneel_hold_frames", int(kneelHoldFrames), ini.c_str()))));
+    dodgeRoll = GetPrivateProfileIntA("pilot", "glock_dodge_always_roll", 1, ini.c_str()) != 0;   // r6 dodge (test switch)
+    dodgeKneel = GetPrivateProfileIntA("pilot", "glock_dodge_always_kneel", 0, ini.c_str()) != 0;
+    dodgeWide = GetPrivateProfileIntA("pilot", "glock_dodge_always_wide", 0, ini.c_str());
+    dodgeWide = dodgeWide <= 0 ? 0 : dodgeWide < 100 ? 3000 : (std::min)(dodgeWide, 20000);
+    installDodgeAlways(GetPrivateProfileIntA("pilot", "glock_dodge_always", 0, ini.c_str()));
     const size_t from = patches.size(); bool ok = true;
     for (uint32_t site : {0x43639u, 0x5137bu}) ok = ok && callPatch(site, 0x26380, reinterpret_cast<void*>(savLoadHook));
     for (uint32_t site : {0x2716bu, 0x42e13u}) ok = ok && callPatch(site, 0x262a0, reinterpret_cast<void*>(savSaveHook));
