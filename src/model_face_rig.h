@@ -136,8 +136,14 @@ public:
     bool Valid()const{return !clips_.empty();}
     std::size_t ClipCount()const{return clips_.size();}
     bool Load(const std::string& path,std::string* error=nullptr){
+        std::vector<std::uint8_t> b;if(!re3shoulder::detail::ReadFile(path,32,64u*1024*1024,b)){if(error)*error="Missing lip-sync file";return false;}
+        return LoadBytes(std::move(b),error);
+    }
+    // voice packs 2026-11-11: the same R3LIP1 checks on bytes in memory (a pack's lipsync.r3lip read through a wide path, or
+    // one automatic track built at clip load)
+    bool LoadBytes(std::vector<std::uint8_t> b,std::string* error=nullptr){
         auto fail=[&](const char* text){if(error)*error=text;return false;};
-        std::vector<std::uint8_t> b;if(!re3shoulder::detail::ReadFile(path,32,64u*1024*1024,b))return fail("Missing lip-sync file");
+        if(b.size()<32||b.size()>64u*1024*1024)return fail("Missing lip-sync file");
         if(std::memcmp(b.data(),"R3LIP1\0\0",8))return fail("Invalid R3LIP1 magic");
         std::uint32_t v[6];std::memcpy(v,b.data()+8,24);
         const std::uint32_t version=v[0],header=v[1],count=v[2],fps=v[3],framesOffset=v[4],fileBytes=v[5];

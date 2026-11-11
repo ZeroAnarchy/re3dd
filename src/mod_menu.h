@@ -198,6 +198,7 @@ inline void LoadOptions(bool startup) {
     optValue[O_Scheme] = key("control_scheme", 0) ? (key("modern_stick_run", 0) ? 2 : 1) : 0;
     optValue[O_HitSounds] = key("hit_sounds", 1) ? (std::max)(0, (std::min)(200, key("hit_sound_volume", 100))) : 0;
     optValue[O_BloodBright] = (std::max)(40, (std::min)(160, optValue[O_BloodBright]));
+    optValue[O_VoicePack] = voicePackIndex + 1;   // voice packs 2026-11-11: pilot.ini voice_pack=<folder> -> 0 original / pack number
     // the modules' own startup defaults where the released pilot.ini relies on them
     if (startup) for (int i = 0; i < O_Count; ++i) optRunning[i] = optValue[i];
     optRunning[O_Enabled] = desiredEnabled ? 1 : 0; optRunning[O_Fps60] = fps60Enabled ? 1 : 0;
@@ -221,12 +222,14 @@ inline Str OptBlocked(int id) {
     case O_Shadows: case O_FlashLight: return needModels != S_Count ? needModels : optValue[O_GpuModels] ? S_Count : S_NeedsGpu;
     case O_BloodBright: return needModels != S_Count ? needModels : optValue[O_Blood] ? S_Count : S_NeedsBlood;
     case O_MovieFit: return optValue[O_PlayerMovies] ? S_Count : S_NeedsOwnMovies;
+    case O_VoicePack: return voicePacks.empty() ? S_NoVoicePacks : S_Count;   // voice packs 2026-11-11: nothing in 3DD-Voice
     default: return S_Count;
     }
 }
 inline OptStatus OptState(int id) {
     switch (id) {
     case O_Enabled: case O_Language: case O_Effects: case O_BloodBright: return OptLive;
+    case O_VoicePack: return voiceHooksReady && voiceDubReady ? OptLive : OptUnavailable;   // voice packs 2026-11-11: from the next clip load
     case O_Shadows: case O_FlashLight: return modelGpuEnabled ? OptLive : OptUnavailable;   // lighting round 2026-11-10 (GPU path of the HD models)   // r7 fx pages: nothing to install, always live
     case O_Fps60: return modelActive ? OptLive : OptUnavailable;
     case O_Motion: case O_Wounds: return modelActive ? OptLive : OptRestart;   // fix 2026-11-11: wounds are a live switch (the shot hooks are always there)
@@ -275,12 +278,13 @@ inline void OptSet(int id, int v) {
     case O_WidePeek: if (onSetWidescreenPeek) { onSetWidescreenPeek(v); applied = true; } break;
     case O_DodgeAlways: if (onSetDodgeAlways) { onSetDodgeAlways(v); applied = true; } break;
     case O_Language: cfg.language = v; applied = true; break;
+    case O_VoicePack: if (live) { voiceSetPack(v); v = voicePackIndex + 1; applied = true; } break;   // voice packs 2026-11-11 (writes voice_pack=)
     default: break;
     }
     optValue[id] = v;
     auto put = [&](const char* name, int value) { WritePrivateProfileStringA("pilot", name, std::to_string(value).c_str(), ini.c_str()); };
     switch (id) {   // fix 2026-11-11: the merged rows write their two keys (the second only when it has a meaning)
-    case O_Fps60: break;
+    case O_Fps60: case O_VoicePack: break;
     case O_Models: put("models", v ? 1 : 0); if (v) put("characters", v == 2 ? 1 : 0); break;
     case O_Scheme: put("control_scheme", v ? 1 : 0); if (v) put("modern_stick_run", v == 2 ? 1 : 0); break;
     case O_HitSounds: put("hit_sounds", v ? 1 : 0); if (v) put("hit_sound_volume", v); break;
@@ -435,6 +439,12 @@ struct GameHost : Host {
     OptStatus OptState(int id) override { return detail::OptState(id); }
     Str OptBlocked(int id) override { return detail::OptBlocked(id); }   // fix 2026-11-11
     Str OptReason(int id) override { return id == O_Fps60 ? S_NeedsModels : S_Unavailable; }
+    // voice packs 2026-11-11: the voice-over row = original + every offered pack (pack.ini name, name_ru in a Russian menu)
+    int OptChoiceCount(int id) override { return id == O_VoicePack ? 1 + int(voicePacks.size()) : Host::OptChoiceCount(id); }
+    std::wstring OptChoiceText(int id, int v, bool ru) override {
+        if (id != O_VoicePack || v <= 0 || v > int(voicePacks.size())) return Host::OptChoiceText(id, v, ru);
+        const auto& p = voicePacks[size_t(v - 1)].info; return ru && !p.nameRu.empty() ? p.nameRu : p.name;
+    }
     void OptSet(int id, int value) override { detail::OptSet(id, value); }
     bool NativeWindowAvailable() override { return !merce; }
     void OpenNativeWindow() override { nativeAfterClose = true; closeRequested = true; closeReason = "game settings window"; }

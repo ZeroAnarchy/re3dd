@@ -110,13 +110,214 @@ static void modelMessage(void*,const char* message){log("MODEL %s",message);}
 static bool modelFaceEnabled=true;
 static bool modelMotionSmoothing=true;
 static re3face::LipSync faceLipSync;
-struct VoiceChannelState{char name[16]{};double startTime=0;bool started=false;const re3face::LipClip* clip=nullptr;};
+// ---------------------------------------------------------------- voice packs (2026-11-11)
+// <game>\3DD-Voice\<pack>\<CLIP>.wav replace the game's voice clips while that pack is chosen (pilot.ini voice_pack=<folder>,
+// F5 SOUND row "Voice-over", live from the next clip load); a clip the pack does not have plays the original. Formats and
+// the game's voice path: voice_wav.h; pack folders, pack.ini, speakers.ini: voice_packs.h. Lip sync of a pack clip: the
+// pack's lipsync.r3lip if it has the clip, else an automatic track (lipsync_auto.h) from the clip's own samples, made on a
+// worker thread at clip load (the lips start when it is ready, ~2 frames later) and cached per pack + clip, none for a
+// silent clip; speaker = pack.ini [speakers], else the pack's lipsync.r3lip record, else
+// 3DD-Voice\speakers.ini, else the English model-pack\lipsync.r3lip (clips it has no record for get no lips).
+#include "voice_wav.h"
+#include "voice_packs.h"
+#include "lipsync_auto.h"
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+struct VoicePackRuntime{
+    re3voice::PackInfo info;std::string folderUtf8,language;
+    std::unique_ptr<re3face::LipSync> lip;int lipState=0;   // the pack's lipsync.r3lip: 0 not read yet, 1 loaded, -1 none
+    std::unordered_set<std::string> logged,longer;           // clips already listed / reported longer this session
+};
+static std::vector<VoicePackRuntime> voicePacks;              // offered packs (with at least one game clip), folder order
+static int voicePackIndex=-1;                                 // -1 = original English, else index in voicePacks (F5 value - 1)
+static std::map<std::string,int> voiceSpeakerFixes;           // 3DD-Voice\speakers.ini [speakers]
+static bool voiceHooksReady=false,voiceDubReady=false;
+// automatic lip sync: one job per pack + clip, analysed on a worker thread (lipsync_auto.h: up to ~170 ms for a minute of
+// sound), cached for the session; the game thread only queues, polls the atomic state and logs
+struct VoiceAutoJob{
+    std::string key,name,pack;int speaker=-1;std::vector<int16_t> pcm;uint32_t frames=0;unsigned channels=0,rate=0;
+    std::atomic<int> state{0};   // 0 queued / running, 1 track ready, -1 no track (silent, failed)
+    std::unique_ptr<re3face::LipSync> track;double ms=0,queuedAt=0,doneAt=0;std::string error;uint32_t trackFrames=0;bool logged=false;
+};
+struct VoiceAutoWorker{std::mutex mutex;std::condition_variable wake;std::deque<std::shared_ptr<VoiceAutoJob>> queue;bool started=false;};
+static VoiceAutoWorker* voiceAuto=new VoiceAutoWorker;   // never destroyed: the thread may still wait on it at process exit
+static std::unordered_map<std::string,std::shared_ptr<VoiceAutoJob>> voiceAutoJobs;   // "<folder>|<CLIP>" (game thread only)
+static std::vector<std::shared_ptr<VoiceAutoJob>> voiceAutoUnlogged;
+static double voiceAutoMs=0;static unsigned voiceAutoCount=0;
+struct VoiceServed{char name[16]{};double seconds=0;const char* format="";bool valid=false;int pack=-1,speaker=-1;const char* source="none";
+    const re3face::LipSync* track=nullptr;const re3face::LipClip* clip=nullptr;std::shared_ptr<VoiceAutoJob> autoJob;};
+static VoiceServed voiceServed;   // set by voiceFileHook inside the native load, read by voiceLoadHook right after it
+static unsigned voiceLogLines=0,voiceEndLogLines=0,voiceCutLogLines=0;
+struct VoiceChannelState{char name[16]{};double startTime=0,seconds=0;bool started=false,playing=false;int pack=-1,speaker=-1;const char* source="none";
+    const re3face::LipClip* clip=nullptr;const re3face::LipSync* track=nullptr;std::shared_ptr<VoiceAutoJob> autoJob;};
 static VoiceChannelState voiceChannels[0x15];
 static int(__thiscall* originalVoiceLoad)(void*,int,const char*)=nullptr;
 static int(__thiscall* originalVoicePlay)(void*,int)=nullptr;
+static int(__thiscall* originalVoiceBusy)(void*,int)=nullptr;
+static int(__thiscall* originalVoiceFile)(void*,void*,const char*)=nullptr;
+static int(__thiscall* nativeVoiceCreate)(void*,const void*,unsigned)=nullptr;
 static double faceClock(){return modelClockMs()/1000.0;}
-// Native sound object vtable 0x50A8A4: +0x18 load(channel,path), +0x1C play(channel), +0x30 isPlaying(channel).
+static bool voiceLog(){if(voiceLogLines<800){++voiceLogLines;return true;}if(voiceLogLines==800){++voiceLogLines;log("VOICE_LOG_BUDGET 800 voice-pack lines reached: further clip lines are not written");}return false;}
+static const char* voicePackFolder(int pack){return pack>=0&&pack<int(voicePacks.size())?voicePacks[size_t(pack)].folderUtf8.c_str():"-";}
+static std::wstring voiceRootW(){const int n=MultiByteToWideChar(CP_ACP,0,root.c_str(),int(root.size()),nullptr,0);std::wstring w(size_t((std::max)(0,n)),L'\0');if(n>0)MultiByteToWideChar(CP_ACP,0,root.c_str(),int(root.size()),&w[0],n);return w+L"\\3DD-Voice";}
+// F5 / reset: 0 = original, n = pack n; saved as pilot.ini voice_pack=<folder> (empty = original)
+static void voiceSetPack(int v){
+    voicePackIndex=v>=1&&v<=int(voicePacks.size())?v-1:-1;
+    const std::string value=voicePackIndex<0?std::string():re3voice::EncodePackKey(voicePacks[size_t(voicePackIndex)].info.folder);
+    WritePrivateProfileStringA("pilot","voice_pack",value.c_str(),(root+"\\pilot.ini").c_str());
+    log("VOICE_PACK_SELECTED %s (pilot.ini voice_pack=%s), from the next clip",voicePackIndex<0?"original English":("\""+voicePacks[size_t(voicePackIndex)].folderUtf8+"\"").c_str(),value.c_str());
+}
+// start: packs in 3DD-Voice, speakers.ini, the chosen pack
+static void voiceDiscoverPacks(){
+    const std::wstring voiceRoot=voiceRootW();size_t skipped=0;
+    std::vector<re3voice::PackInfo> found=re3voice::DiscoverPacks(voiceRoot,&skipped);
+    {re3voice::PackInfo fixes;std::string text;
+        if(re3voice::ReadSmallFile(voiceRoot+L"\\speakers.ini",text)){re3voice::ParsePackIni(text,fixes,true);voiceSpeakerFixes=fixes.speakers;
+            log("VOICE_SPEAKERS_INI 3DD-Voice\\speakers.ini entries=%zu%s",voiceSpeakerFixes.size(),fixes.warnings.empty()?"":" (some lines ignored, below)");
+            for(size_t i=0;i<fixes.warnings.size()&&i<10;++i)log("VOICE_SPEAKERS_INI_LINE %s",fixes.warnings[i].c_str());}}
+    for(auto& info:found){
+        std::string notGame;for(size_t i=0;i<info.notGameClips.size()&&i<12;++i)notGame+=(i?", ":"")+info.notGameClips[i]+".wav";
+        if(info.notGameClips.size()>12)notGame+=", ...";
+        char gain[16];sprintf_s(gain,"%+.1f",info.gainDb);
+        log("VOICE_PACK \"%s\" name=\"%s\" name_ru=\"%s\" language=%s author=\"%s\" version=\"%s\" gain_db=%s clips=%zu/%zu lipsync=%s speakers=%zu pack_ini=%s%s%s%s",
+            re3voice::WideToUtf8(info.folder).c_str(),re3voice::WideToUtf8(info.name).c_str(),re3voice::WideToUtf8(info.nameRu).c_str(),info.language.empty()?"-":info.language.c_str(),
+            info.author.c_str(),info.version.c_str(),gain,info.clips.size(),re3voice::GameClipCount(),info.hasLipsync?"yes":"no",info.speakers.size(),info.hasIni?"yes":"no",
+            info.notGameClips.empty()?"":" not_game_clips=",notGame.c_str(),info.clips.empty()?" -> NOT OFFERED (no WAV under a game clip name)":"");
+        for(size_t i=0;i<info.warnings.size()&&i<10;++i)log("VOICE_PACK_INI \"%s\" %s",re3voice::WideToUtf8(info.folder).c_str(),info.warnings[i].c_str());
+        if(info.clips.empty())continue;
+        VoicePackRuntime p;p.folderUtf8=re3voice::WideToUtf8(info.folder);
+        for(char c:info.language)if(isalnum((unsigned char)c)||c=='-'||c=='_')p.language+=c;if(p.language.empty())p.language="?";
+        p.info=std::move(info);voicePacks.push_back(std::move(p));
+    }
+    log("VOICE_PACKS 3DD-Voice: %zu offered of %zu folders%s",voicePacks.size(),found.size(),skipped?(" ("+std::to_string(skipped)+" more folders past the limit of 30 ignored)").c_str():"");
+    char value[1024]="";GetPrivateProfileStringA("pilot","voice_pack","\x01",value,sizeof(value),(root+"\\pilot.ini").c_str());
+    voicePackIndex=-1;
+    if(value[0]=='\x01'){   // no key: the experiment of 11.11 (voice_language=1, never released) = the first pack
+        if(GetPrivateProfileIntA("pilot","voice_language",0,(root+"\\pilot.ini").c_str())==1&&!voicePacks.empty()){voicePackIndex=0;log("VOICE_PACK_CHOSEN \"%s\" (old key voice_language=1, no voice_pack key)",voicePacks[0].folderUtf8.c_str());}
+        else log("VOICE_PACK_CHOSEN original English (no voice_pack key)");
+    }else if(!value[0])log("VOICE_PACK_CHOSEN original English (voice_pack empty)");
+    else{
+        const std::wstring folder=re3voice::DecodePackKey(value);
+        for(size_t i=0;i<voicePacks.size();++i)if(re3voice::SameFolder(voicePacks[i].info.folder,folder)){voicePackIndex=int(i);break;}
+        if(voicePackIndex>=0)log("VOICE_PACK_CHOSEN \"%s\"",voicePacks[size_t(voicePackIndex)].folderUtf8.c_str());
+        else log("VOICE_PACK_MISSING voice_pack=%s: no such pack with clips in 3DD-Voice -> original English",value);
+    }
+}
+// the pack's lipsync.r3lip, read at its first clip
+static const re3face::LipSync* voicePackLip(VoicePackRuntime& p){
+    if(!p.lipState){p.lipState=-1;
+        if(p.info.hasLipsync){std::vector<uint8_t> bytes;std::string error;auto track=std::make_unique<re3face::LipSync>();
+            if(re3voice::ReadFileW(p.info.dir+L"\\lipsync.r3lip",bytes,error)&&track->LoadBytes(std::move(bytes),&error)){p.lip=std::move(track);p.lipState=1;log("VOICE_PACK_LIPSYNC \"%s\" lipsync.r3lip clips=%zu",p.folderUtf8.c_str(),p.lip->ClipCount());}
+            else log("VOICE_PACK_LIPSYNC \"%s\" lipsync.r3lip unusable (%s): automatic lip sync instead",p.folderUtf8.c_str(),error.c_str());}}
+    return p.lipState==1?p.lip.get():nullptr;
+}
+static int voicePackSpeaker(const VoicePackRuntime& p,const std::string& name,const re3face::LipClip* packClip){
+    if(auto it=p.info.speakers.find(name);it!=p.info.speakers.end())return it->second;
+    if(packClip)return int(packClip->speaker);
+    if(auto it=voiceSpeakerFixes.find(name);it!=voiceSpeakerFixes.end())return it->second;
+    const auto* english=faceLipSync.Valid()?faceLipSync.Find(name.c_str()):nullptr;
+    return english?int(english->speaker):-1;
+}
+// the worker: one thread, below normal priority, takes jobs in order; a silent clip (peak below -50 dBFS) gets no track
+static void voiceAutoRun(VoiceAutoJob& job){
+    LARGE_INTEGER f,a,b;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&a);
+    int peak=0;for(const int16_t v:job.pcm)peak=(std::max)(peak,std::abs(int(v)));
+    if(peak<104){job.error="silent (peak below -50 dBFS)";job.state.store(-1,std::memory_order_release);return;}
+    re3lipauto::Track t;std::string error;
+    bool ok=re3lipauto::Analyze(job.pcm.data(),job.frames,job.channels,job.rate,job.speaker==0||job.speaker==7,t,&error);
+    if(ok&&(!t.frameCount||t.frames.size()!=size_t(t.frameCount)*4||!std::isfinite(t.duration))){ok=false;error="malformed track";}
+    if(ok){auto track=std::make_unique<re3face::LipSync>();ok=track->LoadBytes(re3voice::OneClipR3lip(job.name,job.speaker,t.frames,t.frameCount,t.duration),&error);
+        if(ok){job.track=std::move(track);job.trackFrames=t.frameCount;}}
+    QueryPerformanceCounter(&b);job.ms=double(b.QuadPart-a.QuadPart)*1000.0/double(f.QuadPart);
+    std::vector<int16_t>().swap(job.pcm);job.error=error;
+    job.state.store(ok?1:-1,std::memory_order_release);
+}
+static void voiceAutoThread(){
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+    for(;;){
+        std::shared_ptr<VoiceAutoJob> job;
+        {std::unique_lock<std::mutex> lock(voiceAuto->mutex);voiceAuto->wake.wait(lock,[]{return !voiceAuto->queue.empty();});job=voiceAuto->queue.front();voiceAuto->queue.pop_front();}
+        try{voiceAutoRun(*job);}catch(...){job->error="exception";job->state.store(-1,std::memory_order_release);}
+    }
+}
+// game thread: the job of a pack clip (cached, or queued now with the clip's PCM16)
+static std::shared_ptr<VoiceAutoJob> voiceAutoRequest(const VoicePackRuntime& p,const std::string& name,re3voice::Prepared& prep,int speaker){
+    const std::string key=p.folderUtf8+"|"+name;
+    if(auto it=voiceAutoJobs.find(key);it!=voiceAutoJobs.end())return it->second;
+    if(prep.pcm.empty())return nullptr;
+    auto job=std::make_shared<VoiceAutoJob>();job->key=key;job->name=name;job->pack=p.folderUtf8;job->speaker=speaker;
+    job->pcm=std::move(prep.pcm);job->frames=prep.frames;job->channels=prep.channels;job->rate=prep.rate;job->queuedAt=modelClockMs();
+    {std::lock_guard<std::mutex> lock(voiceAuto->mutex);
+        if(!voiceAuto->started){voiceAuto->started=true;std::thread(voiceAutoThread).detach();}
+        voiceAuto->queue.push_back(job);}
+    voiceAuto->wake.notify_one();
+    voiceAutoJobs[key]=job;voiceAutoUnlogged.push_back(job);
+    return job;
+}
+// game thread, every voice poll: one log line per finished job (the worker never writes the log)
+static void voiceAutoLogFinished(){
+    for(size_t i=0;i<voiceAutoUnlogged.size();){
+        auto& job=voiceAutoUnlogged[i];const int state=job->state.load(std::memory_order_acquire);
+        if(!state){++i;continue;}
+        voiceAutoMs+=job->ms;++voiceAutoCount;
+        if(voiceLog())log("VOICE_LIPSYNC_AUTO %s pack=\"%s\" speaker=%d %s frames=%u analysis=%.1fms ready_after=%.0fms (worker thread; session: %u tracks, %.0f ms)",job->name.c_str(),job->pack.c_str(),
+            job->speaker,state==1?"ok":job->error.c_str(),job->trackFrames,job->ms,modelClockMs()-job->queuedAt,voiceAutoCount,voiceAutoMs);
+        voiceAutoUnlogged[i]=voiceAutoUnlogged.back();voiceAutoUnlogged.pop_back();
+    }
+}
+// Native sound object vtable 0x50A8A4: +0x18 load(channel,path), +0x1C play(channel), +0x30 isPlaying(channel),
+// +0x74 load file(holder,path) -> buffer handle, +0x78 create buffer from WAV bytes(bytes,size). voice_wav.h has the RE.
+static int __fastcall voiceFileHook(void* self,void*,void* holder,const char* path){
+    const int pack=voicePackIndex;
+    if(pack>=0&&pack<int(voicePacks.size())&&nativeVoiceCreate){
+        auto& p=voicePacks[size_t(pack)];std::string name;
+        try{
+            name=re3voice::VoiceClipName(path);
+            if(!name.empty()&&p.info.HasClip(name)){
+                const bool lips=modelActive&&modelFaceEnabled;
+                const re3face::LipSync* packLip=lips?voicePackLip(p):nullptr;
+                const re3face::LipClip* packClip=packLip?packLip->Find(name.c_str()):nullptr;
+                const int speaker=lips?voicePackSpeaker(p,name,packClip):-1;
+                const bool wantPcm=lips&&!packClip&&speaker>=0&&!voiceAutoJobs.count(p.folderUtf8+"|"+name);
+                std::vector<uint8_t> bytes;re3voice::Prepared prep;std::string error;const double t0=modelClockMs();
+                const std::wstring file=p.info.dir+L"\\"+std::wstring(name.begin(),name.end())+L".wav";
+                if(re3voice::ReadFileW(file,bytes,error)&&re3voice::PrepareClip(bytes.data(),bytes.size(),p.info.gainDb,wantPcm,prep,error)){
+                    const size_t fileBytes=bytes.size();std::vector<uint8_t>().swap(bytes);const double prepareMs=modelClockMs()-t0;
+                    const int handle=nativeVoiceCreate(self,prep.image.data(),unsigned(prep.image.size()));
+                    if(handle!=-1){
+                        VoiceServed served;strncpy_s(served.name,name.c_str(),_TRUNCATE);served.seconds=prep.seconds;served.format=prep.servedAdpcm?"ms-adpcm":"pcm16";
+                        served.valid=true;served.pack=pack;served.speaker=speaker;
+                        if(packClip){served.track=packLip;served.clip=packClip;served.source="pack";}
+                        else if(lips&&speaker>=0){if((served.autoJob=voiceAutoRequest(p,name,prep,speaker)))served.source="auto";}   // lips start when the worker is done
+                        voiceServed=served;
+                        if(p.logged.insert(name).second&&voiceLog())
+                            log("VOICE_PACK_CLIP %s pack=\"%s\" file=%s served=%s channels=%u rate=%u duration=%.3fs bytes=%zu gain_db=%+.1f read+convert=%.1fms",name.c_str(),p.folderUtf8.c_str(),
+                                re3voice::CodecName(prep.source),served.format,prep.channels,prep.rate,prep.seconds,fileBytes,p.info.gainDb,prepareMs);
+                        if(const auto* original=re3voice::FindGameClip(name.c_str())){
+                            const double originalSeconds=double(original->frames)/double(original->rate);
+                            if(prep.seconds>originalSeconds+0.05&&p.longer.insert(name).second&&voiceLog())
+                                log("VOICE_LONGER %s pack=\"%s\" %.2fs, original %.2fs (+%.2fs): a scene that starts the next line by a timer cuts the end",name.c_str(),p.folderUtf8.c_str(),prep.seconds,originalSeconds,prep.seconds-originalSeconds);
+                        }
+                        return handle;
+                    }
+                    error="the game's WAV parser 409960 refused it";
+                }
+                if(voiceLog())log("VOICE_PACK_REJECTED %s pack=\"%s\": %s -> original clip",name.c_str(),p.folderUtf8.c_str(),error.c_str());
+            }
+        }catch(...){if(voiceLog())log("VOICE_PACK_REJECTED %s pack=\"%s\": exception -> original clip",name.c_str(),p.folderUtf8.c_str());}
+    }
+    return originalVoiceFile(self,holder,path);
+}
 static int __fastcall voiceLoadHook(void* self,void*,int channel,const char* path){
+    if(channel>=0&&channel<0x15&&voiceChannels[channel].playing&&originalVoiceBusy&&originalVoiceBusy(self,channel)){
+        // the native load stops and frees the line still playing on this channel (4094E0)
+        const auto& old=voiceChannels[channel];
+        if(voiceCutLogLines<300){++voiceCutLogLines;log("VOICE_CUT channel=%d name=%s pack=\"%s\" after=%.2fs duration=%.2fs: the next line stops it",channel,old.name,voicePackFolder(old.pack),faceClock()-old.startTime,old.seconds);}
+    }
+    voiceServed=VoiceServed{};
     const int result=originalVoiceLoad(self,channel,path);
     if(channel>=0&&channel<0x15){
         auto& state=voiceChannels[channel];state=VoiceChannelState{};
@@ -126,17 +327,40 @@ static int __fastcall voiceLoadHook(void* self,void*,int channel,const char* pat
                 const auto slash=text.find_last_of("/\\");std::string base=text.substr(slash==std::string::npos?0:slash+1);
                 const auto dot=base.find('.');if(dot!=std::string::npos)base.resize(dot);
                 strncpy_s(state.name,base.c_str(),_TRUNCATE);
-                state.clip=faceLipSync.Valid()?faceLipSync.Find(state.name):nullptr;
+                if(voiceServed.valid&&!_stricmp(voiceServed.name,state.name)){
+                    state.pack=voiceServed.pack;state.seconds=voiceServed.seconds;state.speaker=voiceServed.speaker;state.source=voiceServed.source;
+                    state.track=voiceServed.track;state.clip=voiceServed.clip;state.autoJob=voiceServed.autoJob;
+                }else{
+                    state.track=faceLipSync.Valid()?&faceLipSync:nullptr;state.clip=state.track?state.track->Find(state.name):nullptr;
+                    state.speaker=state.clip?int(state.clip->speaker):-1;state.source=state.clip?"en":"none";
+                    if(const auto* original=re3voice::FindGameClip(re3voice::Upper(state.name).c_str()))state.seconds=double(original->frames)/double(original->rate);
+                }
             }
         }
     }
+    voiceServed=VoiceServed{};
     return result;
 }
 static int __fastcall voicePlayHook(void* self,void*,int channel){
     const int result=originalVoicePlay(self,channel);
     if(channel>=0&&channel<0x15&&voiceChannels[channel].name[0]){
-        auto& state=voiceChannels[channel];state.startTime=faceClock();state.started=true;
-        log("VOICE_START channel=%d name=%s track=%s speaker=%d",channel,state.name,state.clip?"yes":"no",state.clip?int(state.clip->speaker):-1);
+        auto& state=voiceChannels[channel];state.startTime=faceClock();state.started=true;state.playing=true;
+        voiceAutoLogFinished();
+        log("VOICE_START channel=%d name=%s track=%s speaker=%d lang=%s pack=\"%s\" duration=%.3fs lips=%s",channel,state.name,state.clip||state.autoJob?"yes":"no",state.speaker,
+            state.pack>=0?voicePacks[size_t(state.pack)].language.c_str():"en",voicePackFolder(state.pack),state.seconds,state.source);
+    }
+    return result;
+}
+// The game's own poll of the voice channel (state 2 of 4272F0, every frame): the first "not playing" after a start = the
+// line ended (or was stopped): VOICE_END with the time it played.
+static int __fastcall voiceBusyHook(void* self,void*,int channel){
+    const int result=originalVoiceBusy(self,channel);
+    if(!voiceAutoUnlogged.empty())voiceAutoLogFinished();
+    if(!result&&channel>=0&&channel<0x15&&voiceChannels[channel].playing){
+        auto& state=voiceChannels[channel];state.playing=false;
+        if(voiceEndLogLines<800){++voiceEndLogLines;const double played=faceClock()-state.startTime;
+            log("VOICE_END channel=%d name=%s pack=\"%s\" played=%.2fs duration=%.2fs %s",channel,state.name,voicePackFolder(state.pack),played,state.seconds,played+0.12>=state.seconds?"whole":"stopped early");}
+        else if(voiceEndLogLines==800){++voiceEndLogLines;log("VOICE_END_LOG_BUDGET 800 lines reached");}
     }
     return result;
 }
@@ -146,17 +370,27 @@ static bool voiceStillPlaying(int channel){
     auto isPlaying=reinterpret_cast<int(__thiscall*)(void*,int)>(gameBase+0x9300);
     return isPlaying(object,channel)!=0;
 }
+// Installed with or without the HD models (packs need no model); RE3_MERCE.exe: the same methods 32 bytes lower (exe_map.h).
 static void installVoiceHooks(){
     auto table=reinterpret_cast<void**>(gameBase+0x10a8a4);
     if(table[0x18/4]!=reinterpret_cast<void*>(gameBase+0x91c0)||table[0x1c/4]!=reinterpret_cast<void*>(gameBase+0x9240)||table[0x30/4]!=reinterpret_cast<void*>(gameBase+0x9300)){log("FACE_VOICE_HOOKS_SKIPPED sound vtable signature mismatch");return;}
     const uint8_t loadSig[]={0x81,0xec,0x00,0x01,0x00,0x00},playSig[]={0x8b,0x54,0x24,0x04,0x8b,0x01,0x52,0xff,0x50,0x4c},busySig[]={0x8b,0x44,0x24,0x04,0x85,0xc0,0x7c,0x40,0x83,0xf8,0x15};
     if(memcmp(reinterpret_cast<void*>(gameBase+0x91c0),loadSig,sizeof(loadSig))||memcmp(reinterpret_cast<void*>(gameBase+0x9240),playSig,sizeof(playSig))||memcmp(reinterpret_cast<void*>(gameBase+0x9300),busySig,sizeof(busySig))){log("FACE_VOICE_HOOKS_SKIPPED sound method signature mismatch");return;}
+    // voice packs: +0x74 load file 4098A0 (push ecx; mov eax,[esp+8]; ...; mov esi,[eax+24h]) and +0x78 WAV parser 409960
+    const uint8_t fileSig[]={0x51,0x8b,0x44,0x24,0x08,0x53,0x55,0x56,0x8b,0x70,0x24},createSig[]={0x55,0x8b,0xec,0x83,0xec,0x74,0x53,0x56,0x33,0xf6,0x57};
+    voiceDubReady=table[0x74/4]==reinterpret_cast<void*>(gameBase+0x98a0)&&table[0x78/4]==reinterpret_cast<void*>(gameBase+0x9960)&&
+        !memcmp(reinterpret_cast<void*>(gameBase+0x98a0),fileSig,sizeof(fileSig))&&!memcmp(reinterpret_cast<void*>(gameBase+0x9960),createSig,sizeof(createSig));
     originalVoiceLoad=reinterpret_cast<int(__thiscall*)(void*,int,const char*)>(table[0x18/4]);
     originalVoicePlay=reinterpret_cast<int(__thiscall*)(void*,int)>(table[0x1c/4]);
-    DWORD protection,unused;VirtualProtect(table+0x18/4,8,PAGE_READWRITE,&protection);
-    table[0x18/4]=reinterpret_cast<void*>(voiceLoadHook);table[0x1c/4]=reinterpret_cast<void*>(voicePlayHook);
-    VirtualProtect(table+0x18/4,8,protection,&unused);
-    log("FACE_VOICE_HOOKS_INSTALLED lipsync_clips=%zu",faceLipSync.ClipCount());
+    originalVoiceBusy=reinterpret_cast<int(__thiscall*)(void*,int)>(table[0x30/4]);
+    if(voiceDubReady){originalVoiceFile=reinterpret_cast<int(__thiscall*)(void*,void*,const char*)>(table[0x74/4]);nativeVoiceCreate=reinterpret_cast<int(__thiscall*)(void*,const void*,unsigned)>(table[0x78/4]);}
+    DWORD protection,unused;VirtualProtect(table,0x80,PAGE_READWRITE,&protection);
+    table[0x18/4]=reinterpret_cast<void*>(voiceLoadHook);table[0x1c/4]=reinterpret_cast<void*>(voicePlayHook);table[0x30/4]=reinterpret_cast<void*>(voiceBusyHook);
+    if(voiceDubReady)table[0x74/4]=reinterpret_cast<void*>(voiceFileHook);
+    VirtualProtect(table,0x80,protection,&unused);
+    voiceHooksReady=true;
+    log("VOICE_HOOKS_INSTALLED exe=%s packs=%zu chosen=\"%s\" serving=%s",re3exe::gRunning==re3exe::Exe::Merce?"RE3_MERCE":"ResidentEvil3",voicePacks.size(),voicePackFolder(voicePackIndex),
+        voiceDubReady?"ready (+74 4098A0 / +78 409960 verified)":"UNAVAILABLE: +74/+78 signature mismatch, original voices only");
 }
 struct FaceActorRecord{re3face::ActorFace face;re3model::Vec3 eyeWorld{};double eyeTime=-1;bool lipActive=false;};
 // ---------------------------------------------------------------- per-actor state
@@ -664,13 +898,14 @@ static void driveFace(const std::shared_ptr<ModelAsset>& asset,ActorRuntime& act
     const auto head=re3model::Multiply(bones[1],asset->mesh.inverseBind[1]);
     record.eyeWorld=re3model::TransformPoint(head,asset->face.EyeCentre());record.eyeTime=now;
     // lip sync from the voice clips of this actor's speaker id (-1: none)
-    float lip[3]={0,0,0};const char* clipName=nullptr;
+    float lip[3]={0,0,0};const char* clipName=nullptr;const char* clipSource="en";int clipPack=-1;
     for(int c=0;c<0x15&&speaker>=0;++c){auto& v=voiceChannels[c];
-        if(!v.started||!v.clip||int(v.clip->speaker)!=speaker)continue;
+        if(!v.track&&v.autoJob&&v.autoJob->state.load(std::memory_order_acquire)==1){v.track=v.autoJob->track.get();v.clip=v.track->Find(v.name);}   // automatic track ready
+        if(!v.started||!v.clip||!v.track||v.speaker!=speaker)continue;   // voice packs: speaker as resolved at the clip load
         if(now-v.startTime>0.25&&!voiceStillPlaying(c)){v.started=false;continue;}
-        if(faceLipSync.Sample(*v.clip,now-v.startTime,lip)){clipName=v.name;break;}
+        if(v.track->Sample(*v.clip,now-v.startTime,lip)){clipName=v.name;clipSource=v.source;clipPack=v.pack;break;}
     }
-    if(clipName&&!record.lipActive)log("FACE_LIPSYNC %s clip=%s",asset->id.c_str(),clipName);
+    if(clipName&&!record.lipActive)log("FACE_LIPSYNC %s clip=%s source=%s pack=\"%s\"",asset->id.c_str(),clipName,clipSource,voicePackFolder(clipPack));
     record.lipActive=clipName!=nullptr;
     st.values[re3face::Jaw]=re3face::Approach(st.values[re3face::Jaw],lip[0],dt,0.025f);
     st.values[re3face::Wide]=re3face::Approach(st.values[re3face::Wide],lip[1],dt,0.04f);
@@ -2827,6 +3062,8 @@ static void installModels(){
     modelWoundsEnabled=GetPrivateProfileIntA("pilot","wounds",1,(root+"\\pilot.ini").c_str())!=0;   // fix 2026-11-11: live
     modelRenderer.gpuPixelLight=GetPrivateProfileIntA("pilot","gpu_pixel_light",0,(root+"\\pilot.ini").c_str())!=0;
     lightLoadConfig();   // lighting round 2026-11-10
+    voiceDiscoverPacks();   // voice packs 2026-11-11: 3DD-Voice folders, speakers.ini, pilot.ini voice_pack
+    installVoiceHooks();    // with or without the HD models; the English lip tracks are loaded below with the models
     if(!modelActive)return;modelRenderer.setLogger(modelMessage);
     if(GetPrivateProfileIntA("pilot","characters",1,(root+"\\pilot.ini").c_str())){loadActorRules();loadLooks();loadKit();}
     loadWeapons();
@@ -2834,7 +3071,7 @@ static void installModels(){
     if(modelFaceEnabled){
         std::string lipError;
         if(!faceLipSync.Load(root+"/model-pack/lipsync.r3lip",&lipError))log("FACE_LIPSYNC_UNAVAILABLE %s",lipError.c_str());
-        installVoiceHooks();
+        if(voiceHooksReady)log("FACE_VOICE_HOOKS_INSTALLED lipsync_clips=%zu",faceLipSync.ClipCount());
     }
     re3bridge::Callbacks callbacks;callbacks.beginBuild=beginModelBuild;callbacks.prepareActor=prepareModelActor;callbacks.drawJob=drawModelJob;callbacks.message=modelMessage;
     if(!re3bridge::Install(gameBase,callbacks,reinterpret_cast<void*>(frameHook))){modelActive=false;log("MODEL_INSTALL_FAILED keeping original geometry");}

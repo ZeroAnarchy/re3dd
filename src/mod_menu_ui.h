@@ -33,7 +33,9 @@ enum Str {
     S_DescExitTitle, S_DescExitDesktop, S_ExitTitle, S_ExitDesktop, S_PressAgainExit, S_PressAgainQuit, S_ExitNoGame, S_ExitSaveScreen,
     S_ExitNotNow,
     // fix 2026-11-11: why a row is greyed by another row (Host::OptBlocked), the LIGHTING group, the heading of the scheme row
-    S_NeedsHd, S_NeedsEnemies, S_NeedsGpu, S_NeedsFollow, S_NeedsWide, S_NeedsBlood, S_NeedsOwnMovies, S_GroupLight, S_GroupMove, S_Count
+    S_NeedsHd, S_NeedsEnemies, S_NeedsGpu, S_NeedsFollow, S_NeedsWide, S_NeedsBlood, S_NeedsOwnMovies, S_GroupLight, S_GroupMove,
+    // voice packs 2026-11-11: the voice-over row without any pack in 3DD-Voice
+    S_NoVoicePacks, S_Count
 };
 static const Text2 kStr[S_Count] = {
     {L"3DD MENU", L"\u041c\u0415\u041d\u042e 3DD"},
@@ -141,6 +143,7 @@ static const Text2 kStr[S_Count] = {
     {L"needs your own movies", L"\u043d\u0443\u0436\u043d\u044b \u0441\u0432\u043e\u0438 \u0440\u043e\u043b\u0438\u043a\u0438"},
     {L"LIGHTING (experimental)", L"\u041e\u0421\u0412\u0415\u0429\u0415\u041d\u0418\u0415 (\u044d\u043a\u0441\u043f\u0435\u0440\u0438\u043c\u0435\u043d\u0442)"},
     {L"MOVEMENT", L"\u0414\u0412\u0418\u0416\u0415\u041d\u0418\u0415"},
+    {L"no packs in 3DD-Voice", L"\u043d\u0435\u0442 \u043f\u0430\u043a\u0435\u0442\u043e\u0432 \u0432 3DD-Voice"},
 };
 inline const wchar_t* T(Str s, bool ru) { return ru ? kStr[s].ru : kStr[s].en; }
 
@@ -184,7 +187,7 @@ enum OptKind { OptBool, OptChoice, OptNumber };
 // their own; the wounds row sits with the blood (EFFECTS). Greyed rows: Host::OptBlocked.
 enum OptId {
     O_Widescreen, O_WideSmooth, O_WideSpeed, O_WideDelay, O_WidePeek, O_Enabled, O_Models, O_Fps60, O_Motion, O_Face,
-    O_Shadows, O_FlashLight, O_Wounds, O_Blood, O_BloodBright, O_Fire, O_Muzzle, O_Cloud, O_Effects, O_HitSounds,
+    O_Shadows, O_FlashLight, O_Wounds, O_Blood, O_BloodBright, O_Fire, O_Muzzle, O_Cloud, O_Effects, O_HitSounds, O_VoicePack,
     O_PlayerMovies, O_MovieFit, O_GpuModels, O_MovieRgb32, O_MovieSync, O_GlockKneel, O_DodgeAlways, O_Language,
     O_PageCount, O_Scheme = O_PageCount, O_Count
 };
@@ -205,6 +208,9 @@ static const Text2 kSpeedChoices[5] = {{L"None", L"\u041d\u0435\u0442"}, {L"High
 static const Text2 kDelayChoices[6] = {{L"None", L"\u041d\u0435\u0442"}, {L"0.25 s", L"0,25 \u0441"}, {L"0.5 s", L"0,5 \u0441"}, {L"1 s", L"1 \u0441"}, {L"1.5 s", L"1,5 \u0441"}, {L"2 s", L"2 \u0441"}};
 static const Text2 kKneelChoices[2] = {{L"Whole burst", L"\u0412\u0441\u044f \u043e\u0447\u0435\u0440\u0435\u0434\u044c"}, {L"Stands up after 15 (orig.)", L"\u0412\u0441\u0442\u0430\u0451\u0442 \u0447\u0435\u0440\u0435\u0437 15 (\u043e\u0440\u0438\u0433.)"}};
 static const Text2 kLangChoices[3] = {{L"Auto (Windows)", L"\u0410\u0432\u0442\u043e (Windows)"}, {L"English", L"English"}, {L"\u0420\u0443\u0441\u0441\u043a\u0438\u0439", L"\u0420\u0443\u0441\u0441\u043a\u0438\u0439"}};
+// voice packs 2026-11-11: the voice-over row (pilot.ini voice_pack, model_integration.h / voice_packs.h) has a choice count
+// and labels from the host (Host::OptChoiceCount / OptChoiceText): choice 0 = this text, then one per pack in 3DD-Voice
+static const Text2 kVoiceOriginal = {L"Original (English)", L"\u041e\u0440\u0438\u0433\u0438\u043d\u0430\u043b (English)"};
 // defaults = the released pilot.ini / the modules' own defaults (models=1 is written by the installer)
 static const OptionDef kOptions[O_Count] = {
     {"widescreen", 0, OptChoice, {L"Widescreen", L"\u0428\u0438\u0440\u043e\u043a\u0438\u0439 \u044d\u043a\u0440\u0430\u043d"}, 3, kWideChoices, 0, 2, 1, S_GroupScreen,
@@ -265,6 +271,9 @@ static const OptionDef kOptions[O_Count] = {
     {"hit_sound_volume", 100, OptNumber, {L"Bullet hit sounds", L"\u0417\u0432\u0443\u043a\u0438 \u043f\u043e\u043f\u0430\u0434\u0430\u043d\u0438\u0439 \u043f\u0443\u043b\u044c"}, 0, nullptr, 0, 200, 10, S_GroupSound,
      {L"A sound when a bullet hits an enemy's body; the original has none, the mod adds it. The value is its loudness: 100 % is the normal level, \u201cOff\u201d removes the sound.",
       L"\u0417\u0432\u0443\u043a, \u043a\u043e\u0433\u0434\u0430 \u043f\u0443\u043b\u044f \u043f\u043e\u043f\u0430\u0434\u0430\u0435\u0442 \u0432 \u0442\u0435\u043b\u043e \u0432\u0440\u0430\u0433\u0430; \u0432 \u043e\u0440\u0438\u0433\u0438\u043d\u0430\u043b\u0435 \u0435\u0433\u043e \u043d\u0435\u0442 \u2014 \u0434\u043e\u0431\u0430\u0432\u043b\u0435\u043d \u043c\u043e\u0434\u043e\u043c. \u0417\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u2014 \u0433\u0440\u043e\u043c\u043a\u043e\u0441\u0442\u044c: 100 % \u2014 \u043e\u0431\u044b\u0447\u043d\u044b\u0439 \u0443\u0440\u043e\u0432\u0435\u043d\u044c, \u00ab\u0412\u044b\u043a\u043b.\u00bb \u2014 \u0431\u0435\u0437 \u0437\u0432\u0443\u043a\u0430."}, true},
+    {"voice_pack", 0, OptChoice, {L"Voice-over", L"\u041e\u0437\u0432\u0443\u0447\u043a\u0430"}, 1, nullptr, 0, 0, 1, S_GroupSound,   // voice packs 2026-11-11: choices from the host
+     {L"Plays the voices of the game's scenes from a voice pack instead of the original English. Packs are folders in 3DD-Voice next to the game (see README-voice); a line a pack does not have stays original. Takes effect from the next line.",
+      L"\u0413\u043e\u043b\u043e\u0441\u0430 \u0432 \u0441\u0446\u0435\u043d\u0430\u0445 \u0438\u0433\u0440\u044b \u0438\u0437 \u043f\u0430\u043a\u0435\u0442\u0430 \u043e\u0437\u0432\u0443\u0447\u043a\u0438 \u0432\u043c\u0435\u0441\u0442\u043e \u043e\u0440\u0438\u0433\u0438\u043d\u0430\u043b\u044c\u043d\u044b\u0445 \u0430\u043d\u0433\u043b\u0438\u0439\u0441\u043a\u0438\u0445. \u041f\u0430\u043a\u0435\u0442\u044b \u2014 \u043f\u0430\u043f\u043a\u0438 \u0432 3DD-Voice \u0440\u044f\u0434\u043e\u043c \u0441 \u0438\u0433\u0440\u043e\u0439 (\u0441\u043c. README-voice); \u0440\u0435\u043f\u043b\u0438\u043a\u0430, \u043a\u043e\u0442\u043e\u0440\u043e\u0439 \u043d\u0435\u0442 \u0432 \u043f\u0430\u043a\u0435\u0442\u0435, \u0437\u0432\u0443\u0447\u0438\u0442 \u0432 \u043e\u0440\u0438\u0433\u0438\u043d\u0430\u043b\u0435. \u0414\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0441\u043e \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0439 \u0440\u0435\u043f\u043b\u0438\u043a\u0438."}},
     {"player_movies", 1, OptBool, {L"Your own HD movies", L"\u0421\u0432\u043e\u0438 HD-\u0440\u043e\u043b\u0438\u043a\u0438"}, 0, nullptr, 0, 1, 1, S_GroupMovies,
      {L"Plays your own video files instead of the game's movies when they lie in the 3DD-Movies folder next to the game under the movies' names. How to prepare them: README-movies.",
       L"\u0412\u043c\u0435\u0441\u0442\u043e \u0440\u043e\u043b\u0438\u043a\u043e\u0432 \u0438\u0433\u0440\u044b \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u044e\u0442\u0441\u044f \u0432\u0430\u0448\u0438 \u0432\u0438\u0434\u0435\u043e\u0444\u0430\u0439\u043b\u044b, \u0435\u0441\u043b\u0438 \u043f\u043e\u043b\u043e\u0436\u0438\u0442\u044c \u0438\u0445 \u0432 \u043f\u0430\u043f\u043a\u0443 3DD-Movies \u0440\u044f\u0434\u043e\u043c \u0441 \u0438\u0433\u0440\u043e\u0439 \u043f\u043e\u0434 \u0438\u043c\u0435\u043d\u0430\u043c\u0438 \u0440\u043e\u043b\u0438\u043a\u043e\u0432. \u041a\u0430\u043a \u0438\u0445 \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u2014 \u0432 README-movies."}},
@@ -317,6 +326,15 @@ struct Host {
     // round 7 (exit rows). Blocked: S_Count = the row works, else why it is greyed (S_ExitNoGame, S_ExitSaveScreen,
     // S_ExitNotNow, S_Unavailable), shown at the right of the row. The actions close the menu first; the game side
     // carries them out after the menu loop (mod_menu.h). The defaults = a host that cannot do either: both rows greyed.
+    // voice packs 2026-11-11: a choice row whose OptionDef has no choice table (O_VoicePack) asks the host for its choices;
+    // the defaults serve the table (and "Original (English)" alone for the voice-over row)
+    virtual int OptChoiceCount(int id) { return kOptions[id].choice ? kOptions[id].choices : 1; }
+    virtual std::wstring OptChoiceText(int id, int v, bool ru) {
+        const OptionDef& o = kOptions[id];
+        if (o.choice) { const int i = (std::max)(0, (std::min)(o.choices - 1, v)); return ru ? o.choice[i].ru : o.choice[i].en; }
+        if (id == O_VoicePack && v == 0) return ru ? kVoiceOriginal.ru : kVoiceOriginal.en;
+        return std::to_wstring(v);
+    }
     virtual Str ExitTitleBlocked() { return S_Unavailable; }
     virtual Str ExitDesktopBlocked() { return S_Unavailable; }
     virtual void ExitToTitle() {}
@@ -538,6 +556,7 @@ public:
     bool CursorDisabled() { Build(); return rows[size_t(cursor[page])].disabled; }
     int RowCount() { Build(); return int(rows.size()); }
     const std::wstring& Status() const { return status; }
+    std::wstring ValueTextOf(int id, int v) { return ValueText(id, v); }   // test hook (voice packs 2026-11-11)
     // test hooks (offline screenshots)
     void Goto(Page p, int row, int column) { page = p; status.clear(); Build(); col = column; cursor[p] = 0; for (int i = 0; i < int(rows.size()); ++i) if (rows[size_t(i)].selectable && row-- == 0) { cursor[p] = i; break; } dirty = true; }
     void ForceCapture(bool pad, DWORD now) { Build(); StartCapture(pad, now); }
@@ -667,10 +686,9 @@ public:
             } else if (r.type == RowOption) {
                 const float valueX = px0 + pw * 0.66f, noteX = px1 - margin;
                 g.Text(r.label, px0 + margin + 8 * s, cy, text, labelColor, 0, valueX - px0 - margin - pw * 0.15f);
-                const OptionDef& o = kOptions[r.id];
                 const int value = host->OptGet(r.id);
                 const OptStatus st = host->OptState(r.id);
-                std::wstring v = ValueText(o, value);
+                std::wstring v = ValueText(r.id, value);
                 if (sel && !r.disabled) v = L"\u2039  " + v + L"  \u203a";
                 g.Text(v, valueX, cy, text, r.disabled ? kDim : sel ? kWhite : kValue, 1, pw * 0.26f);
                 std::wstring note; DWORD nc = kDim;
@@ -747,9 +765,10 @@ private:
     // press - leaving a game loses the progress since the last save; outside a game (title screen) nothing is lost
     Str ExitBlocked(int link) { return link == LinkExitTitle ? host->ExitTitleBlocked() : host->ExitDesktopBlocked(); }
     Str ExitConfirm(int link) { return link == LinkExitDesktop && host->ExitTitleBlocked() == S_ExitNoGame ? S_PressAgainQuit : S_PressAgainExit; }
-    std::wstring ValueText(const OptionDef& o, int v) {
+    std::wstring ValueText(int id, int v) {
+        const OptionDef& o = kOptions[id];
         if (o.kind == OptBool) return T(v ? S_On : S_Off, ru);
-        if (o.kind == OptChoice) { const int i = (std::max)(0, (std::min)(o.choices - 1, v)); return ru ? o.choice[i].ru : o.choice[i].en; }
+        if (o.kind == OptChoice) return host->OptChoiceText(id, v, ru);   // voice packs 2026-11-11: table or host choices
         if (o.zeroOff && v == 0) return T(S_Off, ru);   // fix 2026-11-11
         return std::to_wstring(v) + L" %";
     }
@@ -849,8 +868,9 @@ private:
             { const Str blocked = host->OptBlocked(r.id); if (blocked != S_Count) { SetStatus(T(blocked, ru), now, true); return; } }   // fix 2026-11-11
             if (host->OptState(r.id) == OptUnavailable) { SetStatus(T(host->OptReason(r.id), ru), now, true); return; }
             int v = host->OptGet(r.id);
-            if (n == NavOk) { v += o.step; if (v > o.hi) v = o.lo; }
-            else { v += n == NavLeft ? -o.step : o.step; v = (std::max)(o.lo, (std::min)(o.hi, v)); }
+            const int hi = o.kind == OptChoice && !o.choice ? (std::max)(o.lo, o.lo + host->OptChoiceCount(r.id) - 1) : o.hi;   // voice packs 2026-11-11
+            if (n == NavOk) { v += o.step; if (v > hi) v = o.lo; }
+            else { v += n == NavLeft ? -o.step : o.step; v = (std::max)(o.lo, (std::min)(hi, v)); }
             if (v != host->OptGet(r.id)) {
                 host->OptSet(r.id, v);
                 if (r.id == O_Language) ru = MenuRussian(v);

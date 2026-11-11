@@ -10,7 +10,7 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
 
 | File in the 1.50 release | Size | SHA-256 |
 |---|---|---|
-| `files\d3d9.dll` | 1,942,528 bytes | `7260a1de0675abe425bafd83a3963de37aad33df89284feb69f2f02cdb83c9b9` |
+| `files\d3d9.dll` | 2,063,872 bytes | `c70afb1ae708e02db0f5f0cc10fd851cb4c0f457b172609f1ff4eaf3469d26ce` |
 
 ## What the DLL does
 
@@ -59,6 +59,12 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
   device-change messages (a hang after focus changes). The experimental lighting (dynamic
   shadows of the HD models on the floor and on the models, light of muzzle flashes) lives in
   `src/model_gpu.h`, `src/model_integration.h` and `src/fx_muzzle.h`.
+- Also since 1.50: voice packs. WAV files in `3DD-Voice\<pack>\` named like the game's voice clips
+  (`src/voice_clips.h`) are served to the game in place of its own clips when the pack is chosen in the
+  menu (`src/voice_packs.h`: discovery, `pack.ini`; `src/voice_wav.h`: PCM 16/24/32-bit, float and
+  MS-ADPCM converted to the layout the game's WAV parser takes). The lip-sync track of a pack clip is
+  computed in the DLL on a worker thread (`src/lipsync_auto.h`, the same analysis the mod's offline tool
+  uses for the English tracks).
 - It does not use the network, start processes or touch the registry. It writes only inside the
   game folder: `runtime.log`, `crash-dumps\*.dmp` after a crash, a `captures\` folder that
   stays empty unless a QA capture is switched on in `pilot.ini`, and `pilot.ini` / `bio3.ini`
@@ -88,7 +94,7 @@ unit; it includes the other headers. `src\d3d9.def` exports `Direct3DCreate9`.
 
 These sources rebuilt with MSVC 19.51.36252 in the folder the release was built in give a
 file that differs from the released `d3d9.dll` only in the link timestamp (in the PE header
-and in the debug directory). Built from a different folder path, the size stays 1,942,528
+and in the debug directory). Built from a different folder path, the size stays 2,063,872
 bytes, but the compiler lays the code out in a different order, so the bytes and the hash
 differ.
 
