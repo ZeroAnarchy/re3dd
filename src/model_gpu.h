@@ -288,6 +288,7 @@ struct Draw {
     // fix 2026-11-08 (wall split): a wall plane in camera space (dot(xyz,camera)+w, positive = the room side) and the side
     // this draw keeps: +1 the room side, -1 beyond the wall, 0 everything (model_integration.h kWallSplit)
     float wallPlane[4]={0,0,0,1},wallSide=0;
+    float bloodHue=0;   // release 1.50: wound decals of a creature with green (1) or olive (2) blood (re3wound::BloodHue, PS options.w)
     // fix 2026-11-08: a draw hidden behind wall masks (bone split) gets its own model depth: its depth never rejects the
     // room-side draws (Nemesis' legs swing in front of his arms while both hang through the R20F04 window)
     bool ownDepth=false;
@@ -833,6 +834,14 @@ float ShadowLit(float3 coord,float facing){
     return sum/9;
 }
 #endif
+// release 1.50 (green blood): options.w = Draw::bloodHue - 0 the texture as drawn, 1 the red blood art of a wound decal in the
+// creatures' green, 2 in olive (the same formula as the CPU path's model shader, model_shader.h)
+float3 BloodHue(float3 c,float hue){
+    if(hue<0.5) return c;
+    float e=max(0,c.r-c.g);
+    float3 tone=hue<1.5?float3(0.25,0.49,0.125):float3(0.69,0.69,0.125);
+    return float3(c.g,c.g,c.b)+e*tone;
+}
 float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOORD1
 #ifdef PIXEL_LIGHT
     ,float3 normal:TEXCOORD2
@@ -844,6 +853,7 @@ float4 main(float4 tint:COLOR0,float2 uv:TEXCOORD0,float3 depthOcclusion:TEXCOOR
     clip(depthOcclusion.x-range.x);clip(range.y-depthOcclusion.x);
     clip(depthOcclusion.z*wallSide.x+wallSide.y);
     float4 texel=tex2D(albedo,uv);
+    texel.rgb=BloodHue(texel.rgb,options.w);
     float coverage=texel.a*tint.a;
     clip(coverage-options.x);
     float3 colour=tint.rgb;

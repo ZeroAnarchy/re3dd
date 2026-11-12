@@ -1244,7 +1244,9 @@ static uint64_t lightGroupsMade=0,lightFramesDrawn=0,lightFlashCount=0,lightNati
 static bool lightOn(){return (lightShadowMode>0||lightFlashOn||lightFireOn)&&modelGpuEnabled&&!modelParity;}
 // The colour of a native shadow object (+0x1C): black-ish = the shadow of a living actor; the two stains are a corpse's blood
 // pool (808010) and the downed Nemesis' purple puddle (10AF10), which other modules replace.
-static bool lightPlainShadow(uint32_t colour){colour&=0xffffffu;return colour!=0x808010u&&colour!=0x10af10u;}
+// Release 1.50 (green blood): the creatures' green and olive stains are stains too (model_wounds.h stainKind); before, they
+// counted as the black blob of a living actor and the lighting hid them - no pool at all under a dead spider in HD.
+static bool lightPlainShadow(uint32_t colour){return re3wound::stainKind(colour)<0;}
 static const float kLightFlashCurve[5]={1.f,0.8f,0.45f,0.2f,0.08f};
 static const float kLightFlashColour[3]={1.f,0.74f,0.40f};
 // The flash light of a build: the strongest one alive (age in builds).
@@ -1878,6 +1880,10 @@ static int appendGpuJobs(const std::shared_ptr<ModelAsset>& asset,const std::vec
     if(modelObserved.insert("prepared:"+asset->id).second)log("MODEL_PREPARED %s triangles=%zu buckets=%u-%u skin=%u H=%.1f offset=%.1f,%.1f scale=%.3f,%.3f zsf3=%d gpu",asset->id.c_str(),asset->mesh.indices.size()/3,unsigned(draw->bucketLow),unsigned(draw->bucketHigh),unsigned(draw->skin),projection.h,projection.offsetX,projection.offsetY,projection.scaleX,projection.scaleY,projection.zsf3);
     return 1;
 }
+// Release 1.50 (green blood): the hue of the wound decals drawn now (re3wound::BloodHue of the actor whose wounds these are;
+// set around the wound block of the actor's preparation): the GPU path passes it to the shader in Draw::bloodHue, the CPU
+// path as the material flags BloodGreen / BloodOlive.
+static uint8_t woundHue=re3wound::HueRed;
 // Wounds of a body drawn by the GPU path: the corners keep the body's bind vertex and weights, the shader adds the offset and
 // the pull toward the eye of appendWounds. Rebuilt each frame (a few hundred vertices at most per wound).
 // 03.11b: meshFilter = only the wounds of that mesh (Wound::mesh; "" = the body); null = all (unused).
@@ -1894,6 +1900,7 @@ static void appendWoundsGpu(const std::vector<re3wound::Wound>& wounds,const Mod
     auto draw=std::make_shared<re3gpu::Draw>();draw->owner=decals;draw->mesh=mesh;draw->name="wound-decals";draw->skin=re3gpu::Skin::Decal;draw->textures=decals->textures;
     std::memcpy(draw->cameraRows,bodyDraw->cameraRows,sizeof(draw->cameraRows));draw->h=bodyDraw->h;draw->offsetX=bodyDraw->offsetX;draw->offsetY=bodyDraw->offsetY;draw->pixelOffsetX=bodyDraw->pixelOffsetX;draw->pixelOffsetY=bodyDraw->pixelOffsetY;draw->nearPlane=bodyDraw->nearPlane;
     std::memcpy(draw->tint,bodyDraw->tint,sizeof(draw->tint));for(unsigned k=0;k<3;++k)draw->tint[k]*=re3wound::bloodBrightness;   // fx 2026-11-11e: the blood brightness
+    draw->bloodHue=float(woundHue);   // release 1.50: green blood of the creatures
     draw->light=bodyDraw->light;draw->lit=bodyDraw->lit;draw->palette=bodyDraw->palette;draw->previous=bodyDraw->previous;draw->paletteRegs=bodyDraw->paletteRegs;
     std::memcpy(draw->rect,bodyDraw->rect,sizeof(draw->rect));draw->epoch=bodyDraw->epoch;draw->bucketHigh=bodyDraw->bucketHigh;draw->bucketLow=bodyDraw->bucketLow;draw->bucketDepth=bodyDraw->bucketDepth;draw->nearClosed=bodyDraw->nearClosed;
     for(unsigned k=0;k<3;++k)draw->eye[k]=view.m[k*4+3]-bodyDraw->origin[k];
@@ -2149,6 +2156,7 @@ static void takeShotsInto(const re3bridge::ActorContext& context,ActorRuntime& a
             actor.wounds.push_back(std::move(w.wound));}
         if(count){re3wound::ShotBlood blood;blood.actor=context.actor;blood.entry=made[0].where;blood.normal=made[0].normal;blood.direction=direction;
             blood.weapon=it->weapon;blood.serial=context.serial;blood.colour=actor.bloodLightView;
+            blood.hue=context.isPlayer?re3wound::HueRed:re3wound::bloodHueOf(context.modelId);   // release 1.50: green blood of the creatures
             blood.floorY=actorFloorY(context.actor);   // fix 2026-11-11: was the actor's own y (in the air while it jumps)
             if(count>1&&made[1].exit){blood.hasExit=true;blood.exit=made[1].where;}
             if(re3wound::shotBlood.size()<64)re3wound::shotBlood.push_back(blood);}
@@ -2187,6 +2195,7 @@ static void appendWounds(const std::vector<re3wound::Wound>& wounds,const std::v
     const re3model::AssetLighting* bodyLight=found!=re3model::AssetLightingStore().end()&&found->second.sculpted&&bodyProjection.shade==&re3model::ShadeNativeNccs&&bodyProjection.shadeContext?&found->second:nullptr;
     for(unsigned texture=0;texture<re3wound::kTextures;++texture){
         auto material=decals->mesh.materials[texture];material.firstIndex=uint32_t(mesh.indices.size());
+        material.flags|=re3model::BloodHueFlags(woundHue);   // release 1.50: green blood of the creatures
         for(const auto& wound:wounds){
             if(meshFilter&&wound.mesh!=*meshFilter)continue;
             if(wound.texture!=texture||std::any_of(wound.corners.begin(),wound.corners.end(),[&](uint32_t v){return v>=body.size();}))continue;
@@ -2908,6 +2917,8 @@ static bool prepareModelActor(void*,const re3bridge::ActorContext& context,re3br
     if(!bodyReady)return false;
     if(wearsOverlay)appendOverlay(name,rule->overlay,bodySkinned,projection,plan);
     if(woundsWanted){const auto* hiddenBody=zones||partMaterials?&hiddenMaterials:nullptr;static const std::string bodyMesh;
+        woundHue=context.isPlayer?re3wound::HueRed:re3wound::bloodHueOf(context.modelId);   // release 1.50: green blood of the creatures
+        struct HueReset{~HueReset(){woundHue=re3wound::HueRed;}}hueReset;
         if(!kit.any){
             // no kit part this frame: the 2 Nov path (wounds a kit part got earlier in the visit are not the body's: left out)
             if(!bodySkinned.empty())takeShots(context,actor,*body,bodySkinned,hiddenBody,name);

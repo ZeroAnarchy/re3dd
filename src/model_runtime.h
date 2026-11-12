@@ -171,7 +171,11 @@ static_assert(sizeof(Header)==64&&sizeof(Vertex)==48&&sizeof(Matrix3x4)==48&&siz
 // Leather (fx 2026-11-11e, runtime only, set from the pack's leather.txt): the GPU path draws the material with the
 // LEATHER shaders (model_gpu.h: the usual lit material, and where the albedo is dark and colourless a bumped normal, two
 // highlight lobes of the native lights and a fresnel reflection). The CPU path draws it plain.
-enum MaterialFlags : std::uint32_t { TwoSided=1, AlphaCutout=2, AlphaBlend=4, Unlit=8, GrowthMask=16, Gem=32, Metal=64, Leather=128 };
+// BloodGreen / BloodOlive (release 1.50, runtime only, the CPU path: blood_fx.h materials and wound decals of the creatures,
+// model_wounds.h BloodHue): the red blood art is drawn in the native green / olive of the creature's blood (model_shader.h).
+enum MaterialFlags : std::uint32_t { TwoSided=1, AlphaCutout=2, AlphaBlend=4, Unlit=8, GrowthMask=16, Gem=32, Metal=64, Leather=128, BloodGreen=256, BloodOlive=512 };
+inline std::uint32_t BloodHueFlags(unsigned hue){return hue==1?BloodGreen:hue==2?BloodOlive:0u;}
+inline float BloodHueOfFlags(std::uint32_t flags){return (flags&BloodGreen)?1.f:(flags&BloodOlive)?2.f:0.f;}
 // gem.txt values of a Gem material, in the order of the GEM pixel shader constants c14..c18 (model_gpu.h).
 constexpr unsigned kGemParams=20;
 // metal.txt values of a Metal material, in the order of the METAL pixel shader constants c14..c17 (model_gpu.h).

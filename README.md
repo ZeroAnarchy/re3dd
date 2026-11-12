@@ -10,7 +10,7 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
 
 | File in the 1.50 release | Size | SHA-256 |
 |---|---|---|
-| `files\d3d9.dll` | 2,248,192 bytes | `4bce15c142a445608097b986891b4063c4966c5266614e3c046030cafe7e72ca` |
+| `files\d3d9.dll` | 2,248,704 bytes | `5a7b9512d586b4234fa863050a81422c0e81f14acf19a74371c6393751c6d61c` |
 
 ## What the DLL does
 
@@ -75,6 +75,12 @@ DLL's config file are in `package/`, byte for byte as they are in the archive.
   (`src/model_integration.h`); the HD blood pools are partly see-through (`src/blood_fx.h`, the opacity
   of the growth shader in `src/model_shader.h`). Switches in `pilot.ini`: `leather_fx`, `nemesis_slime`,
   `nemesis_slime_brightness`, `fire_light`, `shadow_over_masks`, `blood_pool_transparency`.
+- Also in 1.50: the spiders, Drain Deimos, Brain Suckers, worms and the Grave Digger bleed in the
+  native green / olive of their blood: the HD wound decals, sprays, drops, splats and pools take the
+  hue of the creature (`src/model_wounds.h` `bloodHueOf`, `stainKind`), the pixel shaders turn the red
+  art into it (`BloodHue` in `src/model_shader.h` and `src/model_gpu.h`), and the creatures' green
+  stains are HD pools instead of being hidden as shadows (`src/blood_fx.h`, `lightPlainShadow` in
+  `src/model_integration.h`).
 - It does not use the network, start processes or touch the registry. It writes only inside the
   game folder: `runtime.log`, `crash-dumps\*.dmp` after a crash, a `captures\` folder that
   stays empty unless a QA capture is switched on in `pilot.ini`, and `pilot.ini` / `bio3.ini`
@@ -104,7 +110,7 @@ unit; it includes the other headers. `src\d3d9.def` exports `Direct3DCreate9`.
 
 These sources rebuilt with MSVC 19.51.36252 in the folder the release was built in give a
 file that differs from the released `d3d9.dll` only in the link timestamp (in the PE header
-and in the debug directory). Built from a different folder path, the size stays 2,248,192
+and in the debug directory). Built from a different folder path, the size stays 2,248,704
 bytes, but the compiler lays the code out in a different order, so the bytes and the hash
 differ.
 

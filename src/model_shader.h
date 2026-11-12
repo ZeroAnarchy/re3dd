@@ -31,8 +31,18 @@ sampler2D stpMap : register(s1);
 // x=coverage cutoff, y=-1 all/0 opaque-STP/1 semitransparent-STP/2 growth (s1 = reach map, tint.a = progress,
 // w = edge sharpness), z=opacity.
 float4 options : register(c0);
+// release 1.50 (green blood): x = 0 the texture as drawn, 1 the red blood art in the creatures' green, 2 in olive. The red's
+// excess over green goes into the native tone of that blood (palette rows 1 / 7 of the blot set over row 0), the rest stays.
+float4 recolour : register(c1);
+float3 BloodHue(float3 c,float hue){
+    if(hue<0.5) return c;
+    float e=max(0,c.r-c.g);
+    float3 tone=hue<1.5?float3(0.25,0.49,0.125):float3(0.69,0.69,0.125);
+    return float3(c.g,c.g,c.b)+e*tone;
+}
 float4 main(float4 tint : COLOR0, float2 uv : TEXCOORD0) : COLOR0 {
     float4 texel=tex2D(albedo,uv);
+    texel.rgb=BloodHue(texel.rgb,recolour.x);
     float coverage=texel.a*tint.a;
     if(options.y>1.5) coverage=texel.a*saturate((tint.a-tex2D(stpMap,uv).r)*options.w);
     clip(coverage-options.x);
@@ -203,6 +213,7 @@ class ModelRenderer {
         // blood round 2026-11-07: a reach map in s1 (drawSlice binds the stp texture there)
         if(selector<0&&(material.flags&GrowthMask)&&material.textures.stp){constants[1]=2;constants[3]=56;constants[2]=growthOpacity;}   // release 1.50: + the pools' opacity
         HRESULT hr=device_->SetPixelShaderConstantF(0,constants,1);if(FAILED(hr))return hr;
+        {const float recolour[4]={BloodHueOfFlags(material.flags),0,0,0};hr=device_->SetPixelShaderConstantF(1,recolour,1);if(FAILED(hr))return hr;}   // release 1.50: green blood
         const std::pair<D3DRENDERSTATETYPE,DWORD> states[]={
             {D3DRS_ZENABLE,useDepth?D3DZB_TRUE:D3DZB_FALSE},{D3DRS_ZWRITEENABLE,useDepth&&!blended},
             {D3DRS_ALPHABLENDENABLE,blended},{D3DRS_SRCBLEND,source},{D3DRS_DESTBLEND,destination},{D3DRS_BLENDOP,operation}};
@@ -220,7 +231,7 @@ class ModelRenderer {
         static constexpr D3DSAMPLERSTATETYPE kSampler[]={D3DSAMP_ADDRESSU,D3DSAMP_ADDRESSV,D3DSAMP_MINFILTER,D3DSAMP_MAGFILTER,D3DSAMP_MIPFILTER,D3DSAMP_SRGBTEXTURE};
         DWORD render[sizeof(kRender)/sizeof(kRender[0])]{},sampler[2][sizeof(kSampler)/sizeof(kSampler[0])]{},fvf=0;
         IDirect3DBaseTexture9* texture[2]{};IDirect3DVertexShader9* vertexShader=nullptr;IDirect3DPixelShader9* pixelShader=nullptr;
-        IDirect3DVertexDeclaration9* declaration=nullptr;IDirect3DVertexBuffer9* stream=nullptr;UINT streamOffset=0,streamStride=0;float constant[4]{};
+        IDirect3DVertexDeclaration9* declaration=nullptr;IDirect3DVertexBuffer9* stream=nullptr;UINT streamOffset=0,streamStride=0;float constant[8]{};   // c0..c1 (release 1.50: c1 = the blood hue)
         void release(){for(auto& t:texture)if(t){t->Release();t=nullptr;}
             if(vertexShader)vertexShader->Release();if(pixelShader)pixelShader->Release();if(declaration)declaration->Release();if(stream)stream->Release();
             vertexShader=nullptr;pixelShader=nullptr;declaration=nullptr;stream=nullptr;}
@@ -232,7 +243,7 @@ class ModelRenderer {
             if(SUCCEEDED(hr))hr=d->GetVertexShader(&vertexShader);if(SUCCEEDED(hr))hr=d->GetPixelShader(&pixelShader);
             if(SUCCEEDED(hr))hr=d->GetFVF(&fvf);if(SUCCEEDED(hr))hr=d->GetVertexDeclaration(&declaration);
             if(SUCCEEDED(hr))hr=d->GetStreamSource(0,&stream,&streamOffset,&streamStride);
-            if(SUCCEEDED(hr))hr=d->GetPixelShaderConstantF(0,constant,1);
+            if(SUCCEEDED(hr))hr=d->GetPixelShaderConstantF(0,constant,2);
             if(FAILED(hr))release();
             return hr;
         }
@@ -244,7 +255,7 @@ class ModelRenderer {
             keep(d->SetVertexShader(vertexShader));keep(d->SetPixelShader(pixelShader));
             keep(fvf?d->SetFVF(fvf):d->SetVertexDeclaration(declaration));
             keep(d->SetStreamSource(0,stream,streamOffset,streamStride));
-            keep(d->SetPixelShaderConstantF(0,constant,1));
+            keep(d->SetPixelShaderConstantF(0,constant,2));
             release();return first;
         }
     };
@@ -636,7 +647,7 @@ public:
                     const std::uint32_t flags=d.mesh->materialFlags[m];if(((flags&AlphaBlend)!=0)!=(phase!=0))return false;
                     float colour[4];for(unsigned k=0;k<4;++k)colour[k]=d.mesh->materialColour[m*4+k]*d.tint[k];
                     device_->SetVertexShaderConstantF(16,colour,1);
-                    const float options[4]={(flags&AlphaCutout)?0.5f:(0.5f/255.f),-1,1,0};device_->SetPixelShaderConstantF(0,options,1);
+                    const float options[4]={(flags&AlphaCutout)?0.5f:(0.5f/255.f),-1,1,d.bloodHue};device_->SetPixelShaderConstantF(0,options,1);   // release 1.50: w = the blood hue
                     const bool wanted=d.lit&&!(flags&Unlit);
                     if(wanted!=lit){lit=wanted;float profile[4];std::memcpy(profile,d.light.profile1,16);profile[2]=lit?1.f:0.f;device_->SetVertexShaderConstantF(15,profile,1);if(variant)device_->SetPixelShaderConstantF(12,profile,1);}
                     hr=device_->SetTexture(0,d.textures[m].albedo);return SUCCEEDED(hr);};

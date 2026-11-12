@@ -37,8 +37,26 @@ constexpr std::size_t kMaxWounds=24;
 // 3 shotgun pellets, 4 exit wound
 constexpr unsigned kTextures=5;
 enum WoundTexture : std::uint8_t {WoundEntry=0,WoundTorn=1,WoundRun=2,WoundShotgun=3,WoundExit=4};
+// Release 1.50 (user 12.11: "spiders, Drain Deimos, Brain Suckers and worms have green pools and sprays in the original; give
+// them the same HD blood as the zombies, coloured green, with the same brightness and transparency settings"). The hue of
+// the HD blood (wound decals, sprays, drops, floor splats, pools): the red art drawn as is, or turned into the native colour
+// of the creature's blood by the shaders (model_shader.h / model_gpu.h BloodHue) - nothing new is loaded.
+//  - green: the native palette row 1 of the blot set (~22,43,11) and the stains EF409F (Drain Deimos / Brain Sucker 23 28,
+//    baby spider 26), BF10BF and BF407F (giant spider 25); the stain colour is subtracted from the floor (tpage D9), green
+//    stays;
+//  - olive: the Grave Digger and the worms (30 33 32): hit blood = palette row 7 (~61,61,11), stain BF3030 (blue taken away).
+enum BloodHue : std::uint8_t {HueRed=0,HueGreen=1,HueOlive=2,kBloodHues=3};
+inline std::uint8_t bloodHueOf(std::uint8_t model){
+    switch(model){case 0x23:case 0x25:case 0x26:case 0x28:return HueGreen;case 0x30:case 0x32:case 0x33:return HueOlive;default:return HueRed;}
+}
+// A native shadow's colour (+0x1C, low byte = red): -1 the plain shadow of a living actor (808080 and other greys), else the
+// stain a death routine made of it: 0 red (808010, the zombies and most enemies), 1 green, 2 olive, 3 the downed Nemesis'
+// purple puddle (10AF10, fx_nemesis_cloud.h).
+inline int stainKind(std::uint32_t colour){
+    switch(colour&0xffffffu){case 0x808010u:return HueRed;case 0xef409fu:case 0xbf10bfu:case 0xbf407fu:return HueGreen;case 0xbf3030u:return HueOlive;case 0x10af10u:return 3;default:return -1;}
+}
 // One shot's result for the blood effects (blood_fx.h): where it went in and, when it left the body, where it came out.
-struct ShotBlood{void* actor=nullptr;Vec3 entry{},direction{},normal{},exit{};bool hasExit=false;std::uint8_t weapon=0;std::uint32_t serial=0;std::uint32_t colour=0xffffffffu;float floorY=0;};
+struct ShotBlood{void* actor=nullptr;Vec3 entry{},direction{},normal{},exit{};bool hasExit=false;std::uint8_t weapon=0;std::uint32_t serial=0;std::uint32_t colour=0xffffffffu;float floorY=0;std::uint8_t hue=HueRed;};
 static std::vector<ShotBlood> shotBlood;
 inline bool isShotgun(std::uint8_t weapon){return weapon==4||weapon==0x10||weapon==0x13;}
 

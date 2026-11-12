@@ -31,10 +31,12 @@ static const std::uint8_t debugShadowKey[4]{};
 static bool shadowHooked=false;
 struct Config{float coneAnchor[2]{0.02f,0.53f};unsigned coneFrames=14,puffFrames=11;float dropAngle[16]{},dropElong[16]{},dropSize[16]{};bool loaded=false;};
 static Config config;
-struct Pool{const void* shadow=nullptr;const void* actor=nullptr;Vec3 centre{};float size=0,angle=0,w0=0;std::uint8_t variant=0;std::uint32_t born=0,seen=0,colour=0xff808080u;bool logged=false;};
-struct Splat{Vec3 pos{};float size=0,angle=0;std::uint8_t cell=0;std::uint32_t colour=0xff808080u;};
-struct Burst{Vec3 pos{},dir{};float size=0,roll=0;std::uint8_t material=kPuffMaterial;std::uint32_t born=0,colour=0xff808080u;bool directed=false;};
-struct Drop{Vec3 pos{},vel{};float size=0,floorY=0;std::uint8_t cell=0;std::uint32_t born=0,colour=0xff808080u;};
+// release 1.50 (green blood, model_wounds.h BloodHue): every pool, splat, spray and drop carries the hue of the blood it came
+// from; drawBlood draws hue h with materials h*8 .. h*8+7 (the same textures, the hue as material flags)
+struct Pool{const void* shadow=nullptr;const void* actor=nullptr;Vec3 centre{};float size=0,angle=0,w0=0;std::uint8_t variant=0,hue=0;std::uint32_t born=0,seen=0,colour=0xff808080u;bool logged=false;};
+struct Splat{Vec3 pos{};float size=0,angle=0;std::uint8_t cell=0,hue=0;std::uint32_t colour=0xff808080u;};
+struct Burst{Vec3 pos{},dir{};float size=0,roll=0;std::uint8_t material=kPuffMaterial,hue=0;std::uint32_t born=0,colour=0xff808080u;bool directed=false;};
+struct Drop{Vec3 pos{},vel{};float size=0,floorY=0;std::uint8_t cell=0,hue=0;std::uint32_t born=0,colour=0xff808080u;};
 static std::vector<Pool> pools;
 static std::deque<Splat> splats;
 static std::vector<Burst> bursts;
@@ -72,9 +74,13 @@ inline const void* actorOfShadow(const void* shadow){
     if(accessible(player,0x164)&&read<const void*>(player,0x160)==shadow)return player;
     return nullptr;
 }
-inline bool bloodShadow(const std::uint8_t* shadow){return (read<std::uint32_t>(shadow,0x1c)&0xffffffu)==0x808010u;}
+// The stain of a corpse: the zombies' red 808010, and (release 1.50, user 12.11) the creatures' green (EF409F BF10BF BF407F)
+// and olive (BF3030) stains, which their death routines write the same way (and/or over +1C and +44: 48C7xx 48D512 4914B9
+// 4B8C11 4B90D4, 483846 4893B8). -1: no blood stain (a plain shadow, or the downed Nemesis' purple puddle).
+inline int bloodShadowHue(const std::uint8_t* shadow){const int kind=re3wound::stainKind(read<std::uint32_t>(shadow,0x1c));return kind>=0&&kind<re3wound::kBloodHues?kind:-1;}
 inline void poolFromShadow(std::uint8_t* shadow){
-    if(!accessible(shadow,0x68,true)||!bloodShadow(shadow))return;
+    if(!accessible(shadow,0x68,true))return;
+    const int hue=bloodShadowHue(shadow);if(hue<0)return;
     // a corpse's shadow is no longer updated by 457130 (flag 4 stays as it was last set): a known pool keeps going
     // while the stain stays blood red; a new one needs the stain shown (flag 4) once
     Pool* known=nullptr;for(auto& p:pools)if(p.shadow==shadow){known=&p;break;}
@@ -87,6 +93,10 @@ inline void poolFromShadow(std::uint8_t* shadow){
     if(!pool){
         if(pools.size()>=kMaxPools)pools.erase(pools.begin());
         pools.push_back({});pool=&pools.back();pool->shadow=shadow;pool->actor=actorOfShadow(shadow);pool->born=tick;pool->w0=(std::max)(w,h);
+        pool->hue=std::uint8_t(hue);
+        // a creature known by its type keeps its own hue (a red-staining actor of a green-blooded type does not exist; this
+        // only matters if a creature's death routine ever wrote a stain colour not in the table)
+        if(pool->actor&&hue!=re3wound::HueRed){const auto type=re3wound::bloodHueOf(read<std::uint8_t>(pool->actor,0x4a));if(type!=re3wound::HueRed)pool->hue=type;}
         std::uint32_t seed=std::uint32_t(reinterpret_cast<std::uintptr_t>(shadow)*2654435761u)^(bloodRoom*40503u)^tick;
         seed=seed*1664525u+1013904223u;pool->variant=std::uint8_t((seed>>12)%kPools);
         // the body's long axis when the parts can tell (head part 1 from the root part 0), else the shadow's angle
@@ -100,9 +110,13 @@ inline void poolFromShadow(std::uint8_t* shadow){
     // the native stain grows 8 a frame for 90 frames: the HD pool takes the size it will end at (and more if it keeps growing)
     // 1.5x: the native stain is a soft blob that reads ~1.9 m wide around a corpse (diag capture 07.11); the HD pool's
     // outline fills ~85 % of its square, so the same reach needs the larger square
-    pool->size=(std::max)((std::max)(w,h),pool->w0+720.f)*1.5f;
+    // release 1.50: the creatures' stains do not grow 8 a frame (their death routines only colour the shadow): their pool takes
+    // the stain's own size, with the same 1.5x for the soft blob, and follows it if it ever grows
+    if(hue==re3wound::HueRed)pool->size=(std::max)((std::max)(w,h),pool->w0+720.f)*1.5f;
+    else pool->size=(std::max)(pool->size,(std::max)(w,h)*1.5f);
     if(pool->actor){const auto found=actorRuntime.find(const_cast<void*>(pool->actor));if(found!=actorRuntime.end())pool->colour=found->second.bloodLightUp;}
-    if(!pool->logged){pool->logged=true;log("BLOOD_POOL start actor=%p shadow=%p at=%.0f,%.0f,%.0f size=%.0fx%.0f final=%.0f angle=%.2f variant=%u light=%06x",pool->actor,shadow,centre.x,centre.y,centre.z,w,h,pool->size,pool->angle,unsigned(pool->variant),pool->colour&0xffffffu);}
+    if(!pool->logged){pool->logged=true;log("BLOOD_POOL start actor=%p type=%02x shadow=%p stain=%06x hue=%u at=%.0f,%.0f,%.0f size=%.0fx%.0f final=%.0f angle=%.2f variant=%u light=%06x",pool->actor,
+        pool->actor?unsigned(read<std::uint8_t>(pool->actor,0x4a)):0xffu,shadow,read<std::uint32_t>(shadow,0x1c)&0xffffffu,unsigned(pool->hue),centre.x,centre.y,centre.z,w,h,pool->size,pool->angle,unsigned(pool->variant),pool->colour&0xffffffu);}
 }
 using ShadowUpdate=void(__cdecl*)(void*,int,int,int);
 static ShadowUpdate originalShadow=nullptr;
@@ -122,8 +136,8 @@ inline void spawnFromShots(){
     for(const auto& s:shots){
         const bool shotgun=re3wound::isShotgun(s.weapon);const float power=shotgun?1.5f:s.weapon==5?1.35f:1.f;
         const Vec3 dir=re3model::Normalize(s.direction),out=re3model::Normalize(s.normal);
-        if(bursts.size()<kMaxBursts){Burst b;b.pos=s.entry+out*12.f;b.size=rnd(540.f,700.f)*power;b.roll=rnd()*6.2831853f;b.material=kPuffMaterial;b.born=tick;b.colour=s.colour;bursts.push_back(b);}
-        if(bursts.size()<kMaxBursts){Burst b;b.material=kConeMaterial;b.born=tick;b.colour=s.colour;b.directed=true;
+        if(bursts.size()<kMaxBursts){Burst b;b.pos=s.entry+out*12.f;b.size=rnd(540.f,700.f)*power;b.roll=rnd()*6.2831853f;b.material=kPuffMaterial;b.born=tick;b.colour=s.colour;b.hue=s.hue;bursts.push_back(b);}
+        if(bursts.size()<kMaxBursts){Burst b;b.material=kConeMaterial;b.born=tick;b.colour=s.colour;b.hue=s.hue;b.directed=true;
             if(s.hasExit){b.pos=s.exit;b.dir=dir;b.size=rnd(1150.f,1450.f)*power;}
             else{b.pos=s.entry+out*8.f;b.dir=re3model::Normalize(out*0.8f-dir*0.2f+Vec3{0,-0.25f,0});b.size=rnd(550.f,720.f)*power;}
             bursts.push_back(b);}
@@ -137,7 +151,7 @@ inline void spawnFromShots(){
             const Vec3 jitter{rnd(-0.55f,0.55f),rnd(-0.75f,0.25f),rnd(-0.55f,0.55f)};
             d.vel=re3model::Normalize(base+jitter)*rnd(34.f,82.f)*(fromExit?1.25f:1.f);
             d.pos=(fromExit?s.exit:s.entry)+d.vel*0.5f;d.size=rnd(22.f,48.f)*(shotgun?1.1f:1.f);d.floorY=s.floorY;
-            static const std::uint8_t cells[]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};d.cell=cells[unsigned(rnd()*15.99f)];d.born=tick;d.colour=s.colour;drops.push_back(d);}
+            static const std::uint8_t cells[]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};d.cell=cells[unsigned(rnd()*15.99f)];d.born=tick;d.colour=s.colour;d.hue=s.hue;drops.push_back(d);}
         ++burstsSpawned;
     }
     shots.clear();
@@ -150,7 +164,7 @@ inline void stepDrops(){
         if(move){it->vel.y+=10.5f;it->vel=it->vel*0.993f;it->pos=it->pos+it->vel;}
         if(it->pos.y>=it->floorY-2.f){
             if(splats.size()>=kMaxSplats)splats.pop_front();
-            Splat sp;sp.pos={it->pos.x,it->floorY-2.f,it->pos.z};sp.size=it->size*rnd(2.2f,3.6f);sp.angle=rnd()*6.2831853f;sp.cell=std::uint8_t(rnd()*7.99f);sp.colour=it->colour;splats.push_back(sp);++splatsMade;
+            Splat sp;sp.pos={it->pos.x,it->floorY-2.f,it->pos.z};sp.size=it->size*rnd(2.2f,3.6f);sp.angle=rnd()*6.2831853f;sp.cell=std::uint8_t(rnd()*7.99f);sp.colour=it->colour;sp.hue=it->hue;splats.push_back(sp);++splatsMade;
             it=drops.erase(it);continue;}
         if((tick-it->born)/debugSlow>75){it=drops.erase(it);continue;}
         ++it;
@@ -204,9 +218,10 @@ inline void replaceNativeSpray(const Vec3& at){
     const auto* actor=nearestActor(at);
     re3wound::ShotBlood s;s.actor=nullptr;s.entry=at;s.direction=dir;s.normal=dir*-1.f;s.hasExit=false;s.weapon=0;s.colour=0xffb4aca4u;
     s.floorY=actorFloorY(actor?actor:player);   // fix 2026-11-11: the floor under it, not its own y
-    if(actor){const auto found=actorRuntime.find(const_cast<std::uint8_t*>(actor));if(found!=actorRuntime.end())s.colour=found->second.bloodLightView;}
+    if(actor){const auto found=actorRuntime.find(const_cast<std::uint8_t*>(actor));if(found!=actorRuntime.end())s.colour=found->second.bloodLightView;
+        if(actor!=player)s.hue=re3wound::bloodHueOf(read<std::uint8_t>(actor,0x4a));}   // release 1.50: a creature's green blood
     re3wound::shotBlood.push_back(s);++nativeReplaced;   // turned into the spray by spawnFromShots of this same update
-    if(nativeReplaced<=8)log("BLOOD_NATIVE_REPLACED at=%.0f,%.0f,%.0f actor=%p floor=%.0f (native hit blood with no HD wound near it)",at.x,at.y,at.z,actor,s.floorY);
+    if(nativeReplaced<=8)log("BLOOD_NATIVE_REPLACED at=%.0f,%.0f,%.0f actor=%p floor=%.0f hue=%u (native hit blood with no HD wound near it)",at.x,at.y,at.z,actor,s.floorY,unsigned(s.hue));
 }
 // Every native hit-blood billboard (key 0C00, class 2B) is collapsed to a point (all four FT4 corners on the first):
 // nothing is drawn, the native effect itself runs on untouched. (07.11 v1 collapsed it only near an HD spray: hits that
@@ -315,7 +330,7 @@ inline void drawBlood(){
     for(const auto& p:pools){
         const float t=(std::min)(1.f,float(tick-p.born)/165.f),progress=1.f-std::pow(1.f-t,1.7f);
         if(tick-p.born==60||tick-p.born==170){const auto c=re3model::TransformPoint(cam,p.centre);log("BLOOD_POOL_DRAW shadow=%p age=%u progress=%.2f size=%.0f camera_z=%.0f screen=%.0f,%.0f",p.shadow,tick-p.born,progress,p.size,c.z,c.x*base.h/c.z+base.offsetX,c.y*base.h/c.z+base.offsetY);}
-        Item item;item.material=p.variant;item.anchor=p.centre;
+        Item item;item.material=p.variant+kMaterials*p.hue;item.anchor=p.centre;
         const float half=p.size*0.5f,c=std::cos(p.angle),s=std::sin(p.angle);
         const Vec3 ax{c,0,s},az{-s,0,c},origin{p.centre.x,p.centre.y-3.f,p.centre.z};
         const unsigned n=4;const std::uint32_t argb=withAlpha(poolTint(p.colour),progress);
@@ -330,7 +345,7 @@ inline void drawBlood(){
         items.push_back(std::move(item));
     }
     for(const auto& sp:splats){
-        Item item;item.material=kSplatMaterial;item.anchor=sp.pos;float cell[4];gridCell(sp.cell,4,2,cell);
+        Item item;item.material=kSplatMaterial+kMaterials*sp.hue;item.anchor=sp.pos;float cell[4];gridCell(sp.cell,4,2,cell);
         const float c=std::cos(sp.angle),s=std::sin(sp.angle),half=sp.size*0.5f;const Vec3 ax{c,0,s},az{-s,0,c};
         Vec3 corner[4];float uv[8];const float tx[4]={0,1,1,0},ty[4]={0,0,1,1};
         for(unsigned k=0;k<4;++k){corner[k]=sp.pos+ax*((tx[k]-0.5f)*2*half)+az*((ty[k]-0.5f)*2*half);uv[k*2]=cell[0]+(cell[2]-cell[0])*tx[k];uv[k*2+1]=cell[1]+(cell[3]-cell[1])*ty[k];}
@@ -341,7 +356,7 @@ inline void drawBlood(){
         items.push_back(std::move(item));
     }
     for(const auto& b:bursts){
-        Item item;item.material=b.material;item.anchor=b.pos;const unsigned cellIndex=(tick-b.born)/debugSlow;float cell[4];gridCell(cellIndex,4,4,cell);
+        Item item;item.material=b.material+kMaterials*b.hue;item.anchor=b.pos;const unsigned cellIndex=(tick-b.born)/debugSlow;float cell[4];gridCell(cellIndex,4,4,cell);
         if(b.material==kConeMaterial){bool valid=false;const float angle=screenAngle(right,down,b.dir,valid);
             // the spray's length on screen shrinks when it points along the view
             const float along=valid?(std::max)(0.35f,std::sqrt(1.f-std::pow(re3model::Dot(forward,b.dir),2.f))):0.35f;
@@ -352,7 +367,7 @@ inline void drawBlood(){
         items.push_back(std::move(item));
     }
     for(const auto& d:drops){
-        Item item;item.material=kDropMaterial;item.anchor=d.pos;float cell[4];gridCell(d.cell,4,4,cell);
+        Item item;item.material=kDropMaterial+kMaterials*d.hue;item.anchor=d.pos;float cell[4];gridCell(d.cell,4,4,cell);
         bool valid=false;const float moving=screenAngle(right,down,re3model::Normalize(d.vel),valid);
         const float elong=config.dropElong[d.cell];const float angle=elong>1.4f&&valid?moving-config.dropAngle[d.cell]:0.f;
         const float size=d.size*1.5f;
@@ -361,8 +376,10 @@ inline void drawBlood(){
         items.push_back(std::move(item));
     }
     // per ordering table (45ADC0 by the item's anchor): one geometry, its runs grouped by bucket, far buckets first
-    re3model::Mesh materials;materials.materials=asset->mesh.materials;
-    for(unsigned k=0;k<kMaterials;++k){materials.materials[k].flags=re3model::AlphaBlend|re3model::TwoSided|(k<kPools?re3model::GrowthMask:0u);}
+    // release 1.50 (green blood): the 8 materials once per hue (red, green, olive) over the same textures
+    re3model::Mesh materials;std::vector<re3model::MaterialTextures> hueTextures;
+    for(unsigned hue=0;hue<re3wound::kBloodHues;++hue)for(unsigned k=0;k<kMaterials;++k){auto m=asset->mesh.materials[k];
+        m.flags=re3model::AlphaBlend|re3model::TwoSided|(k<kPools?re3model::GrowthMask:0u)|re3model::BloodHueFlags(hue);materials.materials.push_back(m);hueTextures.push_back(asset->textures[k]);}
     const auto chooseTable=reinterpret_cast<ChooseTable>(gameBase+0x5adc0);
     struct Piece{std::uint32_t* table;std::int32_t position[3];std::uint16_t bucket;std::vector<re3model::DrawVertex> vertices;unsigned material;std::size_t order;};
     std::vector<Piece> pieces;
@@ -376,7 +393,7 @@ inline void drawBlood(){
         if(item.bucket>=0){fixed=std::uint16_t((std::min)(1023,item.bucket));projection.depth=fixedBucket;projection.depthContext=&fixed;}
         re3model::FrameGeometry geometry;std::string error;
         if(!re3model::PrepareFrame(mesh,item.vertices,projection,geometry,&error)||geometry.vertices.empty())continue;
-        if(item.material<kPools&&(tick&127)==0&&!geometry.slices.empty()){unsigned lo=1023,hi=0;for(const auto& sl:geometry.slices){lo=(std::min)(lo,unsigned(sl.bucket));hi=(std::max)(hi,unsigned(sl.bucket));}
+        if(item.material%kMaterials<kPools&&(tick&127)==0&&!geometry.slices.empty()){unsigned lo=1023,hi=0;for(const auto& sl:geometry.slices){lo=(std::min)(lo,unsigned(sl.bucket));hi=(std::max)(hi,unsigned(sl.bucket));}
             log("BLOOD_POOL_BUCKETS variant=%u buckets=%u-%u slices=%zu vertices=%zu table=%p",item.material,lo,hi,geometry.slices.size(),geometry.vertices.size(),table);}
         for(const auto& slice:geometry.slices)for(unsigned r=0;r<slice.runCount;++r){const auto& run=geometry.runs[slice.firstRun+r];
             Piece piece;piece.table=table;std::memcpy(piece.position,position,sizeof(position));piece.bucket=slice.bucket;piece.material=item.material;piece.order=pieces.size();
@@ -391,7 +408,7 @@ inline void drawBlood(){
             if(merged.slices.empty()||merged.slices.back().bucket!=piece.bucket)merged.slices.push_back({piece.bucket,std::uint32_t(merged.runs.size()),0});
             merged.runs.push_back({std::uint32_t(merged.vertices.size()),std::uint32_t(piece.vertices.size()),piece.material});++merged.slices.back().runCount;
             merged.vertices.insert(merged.vertices.end(),piece.vertices.begin(),piece.vertices.end());}
-        HRESULT hr;auto gpu=modelRenderer.upload(materials,std::move(merged),asset->textures,false,&hr);if(!gpu){once("blood-upload","HD blood upload failed this frame");return;}
+        HRESULT hr;auto gpu=modelRenderer.upload(materials,std::move(merged),hueTextures,false,&hr);if(!gpu){once("blood-upload","HD blood upload failed this frame");return;}
         std::vector<re3bridge::BucketJob> jobs;jobs.reserve(gpu->slices.size());
         for(std::size_t n=0;n<gpu->slices.size();++n){auto job=std::make_shared<ModelJob>();job->geometry=gpu;job->slice=n;job->name="blood-fx";
             jobs.push_back({gpu->slices[n].bucket,reinterpret_cast<std::uintptr_t>(job.get()),job});}
@@ -423,9 +440,10 @@ inline void update(){
         const Vec3 at{float(read<std::int32_t>(player,0x34)),float(read<std::int32_t>(player,0x38)),float(read<std::int32_t>(player,0x3c))};
         const float yaw=float(read<std::int16_t>(player,0x6e))*6.2831853f/4096.f;const Vec3 ahead{std::sin(yaw),0,std::cos(yaw)};
         static unsigned n=0;Pool p;p.shadow=debugShadowKey+(n&1);p.actor=player;p.centre=at-ahead*float(n&1)*1100.f;p.size=1320;p.w0=600;p.variant=std::uint8_t(n%kPools);p.born=tick;p.seen=tick;p.colour=0xffc8c0b8u;p.logged=true;
+        p.hue=std::uint8_t(n%re3wound::kBloodHues);   // release 1.50: red, green, olive in turn (QA of the green blood)
         pools.erase(std::remove_if(pools.begin(),pools.end(),[&](const Pool& q){return q.shadow==p.shadow;}),pools.end());pools.push_back(p);++n;
-        re3wound::ShotBlood s;s.actor=nullptr;s.entry=at+ahead*500.f+Vec3{0,-1200.f,0};s.direction=ahead;s.normal=ahead*-1.f;s.hasExit=true;s.exit=s.entry+ahead*250.f;s.weapon=3;s.colour=0xffc8c0b8u;s.floorY=at.y;re3wound::shotBlood.push_back(s);
-        log("BLOOD_TEST pool variant=%u at=%.0f,%.0f,%.0f yaw=%.2f",unsigned(p.variant),p.centre.x,p.centre.y,p.centre.z,yaw);}
+        re3wound::ShotBlood s;s.actor=nullptr;s.entry=at+ahead*500.f+Vec3{0,-1200.f,0};s.direction=ahead;s.normal=ahead*-1.f;s.hasExit=true;s.exit=s.entry+ahead*250.f;s.weapon=3;s.colour=0xffc8c0b8u;s.floorY=at.y;s.hue=p.hue;re3wound::shotBlood.push_back(s);
+        log("BLOOD_TEST pool variant=%u hue=%u at=%.0f,%.0f,%.0f yaw=%.2f",unsigned(p.variant),unsigned(p.hue),p.centre.x,p.centre.y,p.centre.z,yaw);}
     decideNativeSprays();scanShadows();spawnFromShots();stepDrops();drawBlood();
 }
 // The effect loop's second emitter 458750 (call 45832F: effects with flag 0x200 = rotated sprites, e.g. the muzzle flash
